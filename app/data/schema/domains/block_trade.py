@@ -15,3 +15,4 @@ class BlockTradeSchema(CommonFields):
     amount: Optional[float] = None       # 成交额（元）
     buyer: Optional[str] = None          # 买方营业部
     seller: Optional[str] = None         # 卖方营业部
+    trade_seq: int = 1                   # 相同成交要素的当日出现序号（从 1 开始）

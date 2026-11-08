@@ -1,29 +1,48 @@
-"""数据新鲜度巡检与自动补数测试 — freshness_patrol 模块。
+"""Freshness patrol regression tests using an opt-in real isolated Mongo DB.
 
-设计原则：不使用 unittest.mock，走真实代码路径。
-- evaluate_domain：SimulatedMongoDB 注入，种 trade_calendar + sync_checkpoints
-- _expected_trading_date：真实日历数据驱动（周末/收盘前/节假日三态）
-- run_patrol：真实 SchedulerEngine（未启动调度器，仅注册表），
-  验证落后域被发现并经 run_job_now 触发补偿
+Calendar/checkpoint documents are seeded in a dedicated test database and
+restored per test. Scheduler tests use the actual unstarted scheduler.
+Production storage and paid APIs are never used.
 """
 
+import os
 import pytest
+import pytest_asyncio
 from datetime import date, timedelta
 
-from test_infra import SimulatedMongoDB
+EXPECTED_VALIDATION_DB = 'tradingagents_latest_validation_20261008'
+pytestmark = pytest.mark.skipif(
+    os.environ.get('LATEST_VALIDATION_DB') != EXPECTED_VALIDATION_DB
+    or os.environ.get('MONGODB_DATABASE') != EXPECTED_VALIDATION_DB
+    or os.environ.get('REDIS_HOST') != '127.0.0.1'
+    or os.environ.get('REDIS_PORT') != '26380',
+    reason='Requires dedicated real Mongo/Redis validation infrastructure',
+)
 
 
-@pytest.fixture
-async def patrol_db():
-    """注入 SimulatedMongoDB 并种入交易日历与检查点基础数据。"""
+@pytest_asyncio.fixture
+async def patrol_db(real_mongo_db):
+    """Use real isolated Mongo; restore each touched collection afterwards."""
+    assert real_mongo_db.name == EXPECTED_VALIDATION_DB
     from app.data.storage.mongo import client as mongo_client
-
+    from app.core.config import settings
+    assert settings.MONGO_DB == EXPECTED_VALIDATION_DB
+    assert settings.REDIS_HOST == '127.0.0.1' and settings.REDIS_PORT == 26380
+    names = ('trade_calendar', 'sync_checkpoints')
+    snapshots = {name: await real_mongo_db[name].find({}).to_list(length=None)
+                 for name in names}
     original = mongo_client._motor_db
-    db = SimulatedMongoDB()
-    mongo_client._motor_db = db
-    yield db
-    mongo_client._motor_db = original
-
+    mongo_client._motor_db = real_mongo_db
+    try:
+        for name in names:
+            await real_mongo_db[name].delete_many({})
+        yield real_mongo_db
+    finally:
+        for name in names:
+            await real_mongo_db[name].delete_many({})
+            if snapshots[name]:
+                await real_mongo_db[name].insert_many(snapshots[name])
+        mongo_client._motor_db = original
 
 async def _seed_calendar(db, market: str, exchange: str, days_back: int = 15):
     """种交易日历：工作日开市、周末休市（真实日历形状的简化）。"""
@@ -46,7 +65,7 @@ async def _seed_checkpoint(db, market: str, domain: str, cp_date: str):
     await db["sync_checkpoints"].insert_one({
         "market": market,
         "domain": domain,
-        "source": "scheduled",
+        "data_source": "scheduled",
         "last_sync_date": cp_date,
         "last_sync_time": "2026-10-01T00:00:00+00:00",
         "status": "success",
@@ -164,13 +183,8 @@ class TestRunPatrol:
     """run_patrol：巡检发现落后域并触发补偿。"""
 
     @pytest.mark.asyncio
-    async def test_patrol_reports_and_compensates(self, patrol_db, scheduler_engine):
-        """落后域被发现并经 run_job_now 触发（status=triggered/already_running）。
-
-        scheduler_engine fixture 构造真实引擎（未 start，仅注册表），
-        run_job_now 走 TaskRegistry 后台执行——为避免真实外呼，本测试
-        聚焦巡检报告的正确性；补偿动作的状态值断言为集合。
-        """
+    async def test_patrol_skips_unscheduled_domains(self, patrol_db, scheduler_engine):
+        """真实但未注册同步任务的引擎不应被巡检强制启用。"""
         from app.data.scheduler import freshness_patrol
         from app.data.scheduler.freshness_patrol import run_patrol
 
@@ -186,12 +200,10 @@ class TestRunPatrol:
         finally:
             SchedulerEngine._instance = original_engine
 
-        assert report["checked"] > 0
-        assert "CN:daily_quotes" in report["behind"]
-        results = report["results"]
-        assert results["CN:daily_quotes"]["behind"] is True
-        # 未注册任务时补偿失败但巡检不崩
-        assert len(report["compensated"]) >= 1
+        assert report["checked"] == 0
+        assert report["behind"] == []
+        assert report["results"] == {}
+        assert report["compensated"] == []
         # 巡检结果可读取
         assert freshness_patrol.get_last_patrol_result()["trigger"] == "test"
 

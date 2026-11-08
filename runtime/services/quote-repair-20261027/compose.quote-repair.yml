@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:quote-repair-ab84a883
+  frontend:
+    image: tradingagents-cn-hub-frontend:quote-repair-ab84a883

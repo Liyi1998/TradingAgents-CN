@@ -67,6 +67,10 @@ export interface LLMConfig {
     cost?: number  // 成本(1-5)
     quality?: number  // 质量(1-5)
   }
+  // 模型用途：chat=对话模型（分析/辩论），embedding=向量模型（知识库/记忆检索）
+  // 与 suitable_roles 是正交维度——对话角色选择器按 model_type=chat 过滤
+  model_type?: 'chat' | 'embedding'
+  embedding_dimension?: number | null  // 向量维度（OpenAI 兼容 dimensions 参数；空=模型默认）
 }
 
 export interface DataSourceConfig {
@@ -395,7 +399,11 @@ export const configApi = {
 
   // 测试配置连接
   testConfig(testRequest: ConfigTestRequest): Promise<ConfigTestResponse> {
-    return ApiClient.post('/api/config/test', testRequest)
+    // Model checks allow up to 180s plus connect/transport overhead; other tests
+    // retain the normal HTTP timeout. Never automatically repeat a billable probe.
+    return ApiClient.post('/api/config/test', testRequest, testRequest.config_type === 'llm'
+      ? { timeout: 210000, retryCount: 0, retryNonIdempotent: false }
+      : undefined)
   },
 
   // 导出配置

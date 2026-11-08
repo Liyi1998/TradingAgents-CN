@@ -13,7 +13,7 @@ from app.engine.orchestrator.invoker import run_node_turn  # noqa: E402 (intenti
 from app.engine.agents.stage_2.researcher_factory import _stage_reports  # noqa: E402
 
 
-def create_research_manager(llm, memory):
+def create_research_manager(llm, memory, horizon=None):
     async def research_manager_node(state) -> dict:
         logger.debug("👔 [DEBUG] ===== 研究经理 (Research Manager) 节点开始 =====")
 
@@ -53,13 +53,21 @@ def create_research_manager(llm, memory):
 
             if not base_prompt:
                 error_msg = "❌ 未找到 research-manager 智能体配置，请检查 agent_specs 智能体库（DB）。"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 raise ValueError(error_msg)
 
             # 动态构建环境上下文（KV 格式）并拼接配置指令
             from app.engine.prompts.builder import context_prefix as build_context_prefix
 
-            system = build_context_prefix(ticker, company_name, currency) + "\n" + base_prompt
+            # 期限锚点（mid/long）：裁决按本次分析期限评估双方证据
+            from app.engine.prompts.horizon import build_horizon_anchor
+
+            system = (
+                build_context_prefix(ticker, company_name, currency)
+                + "\n"
+                + base_prompt
+                + build_horizon_anchor(horizon, role="judge")
+            )
             messages = inject_report_messages(
                 all_reports,
                 report_display_names(),
@@ -69,7 +77,7 @@ def create_research_manager(llm, memory):
             # 裁决前注入相似情景历史记忆（写读对称）
             from app.engine.agents.utils.memory import fetch_memory_brief
 
-            memory_brief = await fetch_memory_brief(memory, f"{bull_report}\n\n{bear_report}")
+            memory_brief = await fetch_memory_brief(memory, f"{bull_report}\n\n{bear_report}", as_of=state.get("trade_date"))
             if memory_brief and not memory_brief.startswith("暂无"):
                 messages.append(Message(role=Role.USER, content=f"=== 历史裁决反思（类似情景） ===\n{memory_brief}"))
                 logger.info("👔 [Research Manager] 已注入历史裁决记忆")
@@ -138,7 +146,7 @@ def create_research_manager(llm, memory):
                 os.replace(tmp_filename, filename)
                 logger.info(f"👔 [Research Manager] 已生成裁决报告: {filename}")
             except Exception as e:
-                logger.error(f"👔 [ERROR] 保存裁决报告失败: {e}")
+                logger.error(f"👔 [ERROR] 保存裁决报告失败: {e}", exc_info=True)
 
             # 6. 更新状态（canonical：仅裁决结论，其余键由 export_legacy_state 派生）
             new_investment_debate_state = dict(investment_debate_state)
@@ -155,13 +163,17 @@ def create_research_manager(llm, memory):
                 "reports": {"research_team_decision": final_content},
             }
 
-        except Exception:
+        except Exception as exc:
             logger.error(
                 "👔 [Research Manager] 节点执行异常，降级返回以保持流程继续",
                 exc_info=True,
             )
             # 降级状态：保留上游 investment_debate_state 原值，仅写入错误说明
-            fallback_content = "⚠️ 研究经理节点执行异常，未能生成有效裁决报告。"
+            from app.llm.failures import describe_failure
+            fallback_content = (
+                "⚠️ 研究经理节点执行异常，未能生成有效裁决报告。"
+                + describe_failure(exc)["message"]
+            )
             new_investment_debate_state = dict(investment_debate_state)
             new_investment_debate_state.update(
                 {

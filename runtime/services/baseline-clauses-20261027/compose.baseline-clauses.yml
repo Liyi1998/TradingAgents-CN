@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:baseline-clauses-1d627185
+  frontend:
+    image: tradingagents-cn-hub-frontend:baseline-clauses-1d627185

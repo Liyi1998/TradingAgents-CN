@@ -1,19 +1,34 @@
 """DataInterface — 数据平台统一门面。消费层的唯一入口。"""
 
+import asyncio
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
+from app.data.core.errors import DataUnavailableError
 from app.data.core.result import RefreshResult
 from app.data.core.reader import Reader
 from app.data.core.refresh_service import DataRefreshService
 from app.data.core.registry.capability import CapabilityRegistry
 from app.data.core.registry.priority import PriorityConfig
+from app.data.core.screening import ScreeningGateway
+from app.data.core.symbols import normalize_symbol, normalize_data_symbol
+from app.data.storage.cache.memory_cache import TTLCache
 
 logger = logging.getLogger(__name__)
 
 _instance: Optional["DataInterface"] = None
 _instance_lock = threading.Lock()
+
+_VALID_MARKETS = ("CN", "HK", "US")
+
+
+def _normalize_market(market: str) -> str:
+    """市场标识入口归一（大小写不敏感），非法值 fail-fast。"""
+    m = (market or "").strip().upper()
+    if m not in _VALID_MARKETS:
+        raise ValueError(f"未知市场类型: {market!r}（支持 CN/HK/US）")
+    return m
 
 
 class DataInterface:
@@ -23,16 +38,30 @@ class DataInterface:
     消费层只通过此类访问数据。
     """
 
+    async def mcp_news_is_fresh(self, symbol: str, max_age_hours: int = 24) -> bool:
+        """Check freshness of normalized MCP news through the data boundary."""
+        from app.data.sync.mcp_ingestion import is_news_fresh
+        return await is_news_fresh(symbol, max_age_hours)
+
+    async def persist_mcp_result(self, tool_name, tool_args, raw, context=None):
+        """Normalize external MCP results before writing standard repositories."""
+        from app.data.sync.mcp_ingestion import persist_mcp_result
+        return await persist_mcp_result(tool_name, tool_args, raw, context)
+
     def __init__(self, sync_trigger_callback=None):
         self.reader = Reader()
         self._registry = CapabilityRegistry()
         self._priority = PriorityConfig()
         self.refresh_service = DataRefreshService(self._registry, self._priority)
         self._sync_trigger_callback = sync_trigger_callback
+        self.screening = ScreeningGateway()
 
         from app.data.storage.mongo.repositories.metadata_repo import MetadataRepo
 
         self._metadata_repo = MetadataRepo()
+        # Dashboard 统计 60s 共享缓存（stats 与 overview 各自键位、键含 market+domains）：
+        # 数据本身分钟级更新，同步后 60s 内 dashboard 数字略旧是可接受的
+        self._dashboard_cache = TTLCache(default_ttl=60)
 
     @classmethod
     def get_instance(cls) -> "DataInterface":
@@ -51,6 +80,30 @@ class DataInterface:
         with _instance_lock:
             _instance = None
 
+    async def ensure_indexes(self) -> None:
+        """启动期业务集合索引保障（应用层组装时调用一次）。
+
+        业务集合索引的唯一事实源在 storage/mongo/index_definitions.py；
+        core.database 不再 import 数据模块，由应用层经本契约入口触发。
+        """
+        from app.data.storage.mongo.client import get_motor_db
+        from app.data.storage.mongo.index_definitions import ensure_all_market_indexes
+
+        await ensure_all_market_indexes(get_motor_db())
+
+    def reset_connections(self) -> None:
+        """失效数据侧桥接缓存（应用层 shutdown 时在 close_db 前调用）。
+
+        storage 层对 core 连接有懒缓存——core 关闭后不重置会让缓存指向
+        已关闭的客户端（重连场景下读写旧实例）。
+        """
+        from app.data.storage.mongo import client as mongo_bridge
+        from app.data.storage.redis import client as redis_bridge
+
+        mongo_bridge.reset_client()
+        redis_bridge.reset_client()
+        logger.info("数据侧连接桥接缓存已重置")
+
     # ── 数据读取 ──
 
     async def read(
@@ -61,32 +114,297 @@ class DataInterface:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         filters: Optional[Dict] = None,
+        *,
+        auto_refresh: bool = False,
+        refresh_timeout: int = 30,
     ) -> Dict:
-        """读取标准数据。
+        """读取标准数据（消费方唯一读入口）。
 
         Args:
-            market: 市场 (CN/HK/US)
-            domain: 数据域 (basic_info/daily_quotes/...)
-            symbol: 股票代码（可选，不传则查询全量）
+            market: 市场 (CN/HK/US，大小写不敏感)
+            domain: 数据域 (basic_info/daily_quotes/...)，未注册域抛 ValueError
+            symbol: 股票代码（可选，容忍多种写法：``000001.SZ`` / ``sz000001`` /
+                ``1`` 均归一为存储口径；envelope 的 symbol 回显归一化结果）
             start_date: 起始日期（可选）
             end_date: 结束日期（可选）
             filters: 额外过滤条件（可选，如 list_status/statement_type 等）
+            auto_refresh: 库空时自动触发该域按需刷新后重读一次（需 symbol，
+                无 symbol 时该选项无效）。刷新自身失败不抛异常，落 refresh 摘要。
+            refresh_timeout: auto_refresh 的刷新超时秒数
+
+        Returns:
+            envelope dict：{"data", "freshness", "market", "symbol", "domain",
+            "auto_refreshed", "refresh"}。形状不变式：列表语义域 data 恒为
+            List[Dict]（空为 ``[]``）；单例语义（basic_info + symbol）data 为
+            Dict（空为 ``None``）。
+
+        Raises:
+            ValueError: domain 未注册或 market 非法（编程错误，fail-fast）
+            DataUnavailableError: 存储故障（auto_refresh 补数后仍失败同样抛出）
         """
-        data, freshness = await self.reader.get_data(
-            market,
-            domain,
-            symbol,
-            start_date=start_date,
-            end_date=end_date,
-            filters=filters,
+        market = _normalize_market(market)
+        if not self.reader.supports_domain(domain):
+            raise ValueError(f"未注册的数据域: {domain!r}")
+        if symbol is not None:
+            symbol = normalize_data_symbol(symbol, market, domain, filters)
+
+        def normalized_date(value):
+            text = str(value) if value is not None else None
+            return f"{text[:4]}-{text[4:6]}-{text[6:]}" if text and len(text) == 8 and text.isdigit() else text
+        start_date, end_date = normalized_date(start_date), normalized_date(end_date)
+        from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT
+        context = ACTIVE_ANALYSIS_CONTEXT.get()
+        if context and context.get("market") == market and domain != "trade_calendar":
+            cutoff = context.get("intraday_end") if domain == "intraday_quotes" else context.get("as_of")
+            if cutoff:
+                end_date = min(end_date, cutoff) if end_date else cutoff
+        from app.data.core.requirements import analysis_filters
+        filters = analysis_filters(market, domain, symbol, start_date, end_date, filters, context)
+        read_kwargs: Dict[str, Any] = dict(
+            start_date=start_date, end_date=end_date, filters=filters
         )
-        return {
+
+        refreshed_summary: Optional[Dict] = None
+        auto_refreshed = False
+        freshness = "unknown"
+        try:
+            data, freshness = await self.reader.get_data(
+                market, domain, symbol, **read_kwargs
+            )
+        except Exception as e:
+            if not (auto_refresh and symbol):
+                raise DataUnavailableError(market, domain, e) from e
+            data = None
+
+        # 库空/首读失败 → 按需补数后重读一次（无 symbol 无法按股补数，不触发）
+        if auto_refresh and symbol and not data:
+            auto_refreshed = True
+            domain_result = None
+            try:
+                rr = await self.refresh(
+                    market, symbol, domains=[domain],
+                    force=True, timeout=refresh_timeout,
+                    start_date=start_date, end_date=end_date, coverage_filters=filters,
+                )
+                domain_result = rr.domains.get(domain) if rr else None
+            except Exception as e:  # noqa: BLE001 — 补数失败降级为摘要，不中断读取
+                logger.warning(f"[read] {market}/{domain}/{symbol} 按需刷新失败: {e}")
+            if domain_result is not None:
+                refreshed_summary = {
+                    "status": domain_result.status,
+                    "source": domain_result.source,
+                    "record_count": domain_result.record_count,
+                    "error": domain_result.error,
+                }
+                try:
+                    data, freshness = await self.reader.get_data(
+                        market, domain, symbol, **read_kwargs
+                    )
+                except Exception as e:
+                    raise DataUnavailableError(market, domain, e) from e
+            else:
+                refreshed_summary = {
+                    "status": "skipped", "source": None,
+                    "record_count": 0, "error": None,
+                }
+
+        from app.data.core.coverage import evaluate
+        data, quality = evaluate(data, domain, start_date, end_date, filters)
+        if market == "CN" and domain == "intraday_quotes" and data and symbol:
+            from app.data.query.intraday_evidence import compare_intraday_daily
+            days = sorted({str(row.get("datetime", ""))[:10] for row in data})
+            # Compare closed sessions only; a partial session is not a missing day.
+            closed = [day for day in days if not end_date or day < end_date[:10]
+                      or len(end_date) == 10 or end_date[11:19] >= "15:00:00"]
+            if closed:
+                try:
+                    daily = await self.read(market, "daily_quotes", symbol,
+                        start_date=closed[0], end_date=closed[-1], filters={"price_basis": "raw"})
+                    comparison = compare_intraday_daily(data, daily.get("data") or [], closed)
+                except Exception as exc:
+                    comparison = {"status": "partial", "reason": type(exc).__name__,
+                                  "limitations": "日线交叉核验不可用，不据此删除已取得的分时OHLC；全日成交量/VWAP未核验。"}
+                quality["daily_cross_check"] = comparison
+                if comparison["status"] != "matched" and quality["status"] == "success":
+                    quality.update(status="partial", reason="intraday_daily_volume_or_ohlc_unverified")
+        if domain == "daily_indicators" and isinstance(data, list) and data:
+            latest = max(data, key=lambda row: str(row.get("trade_date") or ""))
+            optional = (latest.get("data_quality") or {}).get("field_status") or {}
+            quality["optional_field_status"] = {field: status for field, status in optional.items()
+                if field not in filters.get("required_fields", []) and status != "available"}
+        quality["cache_freshness"] = getattr(freshness, "value", freshness)
+        from app.data.core.analysis_context import record_read_trace
+        record_read_trace({"market": market, "domain": domain, "symbol": symbol,
+                           "start_date": start_date, "end_date": end_date, "filters": filters, "quality": quality})
+        if context is not None:
+            snapshots = context.setdefault("coverage_snapshots", {})
+            key = f"{market}:{domain}:{symbol}:{start_date}:{end_date}"
+            if key in snapshots or len(snapshots) < 100:
+                snapshots[key] = {"market": market, "domain": domain, "symbol": symbol, "quality": quality}
+        # 形状钳制：单例语义折叠为单 dict，列表语义空结果为 []（不再吐 None）
+        if domain == "basic_info" and symbol:
+            if isinstance(data, list):
+                data = data[0] if data else None
+        elif data is None:
+            data = []
+
+        result = {
             "data": data,
+            "quality": quality,
             "freshness": freshness,
             "market": market,
             "symbol": symbol,
             "domain": domain,
+            "auto_refreshed": auto_refreshed,
+            "refresh": refreshed_summary,
         }
+        if filters.get("contract") == "verified_same_basis_flow":
+            from app.data.core.requirements import five_session_flow
+            result["derived_context"] = five_session_flow(data or [], quality, filters.get("expected_dates") or [])
+        return result
+
+    async def intraday_research(self, symbol: str, now) -> Dict:
+        """Bounded free 30-minute evidence; separate from daily research inputs."""
+        if len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit():
+            raise ValueError("仅支持六位A股代码")
+        from app.data.query.intraday_research import collect
+        return await collect(self, symbol, now)
+
+    async def analysis_context(self, market: str, as_of: str, sessions: int = 5) -> Dict:
+        from app.data.core.analysis_context import build_context
+        from app.core.async_utils import await_on_main_loop
+        # AnalysisRuntime runs in a worker's asyncio.run loop, while Motor is
+        # owned by the application loop. Calendar preparation needs the same
+        # bridge as the other real data tools, including context propagation.
+        return await await_on_main_loop(build_context(self, market, as_of, sessions))
+
+    async def read_ready(self, market: str, domain: str, symbol: Optional[str] = None,
+                         timeout: int = 30, **read_kwargs) -> Dict:
+        """Bounded single-target completion; unavailable evidence never blocks peers.
+
+        Return partial data plus structured diagnostics after real fallback. Do
+        not refresh the whole market or turn a missing value into a zero.
+        """
+        market = _normalize_market(market)
+        if symbol is not None:
+            symbol = normalize_data_symbol(symbol, market, domain, read_kwargs.get("filters"))
+        from datetime import datetime
+        from app.data.core.market import get_market_timezone
+        from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT, record_read_trace
+        from app.data.core.requirements import analysis_filters
+        import time
+        began = time.monotonic()
+        for key in ("start_date", "end_date"):
+            value = str(read_kwargs.get(key) or "")
+            if len(value) == 8 and value.isdigit():
+                read_kwargs[key] = f"{value[:4]}-{value[4:6]}-{value[6:]}"
+        context = ACTIVE_ANALYSIS_CONTEXT.get()
+        if context and context.get("market") == market and domain != "trade_calendar":
+            cutoff = context.get("intraday_end") if domain == "intraday_quotes" else context.get("as_of")
+            if cutoff:
+                read_kwargs["end_date"] = min(read_kwargs["end_date"], cutoff) if read_kwargs.get("end_date") else cutoff
+        read_kwargs["filters"] = analysis_filters(
+            market, domain, symbol, read_kwargs.get("start_date"), read_kwargs.get("end_date"),
+            read_kwargs.get("filters"), ACTIVE_ANALYSIS_CONTEXT.get())
+        result = {"data": [], "quality": {"status": "failed", "reason": "cache_read_failed"},
+                  "market": market, "domain": domain, "symbol": symbol, "freshness": "unknown"}
+        try:
+            result = await self.read(market, domain, symbol, **read_kwargs)
+            quality = result.get("quality") or {}
+            today = datetime.now(get_market_timezone(market)).date().isoformat()
+            end = read_kwargs.get("end_date")
+            fresh = getattr(result.get("freshness"), "value", result.get("freshness")) == "fresh"
+            if quality.get("status") in {"no_events", "not_applicable"} or (
+                quality.get("status") == "success" and (fresh or (domain != "news" and end and end[:10] < today))
+            ):
+                return result
+        except Exception as exc:
+            logger.warning("按需缓存读取失败 %s/%s/%s: %s", market, domain, symbol, exc)
+        if not symbol or symbol in {"__all__", "market"}:
+            return result
+        try:
+            refreshed = await self.refresh(
+                market, symbol, domains=[domain], timeout=timeout,
+                start_date=str(read_kwargs["start_date"])[:10] if read_kwargs.get("start_date") else None,
+                end_date=str(read_kwargs["end_date"])[:10] if read_kwargs.get("end_date") else None,
+                coverage_filters=read_kwargs["filters"],
+            )
+            detail = refreshed.domains.get(domain)
+            peer_finished = False
+            if detail and detail.status == "skipped":
+                from app.data.storage.redis.locks import DistributedLock
+                peer_finished = await DistributedLock(f"lock:{market}:{domain}:{symbol}").wait_until_released(
+                    max_wait=min(8, max(0, timeout - (time.monotonic() - began))))
+            result = await self.read(market, domain, symbol, **read_kwargs)
+            if detail:
+                result["quality"].update(refresh_status=detail.status, refresh_source=detail.source,
+                                          fallback_from=detail.fallback_from, refresh_error=detail.error)
+                if detail.status == "skipped":
+                    result["quality"]["peer_refresh_status"] = "completed" if peer_finished else "still_pending_or_unobservable"
+                    if peer_finished and result["quality"].get("status") == "success" and getattr(result.get("freshness"), "value", result.get("freshness")) == "fresh":
+                        result["quality"].update(refresh_status="coalesced", refresh_error=None)
+                if not result.get("data") and detail.status == "no_events":
+                    result["quality"].update(status="no_events", reason="source_confirmed_empty")
+        except Exception as exc:
+            logger.warning("有界免费补链失败 %s/%s/%s: %s", market, domain, symbol, exc)
+            result["quality"].update(refresh_status="failed", refresh_error=type(exc).__name__)
+        record_read_trace({"market": market, "domain": domain, "symbol": symbol,
+                           "start_date": read_kwargs.get("start_date"), "end_date": read_kwargs.get("end_date"),
+                           "filters": read_kwargs["filters"], "quality": result["quality"]})
+        context = ACTIVE_ANALYSIS_CONTEXT.get()
+        if context is not None:
+            key = f"{market}:{domain}:{symbol}:{read_kwargs.get('start_date')}:{read_kwargs.get('end_date')}"
+            if key in context.setdefault("coverage_snapshots", {}) or len(context["coverage_snapshots"]) < 100:
+                context["coverage_snapshots"][key] = {"market": market, "domain": domain, "symbol": symbol, "quality": result["quality"]}
+        return result
+
+    async def price_reference(self, market: str, symbol: str, context: Dict) -> Dict:
+        from app.core.async_utils import await_on_main_loop
+        from app.data.query.price_reference import collect_price_reference
+        return await await_on_main_loop(collect_price_reference(self, market, symbol, context))
+
+    async def relative_volume_context(self, market: str, symbol: str, end_date: str, timeout: int = 8) -> Dict:
+        """An explicitly different daily-volume statistic; no provider-field rewrite."""
+        from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT
+        from app.data.core.requirements import relative_volume_5d
+        context = ACTIVE_ANALYSIS_CONTEXT.get()
+        if (not context or context.get("market") != market or context.get("calendar_status") != "success"
+                or len(context.get("volume_reference_trade_dates") or context.get("recent_trade_dates") or []) < 6):
+            context = await self.analysis_context(market, end_date, sessions=6)
+        days = list(context.get("volume_reference_trade_dates") or context.get("recent_trade_dates") or [])[-6:]
+        if market != "CN" or context.get("calendar_status") != "success" or len(days) != 6:
+            return relative_volume_5d([], [])
+        result = await self.read_ready(market, "daily_quotes", symbol, timeout=timeout, start_date=days[0], end_date=end_date,
+            filters={"required_fields": ["volume", "close"], "expected_dates": days,
+                     "contract": "verified_raw_daily_quotes", "calendar_verified": True})
+        return relative_volume_5d(result.get("data") or [], days)
+
+    async def valuation_history_context(self, market: str, symbol: str, end_date: str,
+                                        sessions: int = 120, timeout: int = 12) -> Dict:
+        """A bounded single-symbol long window, separate from the current quote."""
+        from app.data.query.valuation_evidence import summarize_valuation_history
+        if market != "CN" or not str(symbol).isdigit() or not 20 <= sessions <= 500:
+            return {"status": "unavailable", "reason": "unsupported_history_request", "fields": {}}
+        context = await self.analysis_context(market, end_date, sessions=sessions)
+        dates = context.get("recent_trade_dates") or []
+        if context.get("calendar_status") != "success" or len(dates) != sessions:
+            return {"status": "unavailable", "reason": "actual_session_calendar_unverified", "fields": {},
+                    "requested_sessions": sessions, "observed_session_count": len(dates)}
+        read = await self.read_ready(market, "daily_indicators", symbol, timeout=timeout,
+            start_date=dates[0], end_date=end_date,
+            filters={"required_fields": ["pb", "pe_ttm"], "expected_dates": dates,
+                     "contract": "verified_dated_indicators", "calendar_verified": True})
+        result = summarize_valuation_history(read.get("data") or [], dates, sessions)
+        result["quality"] = read.get("quality")
+        result["status"] = "available" if all(item["status"] in {"available", "not_applicable_nonpositive"}
+                                              for item in result["fields"].values()) else "partial"
+        return result
+
+    async def margin_eligibility(self, market: str, symbol: str, as_of: str) -> Dict:
+        if market != "CN":
+            return {"status": "unknown", "eligible": None, "reason": "market_eligibility_not_verified"}
+        from app.data.sources.cn.shared.margin_series import fetch_margin_eligibility
+        return await fetch_margin_eligibility(symbol, as_of)
 
     async def read_latest(
         self,
@@ -96,7 +414,72 @@ class DataInterface:
         projection: Optional[Dict] = None,
     ) -> Optional[Dict]:
         """读取指定股票在某域的最新一条记录（排序键按域自动推导）。"""
+        market = _normalize_market(market)
+        symbol = normalize_data_symbol(symbol, market, domain)
         return await self.reader.read_latest(market, domain, symbol, projection)
+
+    async def technical_snapshot(self, market: str, symbol: str, end_date: str, refresh: bool = True,
+                                 analysis_horizon: str = "short") -> Dict:
+        """Read a bounded period-specific history and derive technical context."""
+        from datetime import date, timedelta
+        from app.core.analysis_horizon import get_horizon_profile
+        from app.data.core.analysis_context import _calendar_days
+        from app.data.query.technical_analysis import build_technical_snapshot, select_daily_bars, verified_price_group
+
+        profile = get_horizon_profile(analysis_horizon)
+        end = date.fromisoformat(end_date)
+        start = (end - timedelta(days=profile.technical_lookback_days)).isoformat()
+        records = await self.read(market, "daily_quotes", symbol, start_date=start, end_date=end_date, filters={"period": "daily"})
+        calendar = await self.read(market, "trade_calendar", start_date=start, end_date=end_date)
+        acquisition_warnings = []
+        calendar_days = _calendar_days(calendar.get("data") or [])
+        known_days = {day for day, opened in calendar_days.items() if opened is not None}
+        requested_calendar_days = {
+            (end - timedelta(days=i)).isoformat() for i in range(profile.technical_lookback_days + 1)}
+        calendar_holes = profile.key != "short" and any(
+            day not in known_days for day in requested_calendar_days)
+        if refresh and (end_date not in known_days or calendar_holes):
+            try:
+                await self.refresh(market, "__calendar__", domains=["trade_calendar"], timeout=8, start_date=start, end_date=end_date)
+                calendar = await self.read(market, "trade_calendar", start_date=start, end_date=end_date)
+            except Exception as exc:
+                acquisition_warnings.append(f"历史交易日历补取未完成（{type(exc).__name__}），仅使用已有日历证据。")
+        priorities = await self._priority.get_priority(market, "daily_quotes")
+        bars = select_daily_bars(records.get("data") or [], end_date, priorities)
+        calendar_days = _calendar_days(calendar.get("data") or [])
+        calendar_history_verified = all(calendar_days.get(day) is not None for day in requested_calendar_days)
+        open_days = [day for day, opened in calendar_days.items() if opened is True and start <= day <= end_date]
+        last = bars["trade_date"].max().strftime("%Y-%m-%d") if not bars.empty else ""
+        first = bars["trade_date"].min().strftime("%Y-%m-%d") if not bars.empty else ""
+        history_short = profile.key != "short" and (
+            not calendar_history_verified or not first or (open_days and first > min(open_days)))
+        if refresh and (len(bars) < 260 or (open_days and last < max(open_days))
+                        or history_short
+                        or (market == "CN" and not verified_price_group(bars, end_date))):
+            try:
+                await self.refresh(market, symbol, domains=["daily_quotes"], force=True, timeout=25,
+                                   start_date=start, end_date=end_date)
+                records = await self.read(market, "daily_quotes", symbol, start_date=start, end_date=end_date, filters={"period": "daily"})
+            except Exception as exc:
+                acquisition_warnings.append(f"历史行情补取未完成（{type(exc).__name__}），保留已验证的现有日线。")
+        result = build_technical_snapshot(records.get("data") or [], calendar.get("data") or [], end_date, priorities,
+                                          weekly_bars=profile.weekly_bars, monthly_bars=profile.monthly_bars)
+        if acquisition_warnings:
+            result.setdefault("warnings", []).extend(acquisition_warnings)
+        if profile.key != "short":
+            result["analysis_horizon"] = profile.key
+            result["requested_history_start"] = start
+            result["requested_history_end"] = end_date
+            observed_start = result.get("history_start")
+            result["history_window_status"] = (
+                "available" if observed_start and open_days and observed_start <= min(open_days)
+                and calendar_history_verified and result.get("calendar_complete") and not result.get("missing_open_dates")
+                and result.get("data_cutoff") == max(open_days) else "partial")
+            result["requested_calendar_verified"] = calendar_history_verified
+            if result["history_window_status"] != "available":
+                result.setdefault("warnings", []).append(
+                    "所请求的中长线历史窗口尚未完整验证；可能涉及上市年限、停牌或源覆盖限制。保留已有证据，不把有限历史当作完整多年表现。")
+        return result
 
     async def read_latest_batch(
         self,
@@ -106,6 +489,8 @@ class DataInterface:
         projection: Optional[Dict] = None,
     ) -> Dict[str, Dict]:
         """批量读取多只股票各自的最新一条记录，返回 {symbol: doc}。"""
+        market = _normalize_market(market)
+        symbols = [normalize_data_symbol(s, market, domain) for s in symbols]
         return await self.reader.read_latest_batch(
             market, domain, symbols, projection
         )
@@ -120,6 +505,8 @@ class DataInterface:
         limit: int = 0,
     ) -> List[Dict]:
         """批量读取多只股票的记录（不折叠）。"""
+        market = _normalize_market(market)
+        symbols = [normalize_data_symbol(s, market, domain) for s in symbols]
         return await self.reader.read_batch(
             market, domain, symbols, projection, sort, limit
         )
@@ -132,7 +519,92 @@ class DataInterface:
         limit: int = 20,
     ) -> List[Dict]:
         """在 basic_info 中模糊搜索股票（symbol 前缀 / 名称包含）。"""
+        market = _normalize_market(market)
         return await self.reader.search_basic_info(market, query, fields, limit)
+
+    # ── 知识库检索（AI 数据面契约）──
+
+    async def kb_search(
+        self,
+        market: str,
+        symbol: str,
+        query: str,
+        *,
+        as_of: Optional[str] = None,
+        top_k: Optional[int] = None,
+        types: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        """新闻知识库向量检索 top-K 语料（AI 侧知识通道的唯一入口）。
+
+        Args:
+            market: 市场 (CN/HK/US)
+            symbol: 股票代码（自动归一）
+            query: 检索文本（关键词或自然语言）
+            as_of: 截止日期，防前视硬约束——分析注入路径必须传分析日期
+            top_k: 返回条数（默认 6）
+            types: 语料类型过滤（news/announcement/…）
+
+        Returns:
+            语料 dict 列表；索引未就绪 / 未配置向量模型 / 无命中返回 []。
+        """
+        market = _normalize_market(market)
+        symbol = normalize_symbol(symbol, market)
+        from app.data.knowledge.retrieval import search
+
+        return await asyncio.to_thread(
+            search, market, symbol, query,
+            as_of, top_k if top_k is not None else 6, types,
+        )
+
+    async def kb_record_citation(self, doc: Dict) -> bool:
+        """写入一条引用校验记录（失败只记日志返回 False，不影响分析主链路）。"""
+        from app.data.knowledge.stats import record_citation_stats
+
+        return await asyncio.to_thread(record_citation_stats, doc)
+
+    # ── 数据可用性（AI 可用性面契约）──
+
+    async def get_availability(
+        self, market: str, domains: Optional[List[str]] = None
+    ) -> Dict[str, Dict]:
+        """查询各域数据可用性（configured 与 has_data 正交）。
+
+        - configured: 能力矩阵注册了源 → 可触发同步/refresh 补数
+        - has_data: 库内有记录 → 可立即 read
+        「有源无货」= 可补数；「无源有货」= 只能消费存量。
+
+        Args:
+            market: 市场 (CN/HK/US)
+            domains: 待查域列表；None = 该市场全部注册域；含未注册域抛 ValueError
+
+        Returns:
+            {domain: {"configured", "has_data", "records", "last_updated", "sources"}}
+        """
+        market = _normalize_market(market)
+        registered = set(self._registry.get_domains(market))
+        if domains is None:
+            targets = sorted(registered)
+        else:
+            unknown = [d for d in domains if d not in registered]
+            if unknown:
+                raise ValueError(f"未注册的数据域: {unknown}")
+            targets = list(dict.fromkeys(domains))
+
+        stats = await self.get_domain_stats(market, targets)
+        availability: Dict[str, Dict] = {}
+        for domain in targets:
+            stat = stats.get(domain, {})
+            records = stat.get("records", 0)
+            availability[domain] = {
+                "configured": True,
+                "has_data": records > 0,
+                "records": records,
+                "last_updated": stat.get("last_updated"),
+                "sources": self._registry.get_available_sources(
+                    domain, market=market
+                ) or [],
+            }
+        return availability
 
     # ── 筛选查询 ──
 
@@ -167,10 +639,23 @@ class DataInterface:
         domains: Optional[List[str]] = None,
         force: bool = False,
         timeout: int = 30,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        coverage_filters: Optional[Dict] = None,
     ) -> RefreshResult:
-        """按需刷新指定股票数据。"""
+        """按需刷新指定股票数据（symbol 容忍多种写法，自动归一）。"""
+        market = _normalize_market(market)
+        symbol = normalize_data_symbol(symbol, market, "index_quotes" if domains == ["index_quotes"] else "", coverage_filters)
+        from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT
+        context = ACTIVE_ANALYSIS_CONTEXT.get()
+        if context and context.get("market") == market and domains != ["trade_calendar"]:
+            cutoff = context.get("as_of")
+            if cutoff:
+                end_date = min(end_date, cutoff) if end_date else cutoff
         return await self.refresh_service.refresh(
-            market, symbol, domains, force, timeout
+            market, symbol, domains, force, timeout, start_date=start_date, end_date=end_date,
+            coverage_filters=coverage_filters,
         )
 
     # ── 同步管理 ──
@@ -208,11 +693,13 @@ class DataInterface:
             except Exception as e:
                 logger.warning(f"回调触发失败: {e}")
 
-        # 降级：尝试调度引擎（后台执行，立即返回标识）
+        # 降级：尝试调度引擎（后台执行，立即返回标识）。
+        # SchedulerEngine 本就是数据模块组件（app/data/scheduler/engine），
+        # 直接取其单例，不再绕道 app.worker（保持 data 不依赖上层）
         try:
-            from app.worker.scheduler_setup import get_scheduler_engine
+            from app.data.scheduler.engine import SchedulerEngine
 
-            engine = get_scheduler_engine()
+            engine = SchedulerEngine.get_instance()
             if engine:
                 result = engine.run_job_now(market, domain, mode=mode, source=source)
                 if result.get("status") in ("triggered", "already_running"):
@@ -277,12 +764,44 @@ class DataInterface:
         mongo_health = await self._metadata_repo.get_all_health(market)
 
         if mongo_health:
-            return mongo_health
+            # 过滤能力矩阵中已经移除的旧源，避免页面继续显示历史 Tushare
+            # 健康记录，让用户误以为当前部署仍会调用收费源。
+            allowed = {
+                (source, domain)
+                for domain in self._registry.get_domains(market)
+                for source in self._registry.get_available_sources(domain, market)
+            }
+            return [
+                item
+                for item in mongo_health
+                if (item.get("data_source") or item.get("source"), item.get("domain")) in allowed
+            ]
 
         from app.data.monitoring.source_health import SourceHealthMonitor
 
         monitor = SourceHealthMonitor()
         return monitor.get_all_health(market)
+
+    async def fetch_market_quotes(
+        self,
+        market: str,
+        preferred_sources: Optional[List[str]] = None,
+    ) -> Dict:
+        """从外部免费源拉取全市场快照，不读取 MongoDB 缓存。"""
+        from app.data.processor.fallback_router import FallbackRouter
+
+        result = await FallbackRouter.get_instance().fetch(
+            market,
+            "market_quotes",
+            "__all__",
+            preferred_sources=preferred_sources,
+        )
+        return {
+            "success": result.success,
+            "data": result.records,
+            "source": result.source,
+            "error": result.error,
+        }
 
     async def reset_source_circuit(self, market: str, source: str, domain: str) -> None:
         """运维重置指定源的熔断器（消费层路由的合法入口）。
@@ -434,7 +953,12 @@ class DataInterface:
     async def get_domain_stats(
         self, market: str, domains: List[str]
     ) -> Dict[str, Dict]:
-        """获取各域统计信息（记录数 + 最后更新时间）。"""
+        """获取各域统计信息（记录数 + 最后更新时间，60s 共享缓存）。"""
+        cache_key = f"stats:{market}:{','.join(domains)}"
+        cached = self._dashboard_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         from app.data.storage.mongo.client import get_motor_db
         from app.data.storage.mongo.collections import get_collection_name
 
@@ -456,6 +980,7 @@ class DataInterface:
             except Exception as e:
                 logger.debug(f"获取域统计失败: {domain}: {e}")
                 stats[domain] = {"records": 0, "last_updated": None}
+        self._dashboard_cache.set(cache_key, stats)
         return stats
 
     async def get_quotes_stats(self, market: str) -> Dict[str, int]:
@@ -480,7 +1005,12 @@ class DataInterface:
     async def get_quality_overview(
         self, market: str, domains: List[str]
     ) -> Dict[str, Dict]:
-        """获取各域质量概览（记录数、完整率、最新日期）。"""
+        """获取各域质量概览（记录数、完整率、最新日期，60s 共享缓存）。"""
+        cache_key = f"overview:{market}:{','.join(domains)}"
+        cached = self._dashboard_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         from app.data.storage.mongo.client import get_motor_db
         from app.data.storage.mongo.collections import get_collection_name
 
@@ -510,6 +1040,7 @@ class DataInterface:
                 }
             except Exception as e:
                 overview[domain] = {"error": str(e)}
+        self._dashboard_cache.set(cache_key, overview)
         return overview
 
     async def check_domain_quality(self, market: str, domain: str) -> Dict:

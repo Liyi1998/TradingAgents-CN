@@ -1,0 +1,3 @@
+services:
+  frontend:
+    image: tradingagents-cn-hub-frontend:chart-layout-50648425

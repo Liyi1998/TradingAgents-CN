@@ -15,6 +15,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 _consumer_started = False
+_consumer_start_requested = False
 
 
 async def refresh_queue_consumer_loop():
@@ -23,7 +24,7 @@ async def refresh_queue_consumer_loop():
     每轮最多处理 MAX_MESSAGES_PER_TICK 条（限速保护），其余留待下轮。
     Redis 不可用时 RefreshQueue.pop_refresh 自动降级内存队列，无异常外泄。
     """
-    global _consumer_started
+    global _consumer_started, _consumer_start_requested
     if _consumer_started:
         return
     _consumer_started = True
@@ -37,7 +38,9 @@ async def refresh_queue_consumer_loop():
         while True:
             processed = 0
             try:
-                for market in ("CN", "HK", "US"):
+                from app.core.config import settings
+                markets = [value.strip().upper() for value in settings.DATA_FRESHNESS_PATROL_MARKETS.split(",")]
+                for market in markets:
                     for _ in range(10):  # 每市场每轮至多 10 条，限速保护
                         msg = await queue.pop_refresh(market)
                         if not msg:
@@ -52,6 +55,7 @@ async def refresh_queue_consumer_loop():
             await asyncio.sleep(5 if processed == 0 else 1)
     finally:
         _consumer_started = False
+        _consumer_start_requested = False
 
 
 async def _handle_refresh_message(market: str, msg: dict) -> None:
@@ -64,8 +68,9 @@ async def _handle_refresh_message(market: str, msg: dict) -> None:
         from app.data.core.interface import DataInterface
 
         di = DataInterface.get_instance()
-        await di.refresh(market, symbol, domains=[domain], timeout=30)
-        logger.debug("按需刷新完成 %s/%s/%s", market, symbol, domain)
+        result = await di.refresh(market, symbol, domains=[domain], timeout=30,
+            start_date=msg.get("start_date"), end_date=msg.get("end_date"))
+        logger.debug("按需刷新结果 %s/%s/%s: %s", market, symbol, domain, result.status)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -74,12 +79,16 @@ async def _handle_refresh_message(market: str, msg: dict) -> None:
 
 def start_refresh_consumer():
     """注册消费协程到 task_registry（幂等：已启动则跳过）。"""
-    if _consumer_started:
+    global _consumer_start_requested
+    if _consumer_started or _consumer_start_requested:
         return
+    _consumer_start_requested = True
     from app.core.task_registry import task_registry
 
-    task_registry.register(
-        refresh_queue_consumer_loop(),
-        name="data_refresh_queue_consumer",
-        critical=False,
-    )
+    coro = refresh_queue_consumer_loop()
+    try:
+        task_registry.register(coro, name="data_refresh_queue_consumer", critical=False)
+    except Exception:
+        coro.close()
+        _consumer_start_requested = False
+        raise

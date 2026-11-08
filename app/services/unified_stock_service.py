@@ -52,84 +52,51 @@ class UnifiedStockService:
             return data[-limit:]
         return [data]
 
-    async def get_cn_quote_with_basic_info(self, code6: str) -> Optional[Dict]:
-        """获取 A 股实时行情（合并 market_quotes + daily_quotes + basic_info）。"""
+    async def get_cn_quote_with_basic_info(self, code6: str, force_refresh: bool = False) -> Optional[Dict]:
+        """A single dated quote snapshot, with a separately labelled daily fallback."""
+        import asyncio
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        from app.data.query.quote_snapshot import quote_view
+
         di = self._di()
-
-        # 1) market_quotes：获取实时行情（含 open/high/low/close/pre_close/volume/amount 等）
-        q_result = await di.read("CN", "market_quotes", symbol=code6)
-        q = q_result.get("data")
-
-        # 2) daily_quotes 最新一条：获取 open/high/low/close/pct_chg/volume/amount/turnover_rate
-        dq = {}
+        now = datetime.now(ZoneInfo("Asia/Shanghai"))
+        day = now.date().isoformat()
+        filters = {"asset_type": "stock", "required_fields": ["last_price"],
+                   "contract": "verified_spot_quote", "quote_symbol": code6, "quote_as_of": day}
+        q = {}
         try:
-            latest_dq = await di.read_latest("CN", "daily_quotes", code6)
-            if latest_dq:
-                dq = latest_dq
-        except Exception as e:
-            logger.warning(f"获取 daily_quotes 最新记录失败: {e}")
+            async with asyncio.timeout(10):
+                if force_refresh:
+                    await di.refresh("CN", code6, domains=["market_quotes"], force=True, timeout=8,
+                        start_date=day, end_date=day, coverage_filters=filters)
+                    result = await di.read("CN", "market_quotes", symbol=code6, filters=filters)
+                else:
+                    result = await di.read_ready("CN", "market_quotes", code6, timeout=8,
+                        start_date=day, end_date=day, filters=filters)
+                data = result.get("data") or {}
+                q = data[0] if isinstance(data, list) and data else data
+        except Exception as exc:
+            logger.warning("Single-stock quote unavailable: %s", type(exc).__name__)
+        daily = await di.read_latest("CN", "daily_quotes", code6) or {}
+        basic = (await di.read("CN", "basic_info", symbol=code6)).get("data") or {}
+        return quote_view(code6, basic, q if isinstance(q, dict) else {}, daily, datetime.now(ZoneInfo("Asia/Shanghai")))
 
-        # 3) basic_info：获取名称等
-        b_result = await di.read("CN", "basic_info", symbol=code6)
-        b = b_result.get("data")
-
-        if not q and not dq and not b:
-            return None
-
-        # 价格：优先 market_quotes 的实时价，其次 daily_quotes 收盘价
-        close = (q or {}).get("last_price") or dq.get("close")
-        pct = dq.get("pct_chg") or (q or {}).get("pct_chg")
-        prev_close = dq.get("pre_close") or (q or {}).get("pre_close")
-        if prev_close is None and close is not None and pct is not None:
-            try:
-                prev_close = round(float(close) / (1.0 + float(pct) / 100.0), 4)
-            except Exception as e:
-                logger.debug(f"计算前收盘价失败: {e}")
-                prev_close = None
-
-        turnover_rate = dq.get("turnover_rate")
-        if turnover_rate is None:
-            turnover_rate = (b or {}).get("turnover_rate")
-        # daily_quotes 和 basic_info 可能都没有 turnover_rate，尝试从 daily_indicators 获取
-        if turnover_rate is None:
-            try:
-                ind_result = await di.read("CN", "daily_indicators", symbol=code6)
-                ind_data = ind_result.get("data")
-                if ind_data:
-                    ind = ind_data[0] if isinstance(ind_data, list) and ind_data else ind_data
-                    turnover_rate = ind.get("turnover_rate")
-            except Exception as e:
-                logger.debug(f"获取换手率数据失败: {e}")
-                pass
-
-        amplitude = None
-        try:
-            high = dq.get("high") or (q or {}).get("high")
-            low = dq.get("low") or (q or {}).get("low")
-            if high is not None and low is not None and prev_close is not None and prev_close > 0:
-                amplitude = round((float(high) - float(low)) / float(prev_close) * 100, 2)
-        except Exception as e:
-            logger.debug(f"计算振幅失败: {e}")
-            pass
-
-        return {
-            "symbol": code6,
-            "name": (b or {}).get("name"),
-            "market": (b or {}).get("market"),
-            "price": close,
-            "change_percent": pct,
-            "amount": dq.get("amount") or (q or {}).get("amount"),
-            "volume": dq.get("volume") or (q or {}).get("volume"),
-            "open": dq.get("open") or (q or {}).get("open"),
-            "high": dq.get("high") or (q or {}).get("high"),
-            "low": dq.get("low") or (q or {}).get("low"),
-            "prev_close": prev_close,
-            "turnover_rate": turnover_rate,
-            "amplitude": amplitude,
-            "trade_date": dq.get("trade_date"),
-            "updated_at": (q or {}).get("updated_at") or dq.get("updated_at"),
-            "data_source": (q or {}).get("data_source") or dq.get("data_source") or (b or {}).get("data_source"),
-        }
+    async def get_cn_market_chart(self, code6: str, force_refresh: bool = False) -> Dict:
+        from datetime import datetime, timezone
+        from app.data.query.research_tracking import collect_market_chart
+        from app.data.query.intraday_chart import intraday_observation
+        chart = await collect_market_chart(code6, datetime.now(timezone.utc), di=self._di())
+        # A visible dashboard needs a new observation, not the 15-minute
+        # tolerance used by long-running analysis. One bounded single-stock call.
+        quote = await self.get_cn_quote_with_basic_info(code6,
+            force_refresh=force_refresh or chart['session']['phase'] in {'trading', 'settling'})
+        now = datetime.now(timezone.utc)
+        live, status = intraday_observation(code6, quote, chart['bars'], chart['session'], now)
+        result = {**chart, 'quote': quote, 'live_bar': live, 'live_status': status, 'checked_at': now.isoformat()}
+        from app.services.chan_structure import ChanStructureService
+        result['chan'] = await ChanStructureService().build(code6, result, now=now)
+        return result
 
     async def get_cn_fundamentals(
         self, code6: str, source: Optional[str] = None,
@@ -241,6 +208,10 @@ class UnifiedStockService:
 
         if result_data["roe"] is None:
             result_data["roe"] = b.get("roe")
+
+        roe_evidence = ((financial_data or {}).get("field_provenance") or {}).get("roe") or {}
+        result_data["roe_status"] = "available" if result_data["roe"] is not None else roe_evidence.get("status", "unavailable")
+        result_data["financial_report_period"] = (financial_data or {}).get("report_period")
 
         return result_data
 

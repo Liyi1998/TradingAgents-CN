@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:model-check-0dac0e57
+  frontend:
+    image: tradingagents-cn-hub-frontend:model-check-0dac0e57

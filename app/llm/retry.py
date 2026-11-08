@@ -11,7 +11,7 @@ import asyncio
 import logging
 from typing import Awaitable, Callable, TypeVar
 
-from .core.errors import AuthError, LLMError, RateLimitError
+from .core.errors import AuthError, ContextWindowExceededError, LLMError, RateLimitError
 
 logger = logging.getLogger("app.llm.retry")
 
@@ -35,8 +35,15 @@ def _delay_ms(attempt: int) -> int:
 
 
 def _should_retry(exc: Exception) -> bool:
-    if isinstance(exc, AuthError):
+    from .failures import describe_failure
+
+    if describe_failure(exc)["kind"] == "quota_exhausted":
+        return False  # 账号总额度耗尽不是短时限流，立即重试只会增加无效请求
+    if isinstance(exc, (AuthError, ContextWindowExceededError)):
         return False  # 鉴权失败重试无意义
+    status = getattr(exc, "status_code", None)
+    if status is not None and 400 <= status < 500 and status not in (408, 409, 429):
+        return False
     if isinstance(exc, (RateLimitError, TimeoutError, ConnectionError, LLMError)):
         return True
     return False
@@ -47,8 +54,10 @@ async def with_retry(
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
     on_fallback_trigger: Callable[[], None] = lambda: None,
+    on_retry: Callable[[int, Exception, int], Awaitable[None]] | None = None,
 ) -> T:
     """带重试执行 API 调用。限流连续达到阈值抛 FallbackTriggeredError。"""
+    max_retries = max(0, min(int(max_retries), DEFAULT_MAX_RETRIES))
     rate_limit_streak = 0
     attempt = 0
     while True:
@@ -70,5 +79,10 @@ async def with_retry(
             logger.warning(
                 f"⚠️ [retry] 第 {attempt + 1}/{max_retries} 次重试（{type(e).__name__}），{delay}ms 后重试: {e}"
             )
+            if on_retry is not None:
+                try:
+                    await on_retry(attempt + 1, e, delay)
+                except Exception:
+                    logger.warning("重试状态通知失败，不影响模型重试", exc_info=True)
             await asyncio.sleep(delay / 1000)
             attempt += 1

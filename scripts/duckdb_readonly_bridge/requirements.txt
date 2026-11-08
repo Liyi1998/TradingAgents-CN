@@ -1,0 +1,4 @@
+# Isolated host bridge dependencies; install only inside the Miniconda environment.
+duckdb==1.5.5
+fastapi==0.141.1
+uvicorn==0.52.4

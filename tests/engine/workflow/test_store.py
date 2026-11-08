@@ -23,7 +23,7 @@ class TestSeeds:
         agents = seeds.load_agent_seeds()
         workflows = seeds.load_workflow_seeds()
         assert len(agents) == 14  # phase1×6 + phase2×4 + phase3×4
-        assert [w["slug"] for w in workflows] == ["default-4stage"]
+        assert [w["slug"] for w in workflows] == ["default-4stage", "research-medium", "research-long"]
 
     def test_seed_phases_and_order(self):
         agents = seeds.load_agent_seeds()

@@ -15,12 +15,24 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import logging
+import threading
 
 from .config import load_config
 from .core.base import BaseLLMClient
 from .core.factory import create_client
 
 logger = logging.getLogger("app.llm.providers")
+
+# 系统配置加载器：应用层启动时注入（config_service.get_system_config）。
+# llm 层不 import services（依赖方向：应用层 → llm）；未注入时走 .env 回退。
+_system_config_loader = None
+
+
+def set_system_config_loader(loader) -> None:
+    """注入系统配置加载器（async，返回 system_config 或抛异常）。"""
+    global _system_config_loader
+    _system_config_loader = loader
+
 
 # provider → 默认协议推断（仅 anthropic 原生走 anthropic 协议，其余全部 openai 兼容）
 _PROVIDER_PROTOCOL = {
@@ -30,6 +42,11 @@ _PROVIDER_PROTOCOL = {
     "volcengine": "anthropic",
 }
 DEFAULT_PROTOCOL = "openai"
+
+
+def _in_worker_thread() -> bool:
+    """Motor 客户端绑定主事件循环；工作线程中的 asyncio.run 必须走 pymongo。"""
+    return threading.current_thread() is not threading.main_thread()
 
 
 @dataclass
@@ -91,11 +108,17 @@ def infer_protocol(provider: str, protocol: Optional[str] = None) -> str:
 
 
 def _pick_candidates(configs: List[Dict[str, Any]], role: str = "both") -> List[Dict[str, Any]]:
-    """角色匹配的启用配置，按 priority 降序（首位为 primary，次位为 fallback）"""
+    """角色匹配的启用配置，按 priority 降序（首位为 primary，次位为 fallback）。
+
+    model_type=embedding 的条目是向量模型（知识库/记忆用），不参与对话角色解析；
+    与 suitable_roles 分开承载，避免给角色字段加值导致前端「全选折叠为 both」
+    与 analyst/debate 过滤器掉进折叠分支。
+    """
     candidates = [
         c
         for c in configs
-        if c.get("enabled", True) and (c.get("suitable_roles") or ["both"])
+        if c.get("enabled", True) and (c.get("model_type") or "chat") == "chat"
+        and (c.get("suitable_roles") or ["both"])
         and (role in (c.get("suitable_roles") or ["both"]) or "both" in (c.get("suitable_roles") or []))
     ]
     return sorted(candidates, key=lambda c: c.get("priority", 0), reverse=True)
@@ -207,6 +230,8 @@ _CONFIG_FIELDS = (
     # 每模型参数（表单采集，此前未消费）
     "max_tokens", "temperature", "timeout", "retry_times", "context_window",
     "thinking_budget", "thinking_effort", "max_concurrency",
+    # 模型用途分类：chat（对话）| embedding（向量，知识库用）；缺省 chat
+    "model_type", "embedding_dimension",
 )
 
 
@@ -391,20 +416,22 @@ async def resolve_task_override_bundle(
     configs: List[Dict[str, Any]] = []
     provider_defaults: Dict[str, Dict[str, Any]] = {}
     catalog_index: Dict[str, Dict[str, Optional[int]]] = {}
-    try:
-        from app.services.config import config_service
-
-        system_config = await config_service.get_system_config()
-        configs = _normalize_llm_configs(
-            [c.model_dump() for c in (system_config.llm_configs or [])]
-        )
-        if configs:
-            provider_defaults = await _load_provider_defaults_async()
-            catalog_index = await _load_catalog_index_async()
-    except Exception as e:  # noqa: BLE001 - 数据库不可用时仅用入参
-        logger.warning(f"[providers] 任务覆盖读取数据库配置失败: {e}")
-    if not configs:
+    if _in_worker_thread():
         configs, provider_defaults, catalog_index = _load_all_sync()
+        logger.debug("[providers] 工作线程任务覆盖直接使用 pymongo 读取配置")
+    else:
+        try:
+            system_config = await _system_config_loader() if _system_config_loader else None
+            configs = _normalize_llm_configs(
+                [c.model_dump() for c in (getattr(system_config, "llm_configs", None) or [])]
+            )
+            if configs:
+                provider_defaults = await _load_provider_defaults_async()
+                catalog_index = await _load_catalog_index_async()
+        except Exception as e:  # noqa: BLE001 - 数据库不可用时仅用入参
+            logger.warning(f"[providers] 任务覆盖读取数据库配置失败: {e}")
+        if not configs:
+            configs, provider_defaults, catalog_index = _load_all_sync()
 
     # 同名模型配置继承每模型参数（覆盖路径不应丢失 DB 参数）
     inherit = next((c for c in configs if c.get("model_name") == model), None) or {}
@@ -461,6 +488,63 @@ async def resolve_task_override_bundle(
     return bundle
 
 
+# ── 向量模型配置解析（知识库 / 记忆 embedding 用） ──────────────────────────
+
+
+@dataclass
+class EmbeddingResolved:
+    """解析后的向量模型配置（OpenAI 兼容 /v1/embeddings 通用协议）"""
+
+    provider: str
+    model_name: str
+    api_key: str
+    base_url: Optional[str]  # 空 = OpenAI 官方默认地址
+    dimension: Optional[int] = None  # 空 = 模型默认维度
+    source: str = "db"
+
+
+def resolve_embedding_config() -> Optional[EmbeddingResolved]:
+    """读取 model_type=embedding 的启用模型配置（priority 最高者）。
+
+    同步 pymongo 路径：调用方（知识库索引/检索、记忆 embedding 解析）
+    多运行在工作线程，motor 绑定主循环会抛跨循环异常。
+    无可用配置返回 None（调用方自行降级或禁用）。
+    """
+    try:
+        from app.core.database import get_mongo_db_sync
+
+        db = get_mongo_db_sync()
+        doc = db.system_configs.find_one({"is_active": True}, sort=[("version", -1)])
+        configs = _normalize_llm_configs((doc or {}).get("llm_configs"))
+        provider_docs = list(
+            db.llm_providers.find(
+                {}, {"name": 1, "api_key": 1, "default_base_url": 1, "protocol": 1}
+            ).limit(200)
+        )
+        defaults = _normalize_provider_defaults(provider_docs)
+    except Exception as e:  # noqa: BLE001 - 数据库不可用（独立测试场景）
+        logger.info(f"[providers] 读取向量模型配置失败: {e}")
+        return None
+
+    candidates = [
+        c for c in configs
+        if c.get("enabled", True) and c.get("model_type") == "embedding"
+    ]
+    candidates.sort(key=lambda c: c.get("priority", 0), reverse=True)
+    if not candidates:
+        return None
+
+    cfg = candidates[0]
+    defaults_ = defaults.get((cfg.get("provider") or "").strip().lower()) or {}
+    return EmbeddingResolved(
+        provider=cfg.get("provider") or "custom",
+        model_name=cfg["model_name"],
+        api_key=cfg.get("api_key") or defaults_.get("api_key") or "",
+        base_url=cfg.get("api_base") or defaults_.get("default_base_url") or None,
+        dimension=cfg.get("embedding_dimension"),
+    )
+
+
 async def get_engine_clients() -> Dict[str, EngineClientBundle]:
     """引擎入口：数据库配置优先，.env 回退。返回 {"analyst": bundle, "debate": bundle}。
 
@@ -469,23 +553,26 @@ async def get_engine_clients() -> Dict[str, EngineClientBundle]:
     configs: List[Dict[str, Any]] = []
     provider_defaults: Dict[str, Dict[str, Any]] = {}
     catalog_index: Dict[str, Dict[str, Optional[int]]] = {}
-    try:
-        from app.services.config import config_service
-
-        system_config = await config_service.get_system_config()
-        configs = _normalize_llm_configs(
-            [c.model_dump() for c in (system_config.llm_configs or [])]
-        )
-    except Exception as e:  # noqa: BLE001 - 独立使用 app/llm 时无数据库
-        logger.info(f"[providers] 数据库配置不可用: {e}")
-    if configs:
-        provider_defaults = await _load_provider_defaults_async()
-        catalog_index = await _load_catalog_index_async()
-    else:
-        # motor 读取失败（常见于分析工作线程跨事件循环）→ pymongo 同步回退
+    if _in_worker_thread():
+        # 分析服务在 worker 中用 asyncio.run 创建临时循环，不能复用主循环 Motor。
         configs, provider_defaults, catalog_index = _load_all_sync()
         if configs:
-            logger.info("[providers] motor 不可用，已通过 pymongo 同步读取数据库配置")
+            logger.info("[providers] 工作线程已通过 pymongo 同步读取数据库配置")
+    else:
+        try:
+            system_config = await _system_config_loader() if _system_config_loader else None
+            configs = _normalize_llm_configs(
+                [c.model_dump() for c in (getattr(system_config, "llm_configs", None) or [])]
+            )
+        except Exception as e:  # noqa: BLE001 - 独立使用 app/llm 时无数据库
+            logger.info(f"[providers] 数据库配置不可用: {e}")
+        if configs:
+            provider_defaults = await _load_provider_defaults_async()
+            catalog_index = await _load_catalog_index_async()
+        else:
+            configs, provider_defaults, catalog_index = _load_all_sync()
+            if configs:
+                logger.info("[providers] motor 不可用，已通过 pymongo 同步读取数据库配置")
 
     bundles: Dict[str, EngineClientBundle] = {}
     for role in ("analyst", "debate"):

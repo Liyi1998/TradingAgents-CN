@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-evidence-e01492db
+  frontend:
+    image: tradingagents-cn-hub-frontend:research-evidence-e01492db

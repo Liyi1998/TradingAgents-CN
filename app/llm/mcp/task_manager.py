@@ -14,6 +14,7 @@
 """
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -247,6 +248,7 @@ class TaskLevelMCPManager:
         self._circuit_breakers: Dict[str, CircuitBreaker] = {}
         self._server_semaphores: Dict[str, asyncio.Semaphore] = {}
         self._failed_tools: Set[str] = set()
+        self._disabled_servers: Set[str] = set()
         self._retry_mechanism = RetryMechanism(RetryConfig())
         self._circuit_config = CircuitBreakerConfig()
         # 使用 threading.Lock 保护 _failed_tools 的写入（在 execute_tool 中使用），
@@ -303,6 +305,10 @@ class TaskLevelMCPManager:
     async def is_tool_available(self, tool_name: str, server_name: Optional[str] = None) -> bool:
         """检查工具是否可用（只读检查，不产生状态副作用）"""
         tool_key = self._get_tool_key(tool_name, server_name)
+
+        # 配额耗尽属于服务器级不可恢复错误，当前任务内不再调用同服其他工具。
+        if server_name and server_name in self._disabled_servers:
+            return False
 
         # 检查是否在失败集合中
         if tool_key in self._failed_tools:
@@ -411,11 +417,39 @@ class TaskLevelMCPManager:
             if semaphore:
                 await semaphore.acquire()
                 acquired = True
+            if tool_key in self._failed_tools:
+                return {"status": "disabled", "message": "该工具连续失败；排队调用已停止", "tool_name": tool_name}
+            if server_name and server_name in self._disabled_servers:
+                return {"status": "disabled", "message": "服务配额已耗尽；本任务不再重试", "tool_name": tool_name}
 
             tool_state.total_calls += 1
 
             # 执行工具（带重试）
             result = await self._retry_mechanism.execute_with_retry(func, *args, **kwargs)
+
+            semantic_failure = self._semantic_failure(result)
+            if semantic_failure:
+                message, server_wide = semantic_failure
+                await circuit_breaker.record_failure()
+                tool_state.failure_count += 1
+                tool_state.last_failure_time = time.time()
+                tool_state.total_failures += 1
+                if tool_state.failure_count >= self._circuit_config.failure_threshold:
+                    with self._lock:
+                        self._failed_tools.add(tool_key)
+                if server_wide and server_name:
+                    with self._lock:
+                        self._disabled_servers.add(server_name)
+                    logger.warning(
+                        "MCP 服务器 %s 当前任务配额不可用，已停止调用该服务器其他工具",
+                        server_name,
+                    )
+                return {
+                    "status": "error",
+                    "message": message,
+                    "tool_name": tool_name,
+                    "error_type": "SemanticToolError",
+                }
 
             # 记录成功
             await circuit_breaker.record_success()
@@ -441,7 +475,7 @@ class TaskLevelMCPManager:
             if tool_state.failure_count >= self._circuit_config.failure_threshold:
                 with self._lock:
                     self._failed_tools.add(tool_key)
-                logger.error(f"工具 {tool_name} 连续失败 {tool_state.failure_count} 次，已在当前任务中禁用")
+                logger.error(f"工具 {tool_name} 连续失败 {tool_state.failure_count} 次，已在当前任务中禁用", exc_info=True)
 
             # 返回友好的错误信息
             return {
@@ -455,6 +489,36 @@ class TaskLevelMCPManager:
             # 释放并发锁（仅当成功 acquire 后才 release，避免 CancelledError 中断 acquire 导致下溢）
             if semaphore and acquired:
                 semaphore.release()
+
+    @staticmethod
+    def _semantic_failure(result: Any) -> Optional[tuple[str, bool]]:
+        """识别 MCP 的 HTTP-200 业务错误，返回 (错误消息, 是否服务器级)。"""
+        from app.llm.tools.result_status import classify_tool_result
+
+        try:
+            text = (
+                result
+                if isinstance(result, str)
+                else json.dumps(result, ensure_ascii=False, default=str)
+            )
+        except (TypeError, ValueError):
+            text = str(result)
+        lowered = text.lower()
+        quota_markers = (
+            "积分已用完",
+            "购买套餐包",
+            "额度已用完",
+            "quota exceeded",
+            "insufficient quota",
+        )
+        if any(marker in lowered for marker in quota_markers):
+            return "MCP 数据服务当前额度已用完，已改用本地免费数据源。", True
+        permission_markers = ("权限不足", "无权访问", "permission denied")
+        if any(marker in lowered for marker in permission_markers):
+            return "MCP 工具无权访问该资源，请改用其他免费数据源。", False
+        if classify_tool_result(result) == "error":
+            return "MCP 工具返回业务错误，已忽略该结果并继续使用其他数据源。", False
+        return None
 
     def get_tool_statistics(self, tool_name: str, server_name: Optional[str] = None) -> Dict[str, Any]:
         """获取工具统计信息（只读，不创建新状态条目，M-1 修复）。"""

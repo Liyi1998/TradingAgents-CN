@@ -17,6 +17,11 @@ class DailyQuotesSchema(CommonFields):
     pre_close: Optional[float] = None
     change: Optional[float] = None      # 涨跌额
     pct_chg: Optional[float] = None     # 涨跌幅 %
+    reported_pct_chg: Optional[float] = None  # quarantined vendor percentage, not a usable return
+    price_change_status: Optional[str] = None
     volume: Optional[float] = None      # 成交量（股）
     amount: Optional[float] = None      # 成交额（元）
     turnover_rate: Optional[float] = None  # 换手率 %
+    price_basis: Optional[str] = None     # raw / qfq / hfq; missing is unknown
+    adjustment_as_of: Optional[str] = None
+    adjustment_contract: Optional[str] = None

@@ -15,9 +15,14 @@ from urllib.parse import urlparse
 from bson import ObjectId
 
 from app.core.database import get_mongo_db
+from app.core.env import get_env
 from app.models.config import LLMConfig, LLMProvider
 from app.utils.timezone import now_tz
 from app.utils.api_key_utils import is_valid_api_key
+from app.llm.connection_check import (
+    CHECK_MAX_TOKENS, CONNECT_CHECK_TIMEOUT, DEFAULT_CHECK_TIMEOUT,
+    check_failure, check_timeout, require_check_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +41,15 @@ _BANNED_NETWORKS = [
     ipaddress.ip_network("fc00::/7"),  # IPv6 ULA
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
 ]
+
+
+def _private_llm_host_allowlist() -> set[str]:
+    """Return exact hostnames explicitly allowed for local LLM deployments."""
+    return {
+        hostname.strip().lower().rstrip(".")
+        for hostname in str(get_env("LLM_PRIVATE_HOST_ALLOWLIST", "")).split(",")
+        if hostname.strip()
+    }
 
 
 def _validate_llm_base_url(base_url: str) -> None:
@@ -58,8 +72,13 @@ def _validate_llm_base_url(base_url: str) -> None:
     if not hostname:
         raise ValueError("URL 缺少 hostname")
 
+    normalized_hostname = hostname.lower().rstrip(".")
+    if normalized_hostname in _private_llm_host_allowlist():
+        logger.info("允许访问显式配置的本地 LLM 主机: %s", normalized_hostname)
+        return
+
     # 拒绝 localhost
-    if hostname.lower() == "localhost":
+    if normalized_hostname == "localhost":
         raise ValueError("禁止使用 localhost 作为目标地址")
 
     # 如果 hostname 是 IP 地址，直接检查网段
@@ -129,7 +148,7 @@ class LLMService:
                 return SystemConfig(**config_data)
             return None
         except Exception as e:
-            logger.error(f"❌ 获取系统配置失败: {e}")
+            logger.error(f"❌ 获取系统配置失败: {e}", exc_info=True)
             return None
 
     async def _save_system_config(self, config) -> bool:
@@ -174,7 +193,7 @@ class LLMService:
                 )
                 return True
         except Exception as e:
-            logger.error(f"保存系统配置失败: {e}")
+            logger.error(f"保存系统配置失败: {e}", exc_info=True)
             return False
 
     # ==================== LLM 配置管理 ====================
@@ -195,7 +214,7 @@ class LLMService:
 
             return await self._save_system_config(config)
         except Exception as e:
-            logger.error(f"更新LLM配置失败: {e}")
+            logger.error(f"更新LLM配置失败: {e}", exc_info=True)
             return False
 
     async def delete_llm_config(self, provider: str, model_name: str) -> bool:
@@ -210,7 +229,7 @@ class LLMService:
 
             config = await self._get_system_config()
             if not config:
-                logger.error("❌ 系统配置为空")
+                logger.warning("❌ 系统配置为空")
                 return False
 
             original_count = len(config.llm_configs)
@@ -234,13 +253,13 @@ class LLMService:
 
             save_result = await self._save_system_config(config)
             if not save_result:
-                logger.error(
+                logger.warning(
                     f"💾 保存失败: provider={provider}, model_name={model_name}"
                 )
             return save_result
 
         except Exception as e:
-            logger.error(f"❌ 删除LLM配置失败: {e}")
+            logger.error(f"❌ 删除LLM配置失败: {e}", exc_info=True)
             logger.error("删除LLM配置失败", exc_info=True)
             return False
 
@@ -263,7 +282,7 @@ class LLMService:
             return await self._save_system_config(config)
 
         except Exception as e:
-            logger.error(f"设置默认LLM失败: {e}")
+            logger.error(f"设置默认LLM失败: {e}", exc_info=True)
             return False
 
     async def test_llm_config(self, llm_config: LLMConfig) -> Dict[str, Any]:
@@ -369,12 +388,13 @@ class LLMService:
                     provider_str,
                     llm_config.model_name,
                     start_time,
+                    llm_config.timeout,
                 )
                 return result
 
         except Exception as e:
             response_time = time.time() - start_time
-            logger.error(f"测试大模型配置失败: {e}")
+            logger.error(f"测试大模型配置失败: {e}", exc_info=True)
             return {
                 "success": False,
                 "message": f"连接失败: {str(e)}",
@@ -408,131 +428,60 @@ class LLMService:
         provider_str: str,
         model_name: str,
         start_time: float,
+        timeout: float = DEFAULT_CHECK_TIMEOUT,
     ) -> Dict[str, Any]:
-        """同步测试 OpenAI 兼容 API 配置（在 run_in_executor 中调用）"""
+        """One bounded request, shared by model and custom-provider tests."""
+        import requests
+
+        budget = check_timeout(timeout)
         try:
-            import requests
-
-            # SSRF 防御：校验用户配置的 api_base
+            # Keep the existing explicit private-host allowlist/SSRF boundary.
             _validate_llm_base_url(api_base)
-
-            api_base_normalized = api_base.rstrip("/")
-            if not re.search(r"/v\d+$", api_base_normalized):
-                api_base_normalized = api_base_normalized + "/v1"
-
-            url = f"{api_base_normalized}/chat/completions"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            }
-            data = {
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Hello, please respond with 'OK' if you can read this.",
-                    }
-                ],
-                "max_tokens": 200,
-                "temperature": 0.1,
-            }
-
-            logger.debug(f"发送测试请求到: {url}, 模型: {model_name}")
-            response = requests.post(url, json=data, headers=headers, timeout=15)
-            response_time = time.time() - start_time
-
-            if response.status_code == 200:
-                result = response.json()
-                if "choices" in result and len(result["choices"]) > 0:
-                    content = result["choices"][0]["message"]["content"]
-                    if content and len(content.strip()) > 0:
-                        return {
-                            "success": True,
-                            "message": f"成功连接到 {provider_str} {model_name}",
-                            "response_time": response_time,
-                            "details": {
-                                "provider": provider_str,
-                                "model": model_name,
-                                "api_base": api_base,
-                                "response_preview": content[:100],
-                            },
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "message": "API响应内容为空",
-                            "response_time": response_time,
-                            "details": None,
-                        }
-                else:
+            base = api_base.rstrip("/")
+            if not re.search(r"/v\d+$", base):
+                base += "/v1"
+            with requests.post(
+                f"{base}/chat/completions",
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "只回复 OK"}],
+                    "max_tokens": CHECK_MAX_TOKENS,
+                    "temperature": 0.1,
+                },
+                timeout=(min(CONNECT_CHECK_TIMEOUT, budget), budget),
+                allow_redirects=False,
+            ) as response:
+                if response.status_code == 200:
+                    body = response.json()
+                    choices = body.get("choices") or []
+                    content = (choices[0].get("message") or {}).get("content") if choices else None
+                    require_check_text(content)
                     return {
-                        "success": False,
-                        "message": "API响应格式异常",
-                        "response_time": response_time,
-                        "details": None,
+                        "success": True,
+                        "message": f"成功连接到 {provider_str} {model_name}",
+                        "response_time": time.time() - start_time,
+                        "details": {"provider": provider_str, "model": model_name},
                     }
-            elif response.status_code == 401:
+
+                # Classify the complete error in memory, but never echo its raw body.
+                failure = check_failure(response.text, budget, status_code=response.status_code)
+                if response.status_code == 404:
+                    failure = {"kind": "endpoint_or_model", "retryable": False,
+                               "message": "模型或 API 端点不存在（404），请检查模型名称和基础地址"}
                 return {
                     "success": False,
-                    "message": "API密钥无效或已过期",
-                    "response_time": response_time,
-                    "details": None,
+                    "message": failure["message"],
+                    "response_time": time.time() - start_time,
+                    "details": {"kind": failure["kind"], "timeout_seconds": budget},
                 }
-            elif response.status_code == 403:
-                return {
-                    "success": False,
-                    "message": "API权限不足或配额已用完",
-                    "response_time": response_time,
-                    "details": None,
-                }
-            elif response.status_code == 404:
-                return {
-                    "success": False,
-                    "message": f"API端点不存在，请检查API基础URL是否正确: {url}",
-                    "response_time": response_time,
-                    "details": None,
-                }
-            else:
-                try:
-                    error_detail = response.json()
-                    error_msg = error_detail.get("error", {}).get(
-                        "message", f"HTTP {response.status_code}"
-                    )
-                    return {
-                        "success": False,
-                        "message": f"API测试失败: {error_msg}",
-                        "response_time": response_time,
-                        "details": None,
-                    }
-                except Exception as e:
-                    logger.debug(f"解析API错误响应失败: {e}")
-                    return {
-                        "success": False,
-                        "message": f"API测试失败: HTTP {response.status_code}",
-                        "response_time": response_time,
-                        "details": None,
-                    }
-
-        except requests.exceptions.Timeout:
+        except Exception as exc:
+            failure = check_failure(exc, budget)
             return {
                 "success": False,
-                "message": "连接超时，请检查API基础URL是否正确或网络是否可达",
+                "message": failure["message"],
                 "response_time": time.time() - start_time,
-                "details": None,
-            }
-        except requests.exceptions.ConnectionError as e:
-            return {
-                "success": False,
-                "message": f"连接失败，请检查API基础URL是否正确: {str(e)}",
-                "response_time": time.time() - start_time,
-                "details": None,
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"连接失败: {str(e)}",
-                "response_time": time.time() - start_time,
-                "details": None,
+                "details": {"kind": failure["kind"], "timeout_seconds": budget},
             }
 
     # ==================== LLM 厂家管理 ====================
@@ -658,7 +607,7 @@ class LLMService:
             result = await providers_collection.insert_one(provider_data)
             return str(result.inserted_id)
         except Exception as e:
-            logger.error(f"添加厂家失败: {e}")
+            logger.error(f"添加厂家失败: {e}", exc_info=True)
             raise
 
     async def update_llm_provider(
@@ -693,7 +642,7 @@ class LLMService:
             # 修复：matched_count > 0 表示找到了记录（即使没有修改）
             return result.matched_count > 0
         except Exception as e:
-            logger.error(f"更新厂家失败: {e}")
+            logger.error(f"更新厂家失败: {e}", exc_info=True)
             logger.error("更新厂家失败", exc_info=True)
             return False
 
@@ -736,7 +685,7 @@ class LLMService:
             return success
 
         except Exception as e:
-            logger.error(f"❌ 删除厂家失败: {e}")
+            logger.error(f"❌ 删除厂家失败: {e}", exc_info=True)
             logger.error("删除厂家失败", exc_info=True)
             return False
 
@@ -770,7 +719,7 @@ class LLMService:
 
             return result.matched_count > 0
         except Exception as e:
-            logger.error(f"切换厂家状态失败: {e}")
+            logger.error(f"切换厂家状态失败: {e}", exc_info=True)
             return False
 
     async def init_aggregator_providers(self) -> Dict[str, Any]:
@@ -882,7 +831,7 @@ class LLMService:
             }
 
         except Exception as e:
-            logger.error(f"❌ 初始化聚合渠道失败: {e}")
+            logger.error(f"❌ 初始化聚合渠道失败: {e}", exc_info=True)
             logger.error("初始化聚合渠道失败", exc_info=True)
             return {"success": False, "error": str(e), "message": "初始化聚合渠道失败"}
 
@@ -1029,7 +978,7 @@ class LLMService:
             }
 
         except Exception as e:
-            logger.error(f"环境变量迁移失败: {e}")
+            logger.error(f"环境变量迁移失败: {e}", exc_info=True)
             return {"success": False, "error": str(e), "message": "环境变量迁移失败"}
 
     # ==================== 厂家 API 测试 ====================
@@ -1071,19 +1020,40 @@ class LLMService:
                 f"✅ 使用数据库配置的 {display_name} API密钥 (长度: {len(api_key) if api_key else 0})"
             )
 
+            system_config = await self._get_system_config()
+            test_model = None
+            test_timeout = DEFAULT_CHECK_TIMEOUT
+            if system_config:
+                selected_config = next(
+                    (
+                        config
+                        for config in system_config.llm_configs
+                        if config.provider == provider_name and config.enabled
+                    ),
+                    None,
+                )
+                if selected_config is not None:
+                    test_model = selected_config.model_name
+                    test_timeout = check_timeout(selected_config.timeout)
+
             # 根据厂家类型调用相应的测试函数
             test_result = await self._test_provider_connection(
-                provider_name, api_key, display_name
+                provider_name, api_key, display_name, test_model, test_timeout
             )
 
             return test_result
 
         except Exception as e:
-            logger.error(f"测试厂家API失败: {e}")
+            logger.error(f"测试厂家API失败: {e}", exc_info=True)
             return {"success": False, "message": f"测试失败: {str(e)}"}
 
     async def _test_provider_connection(
-        self, provider_name: str, api_key: str, display_name: str
+        self,
+        provider_name: str,
+        api_key: str,
+        display_name: str,
+        model_name: Optional[str] = None,
+        timeout: float = DEFAULT_CHECK_TIMEOUT,
     ) -> dict:
         """测试具体厂家的连接"""
         try:
@@ -1105,6 +1075,8 @@ class LLMService:
                     display_name,
                     base_url,
                     provider_name,
+                    model_name,
+                    timeout,
                 )
             elif provider_name == "google":
                 # 获取厂家的 base_url
@@ -1178,6 +1150,8 @@ class LLMService:
                     display_name,
                     base_url,
                     provider_name,
+                    model_name,
+                    timeout,
                 )
         except Exception as e:
             return {
@@ -1292,14 +1266,14 @@ class LLMService:
                                     "message": f"{display_name} API连接测试成功",
                                 }
                             else:
-                                logger.error("❌ [Google AI 测试] 文本为空")
+                                logger.warning("❌ [Google AI 测试] 文本为空")
                                 return {
                                     "success": False,
                                     "message": f"{display_name} API响应内容为空",
                                 }
                         else:
                             # content 中没有 parts，可能是因为 MAX_TOKENS 或其他原因
-                            logger.error("❌ [Google AI 测试] content 中没有 parts")
+                            logger.warning("❌ [Google AI 测试] content 中没有 parts")
                             logger.info(f"   content 的键: {list(content.keys())}")
 
                             if finish_reason == "MAX_TOKENS":
@@ -1313,14 +1287,14 @@ class LLMService:
                                     "message": f"{display_name} API响应格式异常（缺少 parts，finishReason: {finish_reason}）",
                                 }
                     else:
-                        logger.error("❌ [Google AI 测试] candidate 中缺少 'content'")
+                        logger.warning("❌ [Google AI 测试] candidate 中缺少 'content'")
                         logger.info(f"   candidate 的键: {list(candidate.keys())}")
                         return {
                             "success": False,
                             "message": f"{display_name} API响应格式异常（缺少 content）",
                         }
                 else:
-                    logger.error(
+                    logger.warning(
                         "❌ [Google AI 测试] 缺少 candidates 或 candidates 为空"
                     )
                     return {
@@ -1328,7 +1302,7 @@ class LLMService:
                         "message": f"{display_name} API无有效候选响应",
                     }
             elif response.status_code == 400:
-                logger.error(
+                logger.warning(
                     f"❌ [Google AI 测试] 400 错误，响应内容: {response.text[:500]}"
                 )
                 try:
@@ -1345,7 +1319,7 @@ class LLMService:
                         "message": f"{display_name} API请求格式错误",
                     }
             elif response.status_code == 403:
-                logger.error(
+                logger.warning(
                     f"❌ [Google AI 测试] 403 错误，响应内容: {response.text[:500]}"
                 )
                 return {
@@ -1353,7 +1327,7 @@ class LLMService:
                     "message": f"{display_name} API密钥无效或权限不足",
                 }
             elif response.status_code == 503:
-                logger.error(
+                logger.warning(
                     f"❌ [Google AI 测试] 503 错误，响应内容: {response.text[:500]}"
                 )
                 try:
@@ -1378,7 +1352,7 @@ class LLMService:
                         "message": f"{display_name} 服务暂时不可用 (HTTP 503)",
                     }
             else:
-                logger.error(
+                logger.warning(
                     f"❌ [Google AI 测试] {response.status_code} 错误，响应内容: {response.text[:500]}"
                 )
                 return {
@@ -1785,127 +1759,20 @@ class LLMService:
         display_name: str,
         base_url: str = None,
         provider_name: str = None,
+        model_name: str = None,
+        timeout: float = DEFAULT_CHECK_TIMEOUT,
     ) -> dict:
-        """测试 OpenAI 兼容 API（用于聚合渠道和自定义厂家）"""
-        try:
-            import requests
-
-            # 如果没有提供 base_url，使用默认值
-            if not base_url:
-                return {
-                    "success": False,
-                    "message": f"{display_name} 未配置 API 基础地址 (default_base_url)",
-                }
-
-            # SSRF 防御：校验用户配置的 base_url
-            _validate_llm_base_url(base_url)
-
-            # 🔧 智能版本号处理：只有在没有版本号的情况下才添加 /v1
-            logger.info(f"   [测试API] 原始 base_url: {base_url}")
-            base_url = base_url.rstrip("/")
-            logger.info(f"   [测试API] 去除斜杠后: {base_url}")
-
-            if not re.search(r"/v\d+$", base_url):
-                # URL末尾没有版本号，添加 /v1（OpenAI标准）
-                base_url = base_url + "/v1"
-                logger.info(f"   [测试API] 添加 /v1 版本号: {base_url}")
-            else:
-                # URL已包含版本号（如 /v4），不添加
-                logger.info(f"   [测试API] 检测到已有版本号，保持原样: {base_url}")
-
-            url = f"{base_url}/chat/completions"
-            logger.info(f"   [测试API] 最终请求URL: {url}")
-
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            }
-
-            # 🔥 根据不同厂家选择合适的测试模型
-            test_model = "gpt-3.5-turbo"  # 默认模型
-            if provider_name == "siliconflow":
-                # 硅基流动使用免费的 Qwen 模型进行测试
-                test_model = "Qwen/Qwen2.5-7B-Instruct"
-                logger.info(f"🔍 硅基流动使用测试模型: {test_model}")
-            elif provider_name == "zhipu":
-                # 智谱AI使用 glm-4 模型进行测试
-                test_model = "glm-4"
-                logger.info(f"🔍 智谱AI使用测试模型: {test_model}")
-
-            # 使用一个通用的模型名称进行测试
-            data = {
-                "model": test_model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": "Hello, please respond with 'OK' if you can read this.",
-                    }
-                ],
-                "max_tokens": 200,  # 增加到200，给推理模型（如o1/gpt-5）足够空间
-                "temperature": 0.1,
-            }
-
-            response = requests.post(url, json=data, headers=headers, timeout=15)
-
-            if response.status_code == 200:
-                result = response.json()
-                if "choices" in result and len(result["choices"]) > 0:
-                    content = result["choices"][0]["message"]["content"]
-                    if content and len(content.strip()) > 0:
-                        return {
-                            "success": True,
-                            "message": f"{display_name} API连接测试成功",
-                        }
-                    else:
-                        return {
-                            "success": False,
-                            "message": f"{display_name} API响应为空",
-                        }
-                else:
-                    return {
-                        "success": False,
-                        "message": f"{display_name} API响应格式异常",
-                    }
-            elif response.status_code == 401:
-                return {
-                    "success": False,
-                    "message": f"{display_name} API密钥无效或已过期",
-                }
-            elif response.status_code == 403:
-                return {
-                    "success": False,
-                    "message": f"{display_name} API权限不足或配额已用完",
-                }
-            else:
-                try:
-                    error_detail = response.json()
-                    error_msg = error_detail.get("error", {}).get(
-                        "message", f"HTTP {response.status_code}"
-                    )
-                    logger.error(f"❌ [{display_name}] API测试失败")
-                    logger.error(f"   请求URL: {url}")
-                    logger.error(f"   状态码: {response.status_code}")
-                    logger.error(f"   错误详情: {error_detail}")
-                    return {
-                        "success": False,
-                        "message": f"{display_name} API测试失败: {error_msg}",
-                    }
-                except Exception as e:
-                    logger.debug(f"解析API测试错误详情失败: {e}")
-                    logger.error(f"❌ [{display_name}] API测试失败")
-                    logger.error(f"   请求URL: {url}")
-                    logger.error(f"   状态码: {response.status_code}")
-                    logger.error(f"   响应内容: {response.text[:500]}")
-                    return {
-                        "success": False,
-                        "message": f"{display_name} API测试失败: HTTP {response.status_code}",
-                    }
-
-        except Exception as e:
-            return {
-                "success": False,
-                "message": f"{display_name} API测试异常: {str(e)}",
-            }
+        """Use the same budget and diagnostics for custom/aggregate providers."""
+        if not base_url:
+            return {"success": False, "message": f"{display_name} 未配置 API 基础地址"}
+        default_model = {
+            "siliconflow": "Qwen/Qwen2.5-7B-Instruct",
+            "zhipu": "glm-4",
+        }.get(provider_name, "gpt-3.5-turbo")
+        return self._test_openai_compatible_config(
+            base_url, api_key, display_name, model_name or default_model,
+            time.time(), timeout,
+        )
 
     # ==================== 厂家模型获取 ====================
 
@@ -1995,7 +1862,7 @@ class LLMService:
             return result
 
         except Exception as e:
-            logger.error(f"获取模型列表失败: {e}")
+            logger.error(f"获取模型列表失败: {e}", exc_info=True)
             logger.error("获取模型列表失败", exc_info=True)
             return {"success": False, "message": f"获取模型列表失败: {str(e)}"}
 
@@ -2074,7 +1941,7 @@ class LLMService:
                         "message": f"成功获取 {len(formatted_models)} 个常用模型（已过滤）",
                     }
                 else:
-                    logger.error("❌ 响应格式异常，期望 'data' 字段为列表")
+                    logger.warning("❌ 响应格式异常，期望 'data' 字段为列表")
                     return {
                         "success": False,
                         "message": f"{display_name} API 响应格式异常（缺少 data 字段或格式不正确）",
@@ -2092,7 +1959,7 @@ class LLMService:
                     error_msg = error_detail.get("error", {}).get(
                         "message", f"HTTP {response.status_code}"
                     )
-                    logger.error(f"❌ API 错误: {error_msg}")
+                    logger.warning(f"❌ API 错误: {error_msg}")
                     return {
                         "success": False,
                         "message": f"{display_name} API请求失败: {error_msg}",
@@ -2105,7 +1972,7 @@ class LLMService:
                     }
 
         except Exception as e:
-            logger.error(f"❌ 异常: {e}")
+            logger.error(f"❌ 异常: {e}", exc_info=True)
             logger.error("API请求异常", exc_info=True)
             return {
                 "success": False,

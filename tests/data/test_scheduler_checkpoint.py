@@ -47,7 +47,7 @@ class TestUpdateCheckpoint:
     async def test_update_with_zero_count(self, checkpoint_manager):
         await checkpoint_manager.update_checkpoint("US", "daily_quotes", "yfinance", "2024-03-01", 0)
         cp = await checkpoint_manager.get_checkpoint("US", "daily_quotes", "yfinance")
-        assert cp == "2024-03-01"
+        assert cp is None  # 零条日线不能推进有效检查点
 
     @pytest.mark.asyncio
     async def test_update_overwrites_previous(self, checkpoint_manager):
@@ -65,19 +65,19 @@ class TestResetCheckpoint:
         await checkpoint_manager.update_checkpoint("CN", "daily_quotes", "tushare", "2024-06-15", 100)
         await checkpoint_manager.reset_checkpoint("CN", "daily_quotes", "tushare")
         cp = await checkpoint_manager.get_checkpoint("CN", "daily_quotes", "tushare")
-        assert cp == "1970-01-01"
+        assert cp is None  # 重置文档保留，但不能当作有效数据日期
 
     @pytest.mark.asyncio
     async def test_reset_hk_market(self, checkpoint_manager):
         await checkpoint_manager.reset_checkpoint("HK", "basic_info", "akshare_hk")
         cp = await checkpoint_manager.get_checkpoint("HK", "basic_info", "akshare_hk")
-        assert cp == "1970-01-01"
+        assert cp is None  # 重置文档保留，但不能当作有效数据日期
 
     @pytest.mark.asyncio
     async def test_reset_us_market(self, checkpoint_manager):
         await checkpoint_manager.reset_checkpoint("US", "financial_data", "tushare_us")
         cp = await checkpoint_manager.get_checkpoint("US", "financial_data", "tushare_us")
-        assert cp == "1970-01-01"
+        assert cp is None  # 重置文档保留，但不能当作有效数据日期
 
 
 class TestCheckpointManagerIntegration:
@@ -97,7 +97,7 @@ class TestCheckpointManagerIntegration:
         await checkpoint_manager.update_checkpoint("CN", "daily_quotes", "tushare", "2024-06-15", 100)
         await checkpoint_manager.reset_checkpoint("CN", "daily_quotes", "tushare")
         cp = await checkpoint_manager.get_checkpoint("CN", "daily_quotes", "tushare")
-        assert cp == "1970-01-01"
+        assert cp is None  # 重置文档保留，但不能当作有效数据日期
 
     @pytest.mark.asyncio
     async def test_multiple_sources_independent(self, checkpoint_manager):

@@ -28,7 +28,7 @@ R = TypeVar("R")
 _main_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
-def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
+def set_main_loop(loop: Optional[asyncio.AbstractEventLoop]) -> None:
     """注册主线程事件循环（在 app lifespan startup 时调用）"""
     global _main_loop
     _main_loop = loop
@@ -37,6 +37,32 @@ def set_main_loop(loop: asyncio.AbstractEventLoop) -> None:
 def get_main_loop() -> Optional[asyncio.AbstractEventLoop]:
     """获取主线程事件循环"""
     return _main_loop
+
+
+async def await_on_main_loop(awaitable: Awaitable[T]) -> T:
+    """在 Motor/Redis 所绑定的主事件循环上等待协程。
+
+    LangGraph 的同步 ``propagate`` 会在分析线程中用
+    ``asyncio.run`` 创建任务级 loop。若节点直接 ``await`` 全局
+    Motor 客户端，就会触发 ``Future attached to a different loop``。
+    本函数保留异步调用方式，但在需要时把实际 I/O 调度回
+    uvicorn/worker 初始化数据库的主 loop。
+    """
+    main_loop = _main_loop
+    current_loop = asyncio.get_running_loop()
+    if (
+        main_loop is None
+        or not main_loop.is_running()
+        or current_loop is main_loop
+    ):
+        return await awaitable
+
+    concurrent_future = asyncio.run_coroutine_threadsafe(awaitable, main_loop)
+    try:
+        return await asyncio.wrap_future(concurrent_future, loop=current_loop)
+    except asyncio.CancelledError:
+        concurrent_future.cancel()
+        raise
 
 
 def run_async(coro: Awaitable[T]) -> T:
@@ -117,10 +143,9 @@ async def ainvoke(llm: Any, messages: Any, **kwargs: Any) -> Any:
     """
     if hasattr(llm, "ainvoke"):
         return await llm.ainvoke(messages, **kwargs)
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None, lambda: llm.invoke(messages, **kwargs)
-    )
+    # asyncio.to_thread 会复制 contextvars，保证 analysis_task_id 能跟随到
+    # 同步 LLM 调用线程；run_in_executor 不会自动传播上下文。
+    return await asyncio.to_thread(llm.invoke, messages, **kwargs)
 
 
 # ── 同步函数护栏 ──────────────────────────────────────────────────

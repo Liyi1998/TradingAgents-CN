@@ -39,7 +39,7 @@ class TestSettingsDefaults:
         """MONGODB_DATABASE 默认为 'tradingagents'"""
         # conftest 可能通过环境变量覆盖为 tradingagents_test
         db_name = settings.MONGODB_DATABASE
-        assert db_name in ("tradingagents", "tradingagents_test")
+        assert db_name == os.environ.get("MONGODB_DATABASE", "tradingagents")
 
     def test_jwt_algorithm_default(self, settings):
         """JWT_ALGORITHM 默认为 HS256"""

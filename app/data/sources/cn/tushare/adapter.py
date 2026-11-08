@@ -8,6 +8,7 @@
 """
 
 import logging
+import re
 from typing import Any, List
 
 import pandas as pd
@@ -17,6 +18,7 @@ from app.data.schema.base.types import _safe_float, _parse_date
 from app.data.schema.domains.basic_info import StockBasicInfoSchema
 from app.data.schema.domains.trade_calendar import TradeCalendarSchema
 from app.data.schema.domains.daily_quotes import DailyQuotesSchema
+from app.data.schema.domains.index_quotes import IndexQuotesSchema
 from app.data.schema.domains.daily_indicators import DailyIndicatorsSchema
 from app.data.schema.domains.adj_factors import AdjFactorsSchema
 from app.data.schema.domains.financial_data import FinancialDataSchema
@@ -165,6 +167,7 @@ class TushareCNAdapter(BaseAdapter):
                     data_source="tushare",
                     trade_date=trade_date,
                     period="daily",
+                    volume_unit="share", amount_unit="CNY", unit_conversion="tushare:lot*100,CNY_1k*1000",
                     open=_safe_float(get("open")),
                     high=_safe_float(get("high")),
                     low=_safe_float(get("low")),
@@ -175,6 +178,62 @@ class TushareCNAdapter(BaseAdapter):
                     volume=volume,
                     amount=amount,
                     turnover_rate=_safe_float(get("turn") or get("turnover_rate")),
+                )
+            )
+        return results
+
+    # ── index_quotes ──
+
+    def adapt_index_quotes(self, raw: Any) -> List[IndexQuotesSchema]:
+        """指数日线：symbol 为 ts_code 形态（000300.SH）原样保留（规范码即 ts_code）。"""
+        df = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
+        if df.empty:
+            return []
+        results = []
+        for _, row in df.iterrows():
+            get = row.get
+            symbol = str(get("ts_code", "")).strip()
+            trade_date = _parse_date(get("trade_date"))
+            if not symbol or not trade_date:
+                continue
+
+            # index_daily 的 volume/amount 单位与 daily 一致（手/千元）
+            volume = _safe_float(get("volume") or get("vol"))
+            if volume is not None:
+                volume = volume * 100
+            amount = _safe_float(get("amount"))
+            if amount is not None:
+                amount = amount * 1000
+
+            close = _safe_float(get("close"))
+            pre_close = _safe_float(get("pre_close"))
+            change = _safe_float(get("change"))
+            pct_chg = _safe_float(get("pct_chg"))
+            if change is None and close is not None and pre_close is not None:
+                change = round(close - pre_close, 4)
+            if (
+                pct_chg is None
+                and close is not None
+                and pre_close is not None
+                and pre_close != 0
+            ):
+                pct_chg = round((close - pre_close) / pre_close * 100, 4)
+
+            results.append(
+                IndexQuotesSchema(
+                    symbol=symbol,
+                    market="CN",
+                    data_source="tushare",
+                    trade_date=trade_date,
+                    open=_safe_float(get("open")),
+                    high=_safe_float(get("high")),
+                    low=_safe_float(get("low")),
+                    close=close,
+                    pre_close=pre_close,
+                    change=change,
+                    pct_chg=pct_chg,
+                    volume=volume,
+                    amount=amount,
                 )
             )
         return results
@@ -259,7 +318,7 @@ class TushareCNAdapter(BaseAdapter):
                 str(get("ts_code", "") or get("symbol", ""))
             )
             report_period = _parse_date(
-                get("report_period") or get("end_date") or get("ann_date")
+                get("report_period") or get("end_date")
             )
 
             # 判断报表类型
@@ -272,9 +331,18 @@ class TushareCNAdapter(BaseAdapter):
                     data_source="tushare",
                     report_period=report_period,
                     statement_type=stmt_type,
-                    announce_date=_parse_date(get("ann_date")),
+                    report_type=get("report_type"),
+                    source_disclosures=(get("source_disclosures")
+                                        if isinstance(get("source_disclosures"), dict) else None),
+                    announce_date=(_parse_date(get("announce_date"))
+                                   or _parse_date(get("f_ann_date"))
+                                   or _parse_date(get("ann_date"))),
                     revenue=_safe_float(get("total_revenue") or get("revenue")),
-                    net_profit=_safe_float(get("net_profit") or get("n_income")),
+                    net_profit=_safe_float(get("n_income_attr_p")),
+                    net_profit_attributable=_safe_float(get("n_income_attr_p")),
+                    net_profit_consolidated=_safe_float(get("n_income")),
+                    net_profit_deducted=_safe_float(get("profit_dedt")),
+                    net_profit_basis="attributable" if _safe_float(get("n_income_attr_p")) is not None else "unknown",
                     total_assets=_safe_float(get("total_assets")),
                     total_equity=_safe_float(
                         get("total_hldr_eqy_exc_min_int") or get("total_equity")
@@ -314,14 +382,15 @@ class TushareCNAdapter(BaseAdapter):
             get = row.get
             title = get("title", "")
             publish_time = get("datetime", "") or get("publish_time", "")
+            symbol = str(get("symbol", ""))
             content_hash = (
-                StockNewsSchema.compute_hash(title, str(publish_time))
+                StockNewsSchema.compute_hash(title, str(publish_time), symbol)
                 if title
                 else None
             )
             results.append(
                 StockNewsSchema(
-                    symbol=str(get("symbol", "")),
+                    symbol=symbol,
                     market="CN",
                     data_source="tushare",
                     title=title,
@@ -330,6 +399,8 @@ class TushareCNAdapter(BaseAdapter):
                     source=get("source") or get("channels", ""),
                     publish_time=publish_time,
                     url=get("url"),
+                    type=get("type") or get("category"),
+                    summary=get("summary"),
                 )
             )
         return results
@@ -387,12 +458,18 @@ class TushareCNAdapter(BaseAdapter):
 
         单位转换: 万元 → 元（×10000）
         """
+        import numpy as np
+
         df = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
         if df.empty:
             return []
         results = []
         for _, row in df.iterrows():
             get = row.get
+            def number(name):
+                value = get(name)
+                return None if isinstance(value, (bool, np.bool_)) else _safe_float(value)
+
             symbol = _parse_symbol_from_ts_code(str(get("ts_code", "")))
             td = _parse_date(get("trade_date"))
             if not td:
@@ -401,13 +478,13 @@ class TushareCNAdapter(BaseAdapter):
             # 万元 → 元
             # Tushare moneyflow 返回 buy_xxx_amount / sell_xxx_amount（买入/卖出额），
             # 净流入 = 买入额 - 卖出额。直接用 buy 字段会导致净流入全部偏大。
-            main_net_inflow = _safe_float(get("net_mf_amount"))
+            main_net_inflow = number("net_mf_amount")
             if main_net_inflow is not None:
                 main_net_inflow = main_net_inflow * 10000
-            huge_net_inflow = _net_inflow(get("buy_elg_amount"), get("sell_elg_amount"))
-            large_net_inflow = _net_inflow(get("buy_lg_amount"), get("sell_lg_amount"))
-            medium_net_inflow = _net_inflow(get("buy_md_amount"), get("sell_md_amount"))
-            small_net_inflow = _net_inflow(get("buy_sm_amount"), get("sell_sm_amount"))
+            huge_net_inflow = _net_inflow(number("buy_elg_amount"), number("sell_elg_amount"))
+            large_net_inflow = _net_inflow(number("buy_lg_amount"), number("sell_lg_amount"))
+            medium_net_inflow = _net_inflow(number("buy_md_amount"), number("sell_md_amount"))
+            small_net_inflow = _net_inflow(number("buy_sm_amount"), number("sell_sm_amount"))
 
             results.append(
                 MoneyFlowSchema(
@@ -416,6 +493,10 @@ class TushareCNAdapter(BaseAdapter):
                     data_source="tushare",
                     trade_date=td,
                     main_net_inflow=main_net_inflow,
+                    flow_basis="tushare_moneyflow_net_v1", flow_source="tushare",
+                    amount_unit="CNY", flow_pct_unit=None,
+                    flow_api="moneyflow", flow_date_verified=True,
+                    flow_date_basis="source_row_date",
                     main_net_inflow_pct=None,  # Tushare moneyflow 仅提供净流入额/量(net_mf_amount/net_mf_vol)，无占比字段；原错误地用 net_mf_vol 绝对量冒充百分比（R14 DCS-02）
                     huge_net_inflow=huge_net_inflow,
                     large_net_inflow=large_net_inflow,
@@ -439,6 +520,13 @@ class TushareCNAdapter(BaseAdapter):
             td = _parse_date(get("trade_date"))
             if not td:
                 continue
+            code = str(get("ts_code", ""))
+            exchange = "SSE" if re.fullmatch(r"\d{6}\.SH", code) else "SZSE" if re.fullmatch(r"\d{6}\.SZ", code) else None
+            proof = None if exchange is None else {
+                "amount_unit": "CNY", "native_amount_unit": "元", "exchange": exchange,
+                "method": "tushare_margin_detail_yuan_column_contract",
+                "source_url": "https://tushare.pro/document/2?doc_id=59",
+            }
             results.append(
                 MarginTradingSchema(
                     symbol=symbol,
@@ -448,9 +536,16 @@ class TushareCNAdapter(BaseAdapter):
                     margin_balance=_safe_float(get("rzye")),
                     short_balance=_safe_float(get("rqye")),
                     margin_buy_amount=_safe_float(get("rzmre")),
+                    margin_repay_amount=_safe_float(get("rzche")),
                     short_sell_volume=_safe_float(get("rqmcl")),
                     total_balance=_safe_float(get("rzrqye")),
                     short_volume=_safe_float(get("rqyl")),
+                    amount_unit="CNY" if proof else None,
+                    monetary_unit="元" if proof else None,
+                    unit_conversion="native_yuan_no_rescale" if proof else None,
+                    exchange=exchange, source_response_date=td,
+                    date_evidence_status="source_row_date" if proof else None,
+                    unit_evidence=proof,
                 )
             )
         return results

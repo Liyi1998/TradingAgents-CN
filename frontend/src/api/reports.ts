@@ -6,9 +6,11 @@
  * 其他方法（CRUD）统一使用 ApiClient 保持风格一致。
  */
 import { ApiClient, request, type ApiResponse } from './request'
+import type { AnalysisDecision, AnalysisHorizon } from '@/types/analysis'
 
 export interface ReportItem {
   id: string
+  analysis_horizon?: AnalysisHorizon
   title?: string
   stock_code?: string
   stock_name?: string
@@ -28,11 +30,30 @@ export interface ReportListResponse {
 export interface ReportDetail extends ReportItem {
   summary?: string
   recommendation?: string
+  decision?: AnalysisDecision
   modules?: Record<string, any>
   [key: string]: any
 }
 
 export const reportsApi = {
+  /** Read-only observer. Expected 404 is an empty state, never a model call. */
+  async conditionCheck(analysisId: string, signal?: AbortSignal): Promise<Record<string, unknown> | null> {
+    const response = await ApiClient.get<Record<string, unknown> | null>(
+      `/api/reports/${encodeURIComponent(analysisId)}/condition-check`, undefined, {
+        timeout: 10000, retryCount: 0, signal, skipErrorHandler: true,
+        validateStatus: status => status === 200 || status === 404,
+        transformResponse: [(body: string, _headers: unknown, status?: number) => {
+          if (status === 404) return { success: true, data: null }
+          return JSON.parse(body)
+        }],
+      },
+    )
+    if (!response?.success || (response.data !== null && (typeof response.data !== 'object' || Array.isArray(response.data)))) {
+      throw new Error('Invalid condition-check response')
+    }
+    return response.data
+  },
+
   /**
    * 获取报告列表
    */

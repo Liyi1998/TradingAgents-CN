@@ -3,12 +3,13 @@
 """
 
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, ConfigDict, field_serializer, model_validator
+from typing import Optional, List, Dict, Any, Literal
+from pydantic import BaseModel, Field, ConfigDict, PrivateAttr, computed_field, field_serializer, field_validator, model_validator
 from enum import Enum
 from bson import ObjectId
 from .user import PyObjectId
 from app.utils.timezone import now_tz
+from app.core.analysis_horizon import AnalysisHorizon
 
 
 class AnalysisStatus(str, Enum):
@@ -36,12 +37,19 @@ class AnalysisParameters(BaseModel):
     """分析参数模型"""
 
     market_type: str = "A股"
+    analysis_horizon: AnalysisHorizon = Field(
+        default="short", frozen=True, description="分析周期：short 短线、medium 中线（1–3个月）、long 长线（6–12个月）"
+    )
     analysis_date: Optional[datetime] = None
     selected_analysts: List[str] = Field(default_factory=list)
     custom_prompt: Optional[str] = None
     include_sentiment: bool = True
     include_risk: bool = True
     language: str = "zh-CN"
+    account_position: Literal["UNKNOWN", "NONE", "HELD"] = Field(
+        default="UNKNOWN",
+        description="账户持仓状态：UNKNOWN 未提供、NONE 未持仓、HELD 已持仓",
+    )
     # 模型配置
     analyst_model: Optional[str] = "qwen-turbo"
     debate_model: Optional[str] = "qwen-max"
@@ -63,6 +71,41 @@ class AnalysisParameters(BaseModel):
         description="阶段覆盖 {stage_id: {enabled/rounds/concurrency}}，优先于 phaseN_* 旧字段",
     )
 
+    # 投资期限（short=7/mid=60/long=252 交易日，映射见 app/core/horizons.py）
+    horizon: Optional[str] = Field(
+        default=None,
+        description="analysis_horizon 的兼容别名；事后评估窗口为 7/60/252 交易日，不代表到期强制交易",
+    )
+
+    @field_validator("horizon")
+    @classmethod
+    def _validate_horizon(cls, v: Optional[str]) -> Optional[str]:
+        """非法档位直接 422；None 放行（旧客户端/队列旧任务兼容）。"""
+        if v is None:
+            return v
+        allowed = {"short", "mid", "long"}
+        if v not in allowed:
+            raise ValueError(f"horizon 必须是 {'/'.join(sorted(allowed))} 之一，收到 {v!r}")
+        return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _align_horizon_alias(cls, value):
+        """One period contract for the existing UI and the upstream API alias."""
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        alias = value.get("horizon")
+        canonical = value.get("analysis_horizon")
+        aliases = {"short": "short", "mid": "medium", "long": "long"}
+        if alias in aliases:
+            if canonical is not None and canonical != aliases[alias]:
+                raise ValueError("horizon 与 analysis_horizon 周期不一致")
+            value["analysis_horizon"] = aliases[alias]
+        elif canonical in aliases.values():
+            value["horizon"] = {v: k for k, v in aliases.items()}[canonical]
+        return value
+
     # MCP工具
     mcp_enabled: bool = Field(default=False, description="是否启用 MCP 工具")
     mcp_tools: List[str] = Field(default_factory=list, description="兼容旧字段：MCP 工具ID列表")
@@ -78,6 +121,7 @@ class AnalysisResult(BaseModel):
     """分析结果模型"""
 
     analysis_id: Optional[str] = None
+    analysis_horizon: AnalysisHorizon = "short"
     summary: Optional[str] = None
     recommendation: Optional[str] = None
     confidence_score: Optional[float] = None
@@ -89,6 +133,8 @@ class AnalysisResult(BaseModel):
     execution_time: float = 0.0
     error_message: Optional[str] = None
     model_info: Optional[str] = None  # 🔥 添加模型信息字段
+    decision: Optional[Dict[str, Any]] = None
+    structured_summary: Optional[Dict[str, Any]] = None
 
 
 class AnalysisTask(BaseModel):
@@ -114,6 +160,11 @@ class AnalysisTask(BaseModel):
     worker_id: Optional[str] = None
     parameters: AnalysisParameters = Field(default_factory=AnalysisParameters)
     result: Optional[AnalysisResult] = None
+
+    @computed_field
+    @property
+    def analysis_horizon(self) -> AnalysisHorizon:
+        return self.parameters.analysis_horizon
 
     # 重试机制
     retry_count: int = 0
@@ -173,7 +224,9 @@ class StockInfo(BaseModel):
 
 class SingleAnalysisRequest(BaseModel):
     """单股分析请求"""
-
+    # Server-only snapshots: clients cannot inject/relabel report content via JSON.
+    _resume_reports: Dict[str, str] = PrivateAttr(default_factory=dict)
+    _resume_source_task_id: Optional[str] = PrivateAttr(default=None)
     symbol: Optional[str] = Field(None, description="6位股票代码")
     stock_code: Optional[str] = Field(None, description="股票代码(已废弃,使用symbol)")
     workflow_slug: Optional[str] = Field(None, description="工作流 slug（缺省=默认工作流，由工作流管理页设置）")
@@ -216,6 +269,7 @@ class AnalysisTaskResponse(BaseModel):
     """分析任务响应"""
 
     task_id: str
+    analysis_horizon: AnalysisHorizon = "short"
     batch_id: Optional[str]
     symbol: str
     stock_code: Optional[str] = None  # 兼容字段

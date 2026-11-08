@@ -60,19 +60,20 @@ class TestSchema:
     def test_trader_decision_fields(self):
         schema = build_params_schema("trader")
         assert "action" in schema["required"]
-        assert schema["properties"]["action"]["enum"] == ["买入", "持有", "卖出"]
+        assert schema["properties"]["action"]["enum"] == ["买入", "持有", "卖出", "观望", "减仓"]
         assert "target_price" in schema["properties"]
 
-    def test_summarizer_eight_params(self):
-        """summarizer = content + 7 结构化字段（原 structured_summary schema 前置）"""
+    def test_summarizer_params_include_optional_qualitative_assessment(self):
+        """Keep self-assessment wording without requiring an invented number."""
         schema = build_params_schema("summarizer")
         props = set(schema["properties"])
         assert props == {
             "content", "key_indicators", "model_confidence", "risk_assessment",
             "analysis_summary", "investment_recommendation", "analysis_reference",
-            "final_signal",
+            "final_signal", "decision_semantics", "confidence_label",
         }
-        assert schema["properties"]["final_signal"]["enum"] == ["Buy", "Hold", "Sell"]
+        assert "confidence_label" not in schema["required"]
+        assert schema["properties"]["final_signal"]["enum"] == ["Buy", "Hold", "Sell", "Watch", "Reduce"]
 
     def test_unknown_type_rejected(self):
         with pytest.raises(SubmissionError):
@@ -98,7 +99,24 @@ class TestValidation:
         fields = validate_submission("trader", "计划", {"action": "Buy"})
         assert fields["action"] == "买入"
         fields = validate_submission("terminal", "裁决", {"action": "观望"})
-        assert fields["action"] == "持有"
+        assert fields["action"] == "观望"
+
+    @pytest.mark.parametrize("action,expected", [("WATCH", "观望"), ("REDUCE", "减仓")])
+    def test_split_position_actions_survive_submission(self, action, expected):
+        from app.engine.decision_semantics import normalize_decision
+
+        semantics = {"account_position": "UNKNOWN", "research_view": "NEUTRAL",
+                     "unheld_action": "WATCH", "held_action": "REDUCE",
+                     "position_limit_pct": 20, "exit_conditions": ["跌破支撑退出"]}
+        fields = validate_submission("terminal", "裁决", {
+            "action": action, "decision_semantics": semantics,
+        })
+        assert fields["action"] == expected
+        assert fields["decision_semantics"] == semantics
+        decision = normalize_decision({**fields, **fields["decision_semantics"]}, account_position="HELD")
+        assert decision["primary_action"] == "REDUCE"
+        assert decision["unheld_action"] == "WATCH"
+        assert decision["account_position"] == "HELD"
 
     def test_action_missing_rejected(self):
         with pytest.raises(SubmissionError, match="action"):

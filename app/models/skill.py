@@ -22,7 +22,7 @@ from .user import PyObjectId
 class SkillEntrypoint(BaseModel):
     """manifest.yaml 中声明的脚本入口（会被注册为 builtin 工具）"""
 
-    name: str = Field(..., description="入口名（kebab-case），工具 ID 为 {skill_name}.{name}")
+    name: str = Field(..., description="入口名（kebab-case），工具 ID 为 {skill_name}__{name}")
     display_name: str = Field(..., description="中文显示名")
     description: str = Field(..., description="工具描述，供 LLM 判断何时调用")
     module: str = Field(..., description="相对 skill 根目录的 Python 模块路径，如 scripts.entry")

@@ -18,6 +18,38 @@ logger = logging.getLogger(__name__)
 _DOMAIN = "daily_quotes"
 
 
+def validate_daily_quote_options(period: str, adjust: str) -> None:
+    if not isinstance(period, str) or period not in {"daily", "weekly", "monthly"}:
+        raise DataFormatError("akshare", _DOMAIN, "period must be daily/weekly/monthly")
+    if not isinstance(adjust, str) or adjust not in {"", "qfq", "hfq"}:
+        raise DataFormatError("akshare", _DOMAIN, "adjust must be empty/raw, qfq or hfq")
+
+
+def bind_daily_quote_source(df: pd.DataFrame, *, source_api: str) -> pd.DataFrame:
+    """Attach actual API evidence; do not infer source units from column names.
+
+    Official AKShare stock docs: stock_zh_a_hist volume is lots of 100 shares,
+    while stock_zh_a_daily volume is shares. Both amount fields are CNY.
+    https://akshare.akfamily.xyz/data/stock/stock.html
+    Installed implementations only parse these volume/amount values; they do
+    not perform the Eastmoney lot-to-share conversion for us.
+    """
+    contracts = {
+        "stock_zh_a_hist": ("eastmoney", "lot100"),
+        "stock_zh_a_daily": ("sina", "share"),
+    }
+    if source_api not in contracts:
+        raise DataFormatError("akshare", _DOMAIN, "Unknown daily quote API contract")
+    source, volume_unit = contracts[source_api]
+    result = df.copy()
+    result["quote_api"] = source_api
+    result["quote_source"] = source
+    result["quote_units_verified"] = True
+    result["volume_unit"] = volume_unit
+    result["amount_unit"] = "CNY"
+    return result
+
+
 async def fetch_daily_quotes(
     code: str,
     start_date: str,
@@ -33,6 +65,7 @@ async def fetch_daily_quotes(
         DataNotFoundError: 返回空数据（不可重试）
         DataSourceUnavailableError: 其他未知异常
     """
+    validate_daily_quote_options(period, adjust)
     try:
         import akshare as ak
 
@@ -43,12 +76,13 @@ async def fetch_daily_quotes(
             from app.data.sources.cn.akshare.api.anti_scraping import wait_rate_limit
             wait_rate_limit()
             try:
-                return ak.stock_zh_a_hist(
+                primary_df = ak.stock_zh_a_hist(
                     symbol=code, period=ak_period,
                     start_date=start_date.replace("-", ""),
                     end_date=end_date.replace("-", ""),
                     adjust=adjust,
                 )
+                return primary_df, "stock_zh_a_hist"
             except Exception as exc:
                 # 东财 stock_zh_a_hist 在部分网络环境被整体拒绝
                 # （RemoteDisconnected）；回退到新浪 stock_zh_a_daily（仅日线，
@@ -74,9 +108,9 @@ async def fetch_daily_quotes(
                 )
                 if sina_df is not None and not sina_df.empty:
                     sina_df = sina_df.reset_index() if sina_df.index.name == "date" else sina_df
-                return sina_df
+                return sina_df, "stock_zh_a_daily"
 
-        df = await asyncio.to_thread(_fetch)
+        df, source_api = await asyncio.to_thread(_fetch)
     except (asyncio.TimeoutError, ConnectionError, TimeoutError) as exc:
         # 网络异常：可重试
         raise map_network_exception(exc, "akshare", _DOMAIN)
@@ -94,8 +128,15 @@ async def fetch_daily_quotes(
 
     # 东财/新浪接口返回的 df 不含代码列，adapter 会把 symbol 解析成
     # "".zfill(6)="000000" 入库；与 daily_indicators 一致，这里注入 symbol 列
-    df = df.copy()
+    df = bind_daily_quote_source(df, source_api=source_api)
     df["symbol"] = code
+    df["quote_period"] = period
+    # Declare the actual CN request basis. Do not certify a common historical
+    # qfq normalization snapshot merely from the requested range end.
+    df["price_basis"] = "raw" if adjust == "" else adjust
+    if adjust in {"qfq", "hfq"}:
+        from app.utils.timezone import now_tz
+        df["adjustment_as_of"] = now_tz().date().isoformat()
 
     logger.debug(f"AKShare 行情: {code} {len(df)} 条")
     return df

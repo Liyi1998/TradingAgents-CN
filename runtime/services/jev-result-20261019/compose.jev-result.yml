@@ -1,0 +1,3 @@
+services:
+  frontend:
+    image: tradingagents-cn-hub-frontend:jev-result-892625d4

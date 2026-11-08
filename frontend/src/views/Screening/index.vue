@@ -11,10 +11,10 @@
       </p>
     </div>
 
-    <!-- 三层定位 Tab：今日推荐（AI，默认）/ 策略选股（0 token 即时过滤）/ 自定义条件（既有路径） -->
+    <!-- 三层定位 Tab：每日策略推荐 / 策略选股 / 自定义条件 -->
     <el-tabs v-model="activeTab" class="screening-tabs">
-      <el-tab-pane label="今日推荐（AI）" name="daily" lazy>
-        <p class="tab-intro">系统每交易日自动运行全部策略并生成 AI 研判，开盘前即可查看结论</p>
+      <el-tab-pane label="每日策略推荐" name="daily" lazy>
+        <p class="tab-intro">查看已生成的因子策略筛选结果及可选 AI 短评；请留意数据日期与覆盖情况。刷新仅查询结果，不会触发同步、生成推荐或消耗 AI 额度。</p>
         <DailyTab />
       </el-tab-pane>
 
@@ -410,7 +410,7 @@
 // 显式组件名：BasicLayout 的 keep-alive include 名单按组件名匹配，
 // script-setup 无显式名时推断名为文件名 index，缓存永不生效
 defineOptions({ name: 'StockScreening' })
-import { ref, computed, reactive, onMounted } from 'vue'
+import { ref, computed, reactive, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Refresh, TrendCharts, Download, Star, Connection, Warning } from '@element-plus/icons-vue'
@@ -423,7 +423,7 @@ import StrategyTab from './StrategyTab.vue'
 import DailyTab from './DailyTab.vue'
 import MobileTable from '@/components/Global/MobileTable.vue'
 
-// 三 Tab 状态：默认落在今日推荐（AI），策略选股/自定义条件按需进入
+// 三 Tab 状态：默认展示每日策略推荐，策略选股/自定义条件按需进入
 const activeTab = ref('daily')
 
 // 响应式数据
@@ -834,7 +834,10 @@ const loadCurrentDataSource = async () => {
 }
 
 // 生命周期
-onMounted(() => {
+let lastLoadedAt = 0
+
+const loadPageData = () => {
+  lastLoadedAt = Date.now()
   // 加载字段配置和行业列表
   loadFieldConfig()
   loadIndustries()
@@ -842,6 +845,15 @@ onMounted(() => {
   loadFavorites()
   // 加载当前数据源
   loadCurrentDataSource()
+}
+
+onMounted(loadPageData)
+
+// keep-alive 复活新鲜度：距上次加载超过 60s 才重新拉数据（自选集/数据源状态可能已变化）
+onActivated(() => {
+  if (Date.now() - lastLoadedAt > 60 * 1000) {
+    loadPageData()
+  }
 })
 </script>
 

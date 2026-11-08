@@ -1,0 +1,3 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:submission-recovery-622c31c7

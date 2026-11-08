@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:chan-wyckoff-0e44304a
+  frontend:
+    image: tradingagents-cn-hub-frontend:chan-wyckoff-0e44304a

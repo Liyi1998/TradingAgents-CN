@@ -27,24 +27,26 @@ class TestProcessSignalInvalidInput:
     async def test_none_input(self):
         sp = _create_sp()
         result = await sp.process_signal(None)
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
+        assert result["unheld_action"] == "WATCH"
+        assert result["held_action"] == "HOLD"
         assert result["target_price"] is None
         assert result["confidence"] == 0.5
 
     async def test_empty_string_input(self):
         sp = _create_sp()
         result = await sp.process_signal("")
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
 
     async def test_whitespace_only_input(self):
         sp = _create_sp()
         result = await sp.process_signal("   \n\t  ")
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
 
     async def test_non_string_input(self):
         sp = _create_sp()
         result = await sp.process_signal(123)
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
 
 
 class TestExtractSimpleDecision:
@@ -59,22 +61,26 @@ class TestExtractSimpleDecision:
     def test_extract_sell(self):
         sp = _create_sp()
         result = sp._extract_simple_decision("建议SELL卖出该股票", True)
-        assert result["action"] == "卖出"
+        assert result["action"] == "观望"
+        assert result["unheld_action"] == "WATCH"
+        assert result["held_action"] == "SELL"
 
     def test_extract_hold(self):
         sp = _create_sp()
         result = sp._extract_simple_decision("建议HOLD持有观望", True)
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
+        assert result["unheld_action"] == "WATCH"
+        assert result["held_action"] == "HOLD"
 
     def test_default_confidence(self):
         sp = _create_sp()
         result = sp._extract_simple_decision("市场中性", True)
-        assert result["confidence"] == 0.7
+        assert result["confidence"] is None  # 未提供置信度，不能虚构 70%
 
     def test_price_from_yuan_pattern(self):
         sp = _create_sp()
         result = sp._extract_simple_decision("建议买入，价格88.50元", True)
-        assert result["target_price"] == 88.50
+        assert result["target_price"] is None  # 泛称价格不等于目标价
 
 
 class TestGetDefaultDecision:
@@ -83,7 +89,8 @@ class TestGetDefaultDecision:
     def test_returns_correct_structure(self):
         sp = _create_sp()
         result = sp._get_default_decision()
-        assert result["action"] == "持有"
+        assert result["action"] == "观望"
+        assert result["primary_action"] == "WATCH"
         assert result["target_price"] is None
         assert result["confidence"] == 0.5
         assert result["risk_score"] == 0.5
@@ -121,6 +128,6 @@ class TestProcessSignalWithLLM:
             "基于技术分析，建议买入平安银行，目标价位16.50元",
             stock_symbol="000001",
         )
-        assert result["action"] in ("买入", "持有")
+        assert result["action"] in ("买入", "观望", "持有")
         assert isinstance(result["confidence"], float)
         assert 0 <= result["confidence"] <= 1

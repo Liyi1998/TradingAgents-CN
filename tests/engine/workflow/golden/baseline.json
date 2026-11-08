@@ -6,24 +6,24 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "financial_news": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "market": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "research_manager": [
     "agent_start",
@@ -116,16 +116,16 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "social_media": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "summary": [
     "agent_start",
@@ -300,6 +300,9 @@
    ]
   },
   "state_top_keys": [
+   "account_position",
+   "analysis_context",
+   "analysis_horizon",
    "china_market_report",
    "company_of_interest",
    "errors",
@@ -316,6 +319,7 @@
    "sender",
    "short_term_capital_report",
    "social_media_report",
+   "strategy_partitions",
    "structured_summary",
    "task_id",
    "trade_date",
@@ -330,24 +334,24 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "financial_news": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "market": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "research_manager": [
     "agent_start",
@@ -390,16 +394,16 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "social_media": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "summary": [
     "agent_start",
@@ -526,6 +530,9 @@
    "rounds_sides": []
   },
   "state_top_keys": [
+   "account_position",
+   "analysis_context",
+   "analysis_horizon",
    "china_market_report",
    "company_of_interest",
    "errors",
@@ -556,24 +563,24 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "financial_news": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "market": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "risk_debater_neutral": [
     "agent_start",
@@ -630,16 +637,16 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "social_media": [
     "agent_start",
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "summary": [
     "agent_start",
@@ -778,6 +785,9 @@
    ]
   },
   "state_top_keys": [
+   "account_position",
+   "analysis_context",
+   "analysis_horizon",
    "china_market_report",
    "company_of_interest",
    "errors",
@@ -794,6 +804,7 @@
    "sender",
    "short_term_capital_report",
    "social_media_report",
+   "strategy_partitions",
    "structured_summary",
    "task_id",
    "trade_date",
@@ -808,8 +819,8 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "research_manager": [
     "agent_start",
@@ -902,8 +913,8 @@
     "llm_request",
     "llm_response",
     "agent_end",
-    "progress",
-    "report_ready"
+    "report_ready",
+    "progress"
    ],
    "summary": [
     "agent_start",
@@ -1060,6 +1071,9 @@
    ]
   },
   "state_top_keys": [
+   "account_position",
+   "analysis_context",
+   "analysis_horizon",
    "china_market_report",
    "company_of_interest",
    "errors",
@@ -1076,6 +1090,7 @@
    "sender",
    "short_term_capital_report",
    "social_media_report",
+   "strategy_partitions",
    "structured_summary",
    "task_id",
    "trade_date",
@@ -1092,9 +1107,8 @@
     "tool_call",
     "report_ready",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
+    "report_ready",
     "progress"
    ],
    "research_manager": [
@@ -1104,8 +1118,6 @@
     "tool_call",
     "report_ready",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress"
    ],
@@ -1115,8 +1127,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready",
@@ -1125,8 +1135,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready"
@@ -1137,8 +1145,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready",
@@ -1147,8 +1153,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready"
@@ -1159,8 +1163,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready",
@@ -1169,8 +1171,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready"
@@ -1181,8 +1181,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready",
@@ -1191,8 +1189,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready"
@@ -1203,8 +1199,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready",
@@ -1213,8 +1207,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress",
     "report_ready"
@@ -1226,8 +1218,6 @@
     "tool_call",
     "report_ready",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress"
    ],
@@ -1238,9 +1228,8 @@
     "tool_call",
     "report_ready",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
+    "report_ready",
     "progress"
    ],
    "summary": [
@@ -1249,8 +1238,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress"
    ],
@@ -1260,8 +1247,6 @@
     "llm_response",
     "tool_call",
     "tool_result",
-    "llm_request",
-    "llm_response",
     "agent_end",
     "progress"
    ]
@@ -1406,6 +1391,9 @@
    ]
   },
   "state_top_keys": [
+   "account_position",
+   "analysis_context",
+   "analysis_horizon",
    "china_market_report",
    "company_of_interest",
    "errors",
@@ -1423,6 +1411,7 @@
    "sender",
    "short_term_capital_report",
    "social_media_report",
+   "strategy_partitions",
    "structured_summary",
    "task_id",
    "trade_date",

@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:strategy-partition-ccc2804c
+  frontend:
+    image: tradingagents-cn-hub-frontend:strategy-partition-ccc2804c

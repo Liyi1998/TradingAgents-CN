@@ -68,7 +68,7 @@ class DatabaseManager:
             logger.info(f"⏱️  超时配置: connectTimeout={settings.MONGO_CONNECT_TIMEOUT_MS}ms, socketTimeout={settings.MONGO_SOCKET_TIMEOUT_MS}ms")
 
         except Exception as e:
-            logger.error(f"❌ MongoDB连接失败: {e}")
+            logger.error(f"❌ MongoDB连接失败: {e}", exc_info=True)
             self._mongo_healthy = False
             raise
 
@@ -99,7 +99,7 @@ class DatabaseManager:
             logger.info(f"🔗 连接池大小: {settings.REDIS_MAX_CONNECTIONS}")
 
         except Exception as e:
-            logger.error(f"❌ Redis连接失败: {e}")
+            logger.error(f"❌ Redis连接失败: {e}", exc_info=True)
             self._redis_healthy = False
             raise
 
@@ -119,7 +119,7 @@ class DatabaseManager:
                 mongo_db = None
                 logger.info("✅ MongoDB连接已关闭")
             except Exception as e:
-                logger.error(f"❌ 关闭MongoDB连接时出错: {e}")
+                logger.error(f"❌ 关闭MongoDB连接时出错: {e}", exc_info=True)
 
         # 关闭Redis连接
         if self.redis_client:
@@ -130,7 +130,7 @@ class DatabaseManager:
                 redis_client = None
                 logger.info("✅ Redis连接已关闭")
             except Exception as e:
-                logger.error(f"❌ 关闭Redis连接时出错: {e}")
+                logger.error(f"❌ 关闭Redis连接时出错: {e}", exc_info=True)
 
         # 关闭Redis连接池
         if self.redis_pool:
@@ -140,9 +140,9 @@ class DatabaseManager:
                 redis_pool = None
                 logger.info("✅ Redis连接池已关闭")
             except Exception as e:
-                logger.error(f"❌ 关闭Redis连接池时出错: {e}")
+                logger.error(f"❌ 关闭Redis连接池时出错: {e}", exc_info=True)
 
-    async def health_check(self) -> dict:
+    async def health_check(self, *, check_mongodb: bool = True, check_redis: bool = True) -> dict:
         """数据库健康检查"""
         health_status = {
             "mongodb": {"status": "unknown", "details": None},
@@ -151,7 +151,9 @@ class DatabaseManager:
 
         # 检查MongoDB
         try:
-            if self.mongo_client:
+            if not check_mongodb:
+                pass
+            elif self.mongo_client:
                 result = await self.mongo_client.admin.command('ping')
                 health_status["mongodb"] = {
                     "status": "healthy",
@@ -161,7 +163,7 @@ class DatabaseManager:
             else:
                 health_status["mongodb"]["status"] = "disconnected"
         except Exception as e:
-            logger.error(f"MongoDB health check failed: {e}")
+            logger.error(f"MongoDB health check failed: {e}", exc_info=True)
             health_status["mongodb"] = {
                 "status": "unhealthy",
                 "details": {"error": "MongoDB 连接异常，请检查服务状态"}
@@ -170,7 +172,9 @@ class DatabaseManager:
 
         # 检查Redis
         try:
-            if self.redis_client:
+            if not check_redis:
+                pass
+            elif self.redis_client:
                 result = await self.redis_client.ping()
                 health_status["redis"] = {
                     "status": "healthy",
@@ -180,7 +184,7 @@ class DatabaseManager:
             else:
                 health_status["redis"]["status"] = "disconnected"
         except Exception as e:
-            logger.error(f"Redis health check failed: {e}")
+            logger.error(f"Redis health check failed: {e}", exc_info=True)
             health_status["redis"] = {
                 "status": "unhealthy",
                 "details": {"error": "Redis 连接异常，请检查服务状态"}
@@ -228,7 +232,7 @@ async def init_database():
         await init_database_views_and_indexes()
 
     except Exception as e:
-        logger.error(f"💥 数据库初始化失败: {e}")
+        logger.error(f"💥 数据库初始化失败: {e}", exc_info=True)
         raise
 
 
@@ -319,60 +323,13 @@ async def create_stock_screening_view(db):
 
 
 async def create_database_indexes(db):
-    """创建数据库索引。
+    """创建应用层集合索引（users/analysis_*/operation_logs/system_configs 等）。
 
-    业务集合索引统一从 app/data/storage/mongo/index_definitions.py（唯一事实源）加载，
-    循环三市场（CN/HK/US）创建，不再内联各市场专属定义。
+    业务集合索引的唯一事实源在 app/data/storage/mongo/index_definitions.py，
+    由应用层启动流程经 ensure_all_market_indexes 创建——本模块不再 import
+    数据模块（依赖方向：应用层 → 数据模块）。
     """
     try:
-        from app.data.storage.mongo.collections import get_all_collections
-        from app.data.storage.mongo.index_definitions import (
-            INDEX_DEFINITIONS,
-            default_index_name,
-            get_legacy_index_names,
-        )
-
-        legacy_index_names = get_legacy_index_names()
-
-        for market in ("CN", "HK", "US"):
-            try:
-                collection_map = get_all_collections(market)
-            except Exception as e:
-                logger.warning(f"获取 {market} 市场集合映射失败: {e}")
-                continue
-
-            for data_type, collection_name in collection_map.items():
-                collection = db[collection_name]
-
-                # 清理旧版索引：废弃字段名（code/source）与含 data_source 的旧唯一键
-                legacy_names = ["code_1_source_1", "code_1"]
-                legacy_names.extend(legacy_index_names.get(data_type, []))
-                for idx_name in legacy_names:
-                    try:
-                        await collection.drop_index(idx_name)
-                        logger.info(f"已删除旧索引 {collection_name}.{idx_name}")
-                    except Exception:
-                        pass  # 索引不存在时跳过
-
-                for fields, unique in INDEX_DEFINITIONS.get(data_type, []):
-                    try:
-                        await collection.create_index(fields, unique=unique)
-                    except Exception as e:
-                        logger.warning(
-                            f"索引 {collection_name}.{default_index_name(fields)} "
-                            f"创建失败（可能存在重复数据，请运行去重迁移脚本）: {e}"
-                        )
-            logger.info(f"✅ {market} 市场业务集合索引创建完成")
-
-        # 筛选辅助索引（basic_info 投影字段排序用，非唯一键）
-        try:
-            basic_info = db["stock_basic_info"]
-            await basic_info.create_index([("industry", 1)])
-            await basic_info.create_index([("total_mv", -1)])
-            await basic_info.create_index([("pe", 1)])
-            await basic_info.create_index([("pb", 1)])
-        except Exception as e:
-            logger.warning(f"创建 stock_basic_info 辅助索引失败: {e}")
 
         # === 用户集合索引 ===
         try:
@@ -389,6 +346,8 @@ async def create_database_indexes(db):
             await tasks.create_index([("task_id", 1)], unique=True)
             await tasks.create_index([("user_id", 1), ("created_at", -1)])
             await tasks.create_index([("status", 1), ("created_at", -1)])
+            # result 瘦身为引用后，result.analysis_id 成为报告关联查询键
+            await tasks.create_index([("result.analysis_id", 1)])
             logger.info("✅ analysis_tasks 集合索引创建完成")
         except Exception as e:
             logger.warning(f"⚠️ 创建 analysis_tasks 索引失败: {e}")
@@ -397,6 +356,12 @@ async def create_database_indexes(db):
         try:
             events = db["analysis_events"]
             await events.create_index([("task_id", 1), ("seq", 1)])
+            # TTL 90 天：MongoDB TTL 只对 BSON Date 字段生效——created_at 由
+            # EventSink.flush 在落库批次补写（ts 是 epoch float，不能作 TTL 键）；
+            # 存量无该字段的事件不会被 TTL 清理
+            await events.create_index(
+                [("created_at", 1)], expireAfterSeconds=90 * 24 * 3600
+            )
             logger.info("✅ analysis_events 集合索引创建完成")
         except Exception as e:
             logger.warning(f"⚠️ 创建 analysis_events 索引失败: {e}")
@@ -420,6 +385,11 @@ async def create_database_indexes(db):
             op_logs = db["operation_logs"]
             await op_logs.create_index([("timestamp", -1)])
             await op_logs.create_index([("user_id", 1), ("timestamp", -1)])
+            # TTL 90 天：timestamp 为 naive datetime（BSON Date 存储），TTL 可生效；
+            # naive 本地时间与 UTC 的偏差对 90 天量级可忽略
+            await op_logs.create_index(
+                [("timestamp", 1)], expireAfterSeconds=90 * 24 * 3600
+            )
             logger.info("✅ operation_logs 集合索引创建完成")
         except Exception as e:
             logger.warning(f"⚠️ 创建 operation_logs 索引失败: {e}")
@@ -453,6 +423,12 @@ async def create_database_indexes(db):
         try:
             token_usage = db["token_usage"]
             await token_usage.create_index([("timestamp", -1), ("provider", 1)])
+            # TTL 180 天。MongoDB TTL 只对 BSON Date 生效：写入方
+            # （token_usage_recorder）随 ISO 字符串 timestamp 一并落 created_at
+            # datetime，TTL 键为 created_at；timestamp 字符串索引保留供查询
+            await token_usage.create_index(
+                [("created_at", 1)], expireAfterSeconds=180 * 24 * 3600
+            )
             logger.info("✅ token_usage 集合索引创建完成")
         except Exception as e:
             logger.warning(f"⚠️ 创建 token_usage 索引失败: {e}")
@@ -536,7 +512,7 @@ def close_mongo_db_sync():
                 _sync_mongo_db = None
                 logger.info("✅ 同步MongoDB连接已关闭")
         except Exception as exc:
-            logger.error(f"❌ 关闭同步MongoDB连接失败: {exc}")
+            logger.error(f"❌ 关闭同步MongoDB连接失败: {exc}", exc_info=True)
 
 
 def get_redis_client() -> Redis:

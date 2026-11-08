@@ -9,13 +9,21 @@ from app.engine.orchestrator.invoker import run_node_turn
 logger = logging.getLogger("default")
 
 
-def create_trader(llm, memory):
+def create_trader(llm, memory, horizon=None):
     async def trader_node(state):
         logger.debug("💰 [DEBUG] ===== 交易员节点开始 =====")
 
         try:
             # 使用安全读取，确保缺失字段不会导致整个流程中断
             company_name = state.get("company_of_interest", "")
+            from app.engine.decision_semantics import (
+                ACCOUNT_POSITION_LABELS,
+                normalize_account_position,
+            )
+
+            account_position = normalize_account_position(
+                state.get("account_position", "UNKNOWN")
+            )
 
             # 消费集声明化（P3 §4.6）：基础报告 = stage.inputs 的 analyst_reports 槽；
             # 研究裁决 = judge_decision field 槽（phase2 关闭时缺省 → 兜底文案）。
@@ -48,7 +56,12 @@ def create_trader(llm, memory):
             # 历史记忆检索（统一入口 fetch_memory_brief：线程池 + 失败降级）
             from app.engine.agents.utils.memory import fetch_memory_brief
 
-            past_memory_str = await fetch_memory_brief(memory, curr_situation, n=2) or "暂无历史记忆数据可参考。"
+            past_memory_str = await fetch_memory_brief(memory, curr_situation, n=2, as_of=state.get("trade_date"), include_outcomes=False) or "暂无历史记忆数据可参考。"
+            from app.core.horizons import horizon_days_of
+            from app.services.experience_service import prepare_experience, submit_experience, complete_experience, experience_text
+            experience = await prepare_experience(owner=state.get("user_id"), context_id=state.get("task_id"),
+                kind="analysis", stage="trader", as_of=state.get("trade_date"),
+                horizon_days=horizon_days_of(horizon) or 7, situation=company_name + "\n" + curr_situation)
 
             # 🔥 构建所有报告的格式化字符串（用于 prompt）
             # 报告显示名称走 registry 单一权威表（与 builder.report_display_names 同源）
@@ -87,7 +100,7 @@ def create_trader(llm, memory):
             base_prompt = load_agent_config("trader")
             if not base_prompt:
                 error_msg = "❌ 未找到 trader 智能体配置，请检查 agent_specs 智能体库（DB）。"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 raise ValueError(error_msg)
 
             # 动态环境信息注入（仅事实陈述）
@@ -96,13 +109,24 @@ def create_trader(llm, memory):
 - 标的代码：{company_name}
 - 市场类型：{market_info["market_name"]}
 - 计价货币：{currency} ({currency_symbol})
-- 当前时间：{time.strftime("%Y-%m-%d %H:%M:%S")}
+- 当前时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
+- 账户持仓状态：{ACCOUNT_POSITION_LABELS[account_position]} ({account_position})
+
+账户状态是系统提供的事实。UNKNOWN 时必须同时给出未持仓和已持仓两套动作，
+不得从报告中“未持仓者/已有持仓者”等假设性章节猜测用户实际持仓。
 """
 
-            full_system_prompt = base_prompt + "\n\n" + system_context
+            # 期限锚点（mid/long）：压着角色定义里的 3 天/7 天硬文案，环境信息垫底
+            from app.engine.prompts.horizon import build_horizon_anchor
+
+            horizon_anchor = build_horizon_anchor(horizon, role="trader")
+            full_system_prompt = base_prompt + horizon_anchor + "\n\n" + system_context
 
             logger.debug(f"💰 [DEBUG] 准备调用LLM，系统提示包含货币: {currency}")
 
+            experience_sent = await submit_experience(experience, state.get("user_id"))
+            if experience_sent:
+                context_content += "\n\n" + experience_text(experience)
             trader_submission = await run_node_turn(
                 llm,
                 [],
@@ -116,6 +140,8 @@ def create_trader(llm, memory):
                 event_sink=state.get("_event_sink"),
             )
             trader_content = trader_submission.content
+            if experience_sent:
+                await complete_experience(experience, state.get("user_id"), trader_content)
 
             # H-2: 空响应降级 — LLM 返回空内容时使用占位文本
             if not trader_content.strip():
@@ -137,13 +163,18 @@ def create_trader(llm, memory):
                 update["trader_decision_signal"] = dict(trader_submission.fields)
             return update
 
-        except Exception:
+        except Exception as exc:
+            from app.llm.failures import describe_failure
+
             logger.error(
-                "💰 [Trader] 节点执行异常，降级返回以保持流程继续",
+                "💰 [Trader] 节点执行异常，保留失败原因供质量检查拦截",
                 exc_info=True,
             )
             # 降级状态：保守中性值，不误导投资决策
-            fallback_content = "⚠️ 交易员节点执行异常，未能生成有效投资计划。建议：暂缓操作，等待系统恢复后重新评估。"
+            fallback_content = (
+                "⚠️ 交易员节点执行异常，未能生成有效投资计划。"
+                f"原因：{describe_failure(exc)['message']}"
+            )
             return {
                 "trader_investment_plan": fallback_content,
                 "sender": "Trader",

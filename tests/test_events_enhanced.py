@@ -154,6 +154,40 @@ async def test_llm_response_text_field():
     assert responses[1]["text"] == "part1part2"  # 多 text block 拼接
 
 
+async def test_tool_call_budget_caps_single_turn_and_preserves_pairing():
+    """单轮批量 tool_use 也必须受总量预算约束，且所有调用都有配对结果。"""
+    client = _ScriptedClient([
+        _resp(*[
+            ToolUseBlock(id=f"toolu_{index}", name="echo", input={"text": str(index)})
+            for index in range(5)
+        ]),
+    ])
+    sink, events, _ = _capture_sink()
+
+    result = await run_conversation(
+        client,
+        "批量调用工具",
+        registry=_echo_registry(),
+        event_sink=sink,
+        task_id="t-test",
+        agent_key="financial_news",
+        phase="analysts",
+        max_turns=6,
+        max_tool_calls=2,
+    )
+
+    assert result.stop_reason == "max_tool_calls"
+    assert result.tool_calls_executed == 2
+    result_blocks = result.messages[-1].blocks()
+    assert len(result_blocks) == 5
+    assert all(isinstance(block, ToolResultBlock) for block in result_blocks)
+    assert [block.is_error for block in result_blocks] == [False, False, True, True, True]
+    assert all("预算已耗尽" in block.content for block in result_blocks[2:])
+
+    skipped = [event for event in events if event["event_type"] == "tool_call_skipped"]
+    assert len(skipped) == 3
+
+
 async def test_tool_use_id_pairing_and_output_truncation():
     """tool_call 与 tool_result 的 tool_use_id 与 SDK 块 id 配对；output 截断 8000"""
     long_text = "x" * 10000

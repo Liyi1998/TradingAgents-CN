@@ -9,11 +9,13 @@ from typing import Any, List
 import pandas as pd
 
 from app.data.sources.base.adapter import BaseAdapter
+from app.data.sources.cn.stock_name_utils import infer_exchange
 from app.data.schema.base.types import _safe_float, _parse_date
 from app.data.schema.domains.basic_info import StockBasicInfoSchema
 from app.data.schema.domains.daily_quotes import DailyQuotesSchema
 from app.data.schema.domains.financial_data import FinancialDataSchema
 from app.data.schema.domains.adj_factors import AdjFactorsSchema
+from app.data.processor.industry_contract import industry_label
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,12 @@ class BaoStockCNAdapter(BaseAdapter):
                 name=get("name", "") or get("code_name", ""),
                 full_symbol=f"{symbol}.{exchange}" if exchange else symbol,
                 exchange=exchange,
-                industry=get("industry") or get("type"),
+                industry=industry_label(get("industry")),
+                industry_source=get("industry_source"),
+                industry_classification=get("industry_classification"),
+                industry_as_of=_parse_date(get("industry_as_of")),
+                industry_contract=get("industry_contract"),
+                list_status="L" if str(get("status")) == "1" else "D" if str(get("status")) == "0" else None,
                 list_date=_parse_date(get("list_date") or get("ipoDate")),
                 currency="CNY",
             ))
@@ -76,6 +83,10 @@ class BaoStockCNAdapter(BaseAdapter):
             if not trade_date:
                 continue
 
+            from app.data.core.identity import cn_index_identity
+            identity = cn_index_identity(raw_code)
+            if identity:
+                symbol = identity["symbol"]
             close = _safe_float(get("close"))
             pre_close = _safe_float(get("pre_close") or get("preclose"))
             change = _safe_float(get("change"))
@@ -90,8 +101,14 @@ class BaoStockCNAdapter(BaseAdapter):
                 symbol=symbol,
                 market="CN",
                 data_source="baostock",
+                asset_type="index" if identity else "stock",
+                exchange=identity["exchange"] if identity else infer_exchange(symbol),
                 trade_date=trade_date,
                 period="daily",
+                price_basis=get("price_basis"),
+                adjustment_as_of=_parse_date(get("adjustment_as_of")),
+                adjustment_contract=get("adjustment_contract"),
+                volume_unit="share", amount_unit="CNY", unit_conversion="baostock:identity",
                 open=_safe_float(get("open")),
                 high=_safe_float(get("high")),
                 low=_safe_float(get("low")),
@@ -118,9 +135,13 @@ class BaoStockCNAdapter(BaseAdapter):
                 symbol=symbol,
                 market="CN",
                 data_source="baostock",
-                report_period=_parse_date(get("report_date") or get("end_date") or get("pubDate")),
+                report_period=_parse_date(get("report_period") or get("report_date") or get("end_date") or get("statDate")),
+                statement_type=get("statement_type") or "indicator",
+                report_type=get("report_type"),
+                announce_date=_parse_date(get("announce_date")) or _parse_date(get("pubDate")),
                 revenue=_safe_float(get("revenue") or get("total_revenue")),
-                net_profit=_safe_float(get("net_profit") or get("n_income")),
+                net_profit=(_safe_float(get("net_profit")) if _safe_float(get("net_profit")) is not None
+                            else _safe_float(get("n_income"))),
                 total_assets=_safe_float(get("total_assets")),
                 total_equity=_safe_float(get("total_equity")),
                 roe=_safe_float(get("roe")),
@@ -128,25 +149,17 @@ class BaoStockCNAdapter(BaseAdapter):
             ))
         return results
 
+    def adapt_index_quotes(self, raw):
+        from dataclasses import fields
+        from app.data.schema.domains.index_quotes import IndexQuotesSchema
+        names = {f.name for f in fields(IndexQuotesSchema)}
+        return [IndexQuotesSchema(**{k: v for k, v in vars(row).items() if k in names})
+                for row in self.adapt_daily_quotes(raw) if row.asset_type == "index"]
+
     def adapt_adj_factors(self, raw: Any) -> List[AdjFactorsSchema]:
         df = raw if isinstance(raw, pd.DataFrame) else pd.DataFrame(raw)
         if df.empty:
             return []
-        results = []
-        for _, row in df.iterrows():
-            get = row.get
-            raw_code = str(get("code", ""))
-            symbol = raw_code.split(".")[-1] if "." in raw_code else raw_code.zfill(6)
-            trade_date = _parse_date(get("date"))
-            if not trade_date:
-                continue
+        from app.data.processor.adjustment_contract import adjustment_schemas
 
-            results.append(AdjFactorsSchema(
-                symbol=symbol,
-                market="CN",
-                data_source="baostock",
-                trade_date=trade_date,
-                fore_adj_factor=_safe_float(get("foreAdjustFactor")),
-                back_adj_factor=_safe_float(get("backAdjustFactor")),
-            ))
-        return results
+        return adjustment_schemas(df, source="baostock")

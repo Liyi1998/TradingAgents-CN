@@ -79,5 +79,7 @@ class TestCapabilityRegistry:
         """验证 CapabilityRegistry 初始化时自动从 YAML 加载能力。"""
         registry = CapabilityRegistry()
         assert len(registry.get_sources("CN", "daily_quotes")) >= 3
-        assert registry.is_supported("HK", "daily_quotes", "tushare_hk") is True
+        assert registry.is_supported("CN", "daily_quotes", "duckdb") is True
+        assert registry.is_supported("CN", "market_quotes", "tencent") is True
+        assert registry.is_supported("HK", "daily_quotes", "tushare_hk") is False
         assert registry.is_supported("US", "daily_quotes", "yfinance") is True

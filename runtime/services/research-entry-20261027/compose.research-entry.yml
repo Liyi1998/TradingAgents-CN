@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-entry-21145c3d
+  frontend:
+    image: tradingagents-cn-hub-frontend:research-entry-21145c3d

@@ -15,6 +15,8 @@
   工具结果块」驱动状态机（首轮提交 / 收到结果后收尾），不感知节点身份
 """
 
+import json
+
 from app.engine.orchestrator.invoker import run_node_turn
 from app.engine.orchestrator.pipeline import PipelineDeps, run_pipeline
 from app.llm.core.base import BaseLLMClient, StreamEvent
@@ -184,17 +186,19 @@ class _PlainTextClient(BaseLLMClient):
         self._text = text
 
     async def chat_stream(self, messages, **kwargs):
-        yield StreamEvent("message", response=self._resp())
+        yield StreamEvent("message", response=self._resp(kwargs))
 
     async def chat(self, messages, **kwargs) -> ChatResponse:
-        return self._resp()
+        return self._resp(kwargs)
 
     async def count_tokens(self, messages) -> int:
         return 16
 
-    def _resp(self) -> ChatResponse:
+    def _resp(self, kwargs) -> ChatResponse:
+        summary = any("analysis_summary" in str(t.params_schema) for t in (kwargs.get("tools") or []))
+        text = json.dumps(SUPERSET_INPUT, ensure_ascii=False) if summary else self._text
         return ChatResponse(
-            message=Message(role=Role.ASSISTANT, content=[TextBlock(text=self._text)]),
+            message=Message(role=Role.ASSISTANT, content=[TextBlock(text=text)]),
             stop_reason=StopReason.END_TURN,
             usage=Usage(input_tokens=10, output_tokens=5),
             model=self.model,
@@ -263,7 +267,7 @@ class TestStructuredSubmissionPipeline:
         assert len(results) == len(submits)
 
     async def test_report_ready_submission_markers(self):
-        _, events = await _run_with(_SubmitClient(), _SubmitClient())
+        state, events = await _run_with(_SubmitClient(), _SubmitClient())
         ready = [e for e in events if e["event_type"] == "report_ready"]
 
         structured = {e["agent_key"] for e in ready if e.get("submission") == "structured"}
@@ -278,7 +282,7 @@ class TestStructuredSubmissionPipeline:
             if e["agent_key"] in debater_ready:
                 assert "submission" not in e
 
-        # 非辩手节点同一 (agent_key, report_key) 不双发（即时提交后内容不变，
+        # 仅正文改变（附加缺项/引用校验）才再次发射；禁止同一正文双发（
         # merge diff 自然跳过）；辩手报告为累积视图（rounds 逐轮派生），每轮
         # 发言刷新一次 report_ready 属既定语义（前端逐轮更新辩手报告）
         non_debater: dict = {}
@@ -288,8 +292,11 @@ class TestStructuredSubmissionPipeline:
             if e["agent_key"].startswith(("researcher_", "risk_debater_")):
                 debater_events.setdefault(key, []).append(e["content"])
             else:
-                assert key not in non_debater, f"report_ready 双发: {key}"
+                if key in non_debater:
+                    assert e["content"] != non_debater[key]["content"], f"相同报告重复发射: {key}"
                 non_debater[key] = e
+        for (_, report_key), event in non_debater.items():
+            assert event["content"] == state["reports"][report_key]
         for key, contents in debater_events.items():
             assert all(
                 len(later) >= len(earlier) for earlier, later in zip(contents, contents[1:])
@@ -310,7 +317,7 @@ class TestStructuredSubmissionPipeline:
         summary = state["structured_summary"]
 
         assert summary["model_confidence"] == 88
-        assert summary["final_signal"] == "Buy"
+        assert summary["final_signal"] == "BUY"
         assert summary["key_indicators"] == SUPERSET_INPUT["key_indicators"]
         assert summary["analysis_reference"] == ["依据一"]
 
@@ -360,8 +367,9 @@ class TestSchemaRetryBounded:
 
         assert submission.source == "fallback_text"
         assert submission.fields == {"action": "持有"}
-        # 纯工具轮无正文 → 降级 content 为空串（调用方按 H-2 占位降级）
-        assert submission.content == ""
+        # max_turns 耗尽 → runner 无条件收敛调用抢救正文（上游 max_tool_rounds 对齐），
+        # 收敛文本成为降级 content；收敛也失败时才为空串（调用方按 H-2 占位降级）
+        assert submission.content == "报告如下，现提交。"
 
 
 class TestFallbackPipeline:

@@ -29,6 +29,7 @@ export interface WorkflowListItem {
   valid: boolean
   validation_errors: string[]
   is_default: boolean
+  analysis_horizon?: 'short' | 'medium' | 'long'
 }
 
 /** 槽连线值：str = 单来源（report 键 / 点路径 / all_upstream）；数组 = 报告键集合（后端 InputBinding） */
@@ -66,6 +67,12 @@ export interface StageSpecDto {
 }
 
 export interface WorkflowSpecDto {
+  research_profile?: {
+    horizon: 'medium' | 'long'
+    revision: string
+    required_analysts: string[]
+    roles: Record<string, { name: string; prompt: string; data_tools?: string[]; template_inputs: unknown[] }>
+  } | null
   slug: string
   name: string
   description?: string
@@ -85,6 +92,7 @@ export interface WorkflowDetail {
 }
 
 export interface ValidateRunPayload {
+  analysis_horizon?: 'short' | 'medium' | 'long'
   workflow_slug: string
   selected_nodes?: string[]
   stage_overrides?: Record<string, { enabled?: boolean; rounds?: number; concurrency?: number }>
@@ -94,6 +102,8 @@ export interface ValidateRunResult {
   valid: boolean
   errors: string[]
   plan?: {
+    workflow_slug?: string
+    selected_nodes?: string[]
     stages: { stage_id: string; kind: string; nodes: string[] }[]
     total_units: number
   }

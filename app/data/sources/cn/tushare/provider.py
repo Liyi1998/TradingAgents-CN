@@ -29,7 +29,7 @@ class TushareCNProvider(BaseProvider):
             self.connected = await conn.connect()
             return self.connected
         except Exception as e:
-            logger.error(f"Tushare 连接失败: {e}")
+            logger.error(f"Tushare 连接失败: {e}", exc_info=True)
             self.connected = False
             return False
 
@@ -73,6 +73,14 @@ class TushareCNProvider(BaseProvider):
         from .api.daily_quotes import fetch_daily_quotes_batch
 
         return await fetch_daily_quotes_batch(self._get_conn(), trade_date)
+
+    async def get_index_quotes(
+        self, symbol: str, start_date: str, end_date: str, **kwargs
+    ) -> pd.DataFrame:
+        from .api.index_quotes import fetch_index_quotes
+
+        # 指数规范码即 ts_code 形态（000300.SH 等），不做 _to_ts_code 换算
+        return await fetch_index_quotes(self._get_conn(), symbol, start_date, end_date)
 
     async def get_daily_indicators(
         self, symbol: str, start_date: str, end_date: str, **kwargs
@@ -130,6 +138,12 @@ class TushareCNProvider(BaseProvider):
         ts_code = self._to_ts_code(symbol)
         return await fetch_adj_factors(self._get_conn(), ts_code, start_date, end_date)
 
+    async def get_adj_factors_batch(self, trade_date: str, **kwargs) -> pd.DataFrame:
+        """按交易日批量获取全市场复权因子（调度全量同步用）。"""
+        from .api.adj_factors import fetch_adj_factors_by_date
+
+        return await fetch_adj_factors_by_date(self._get_conn(), trade_date)
+
     async def get_news(
         self, symbol: str, start_date: str, end_date: str, **kwargs
     ) -> pd.DataFrame:
@@ -173,6 +187,12 @@ class TushareCNProvider(BaseProvider):
         return await fetch_margin_detail(
             self._get_conn(), ts_code, start_date, end_date
         )
+
+    async def get_margin_trading_batch(self, trade_date: str, **kwargs) -> pd.DataFrame:
+        """按交易日批量获取全市场融资融券明细（调度全量同步用）。"""
+        from .api.margin_trading import fetch_margin_detail_by_date
+
+        return await fetch_margin_detail_by_date(self._get_conn(), trade_date)
 
     async def get_dragon_tiger(
         self,

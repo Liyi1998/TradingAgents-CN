@@ -55,16 +55,11 @@
       <!-- 页面内容 -->
       <main class="main-content">
         <div class="content-wrapper">
+          <!-- 不加内层 transition：App.vue 外层已有 out-in 过渡，双层动画会串联加倍耗时 -->
           <router-view v-slot="{ Component, route }">
-            <transition
-              :name="route.meta.transition || 'fade'"
-              mode="out-in"
-              appear
-            >
-              <keep-alive :include="keepAliveComponents">
-                <component :is="Component" :key="route.fullPath" />
-              </keep-alive>
-            </transition>
+            <keep-alive :include="keepAliveComponents">
+              <component :is="Component" :key="route.fullPath" />
+            </keep-alive>
           </router-view>
         </div>
       </main>
@@ -84,8 +79,9 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useWindowSize } from '@vueuse/core'
+import { useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import SidebarMenu from '@/components/Layout/SidebarMenu.vue'
 import UserProfile from '@/components/Layout/UserProfile.vue'
@@ -117,11 +113,12 @@ const handleMainClick = () => {
 }
 
 // 监听窗口大小变化：在小屏幕上自动折叠侧边栏
+// immediate：真机/小窗首次加载即处于移动宽度，无 resize 事件，需初始就折叠
 watch(width, (newWidth) => {
   if (newWidth < 768 && !appStore.sidebarCollapsed) {
     appStore.setSidebarCollapsed(true)
   }
-})
+}, { immediate: true })
 
 // 路由变化时，移动端收起侧边栏
 watch(() => route.fullPath, () => {
@@ -290,31 +287,5 @@ watch(() => route.fullPath, () => {
   .footer {
     height: 48px;
   }
-}
-
-// 路由过渡动画
-.fade-enter-active,
-.fade-leave-active {
-  transition: opacity 0.3s ease;
-}
-
-.fade-enter-from,
-.fade-leave-to {
-  opacity: 0;
-}
-
-.slide-left-enter-active,
-.slide-left-leave-active {
-  transition: all 0.3s ease;
-}
-
-.slide-left-enter-from {
-  transform: translateX(30px);
-  opacity: 0;
-}
-
-.slide-left-leave-to {
-  transform: translateX(-30px);
-  opacity: 0;
 }
 </style>

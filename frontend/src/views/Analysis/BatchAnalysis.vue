@@ -133,8 +133,12 @@
                   />
                 </el-form-item>
 
+                <el-form-item label="分析周期">
+                  <AnalysisHorizonSelector v-model="batchForm.analysisHorizon" />
+                </el-form-item>
+
                 <el-form-item label="工作流">
-                  <WorkflowSelector v-model="workflowSlug" />
+                  <WorkflowSelector v-model="workflowSlug" :analysis-horizon="batchForm.analysisHorizon" />
                 </el-form-item>
               </div>
 
@@ -165,7 +169,7 @@
                     <span>预计总耗时: <strong>{{ estimatedTotalTime }}</strong> 分钟</span>
                   </div>
                 </div>
-                
+
                 <div v-if="workflowSpec" class="phases-grid">
                   <StageSwitches
                     :spec-stages="workflowSpec.stages"
@@ -311,6 +315,10 @@ import { useAuthStore } from '@/stores/auth'
 import ModelConfig from '@/components/ModelConfig.vue'
 import { getMarketByStockCode } from '@/utils/market'
 import { validateStockCode } from '@/utils/stockValidator'
+import AnalysisHorizonSelector from '@/components/Analysis/AnalysisHorizonSelector.vue'
+import type { AnalysisHorizon } from '@/types/analysis'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
+import { periodAnalystSelection } from '@/utils/researchWorkflow'
 
 // 路由实例（必须在顶层调用）
 const router = useRouter()
@@ -353,7 +361,7 @@ const getAnalystIcon = (slug: string) => {
   if (slug.includes('social')) return 'ChatDotRound'
   if (slug.includes('fund')) return 'DataAnalysis'
   if (slug.includes('capital')) return 'Wallet'
-  
+
   return map[slug] || 'User'
 }
 
@@ -378,7 +386,7 @@ const fetchAnalysts = async () => {
         icon: getAnalystIcon(mode.slug),
         slug: mode.slug
       }))
-      
+
       // 默认勾选：取配置中 default_selected 的智能体；配置未声明任何默认值时全选兜底。
       // 用户已保存的偏好（onMounted 后段回填）优先于此默认值。
       if (batchForm.analysts.length === 0) {
@@ -402,7 +410,7 @@ const fetchAnalysts = async () => {
     // 竞态兜底：工作流 spec 先于分析师列表到达时，pool 裁剪在此补跑
     if (workflowSpec.value && batchForm.analysts.length) {
       const prunable = prunableSlugs(workflowSpec.value)
-      batchForm.analysts = batchForm.analysts.filter((s) => prunable.has(s))
+      batchForm.analysts = periodAnalystSelection(workflowSpec.value, batchForm.analysts, prunable)
     }
   }
 }
@@ -423,6 +431,7 @@ const loadingMcpTools = ref(false)
 const batchForm = reactive({
   title: '',
   description: '',
+  analysisHorizon: 'short' as AnalysisHorizon,
   analysts: [] as string[],  // 将在 onMounted 中加载
   mcpTools: [] as string[],
   language: 'zh-CN'
@@ -435,6 +444,10 @@ const workflowSpec = ref<WorkflowSpecDto | null>(null)
 const stageStates = ref<Record<string, StageState>>({})
 const runErrors = ref<string[]>([])
 const runPlan = ref<ValidateRunResult['plan'] | undefined>(undefined)
+const horizonSelections = new Map<string, string[]>()
+watch(() => batchForm.analysisHorizon, (_next, previous) => {
+  horizonSelections.set(previous, [...batchForm.analysts])
+})
 
 /** 被跳过的组（optional 且未启用）：NodeSelectGrid 灰显其成员选择 */
 const skippedStageIds = computed(() =>
@@ -480,7 +493,8 @@ const applyWorkflowSpec = (spec: WorkflowSpecDto) => {
   )
 
   const prunable = prunableSlugs(spec)
-  batchForm.analysts = batchForm.analysts.filter((s) => prunable.has(s))
+  batchForm.analysts = periodAnalystSelection(spec,
+    horizonSelections.get(spec.research_profile?.horizon || 'short') || batchForm.analysts, prunable)
   scheduleValidateRun()
 }
 
@@ -488,35 +502,44 @@ const fetchWorkflowSpec = async (slug: string) => {
   if (!slug) return
   try {
     const res = await workflowApi.get(slug)
+    if (slug !== workflowSlug.value) return
     applyWorkflowSpec(res.data.workflow)
   } catch (error) {
     console.error('获取工作流详情失败', error)
+    if (slug !== workflowSlug.value) return
     workflowSpec.value = null
     runErrors.value = ['工作流加载失败，请刷新重试']
   }
 }
 
 watch(workflowSlug, (slug) => {
+  validateRunVersion++
   runErrors.value = []
   runPlan.value = undefined
+  workflowSpec.value = null
   fetchWorkflowSpec(slug)
 })
 
 // 裁剪可行性校验（轻量编译 validate-run）：勾选/开关变化后防抖触发
 let validateRunTimer: ReturnType<typeof setTimeout> | null = null
+let validateRunVersion = 0
 const scheduleValidateRun = () => {
+  validateRunVersion++
   if (validateRunTimer) clearTimeout(validateRunTimer)
   validateRunTimer = setTimeout(validateRun, 400)
 }
 
 const validateRun = async () => {
   if (!workflowSlug.value || !workflowSpec.value) return
+  const version = validateRunVersion
   try {
     const res = await workflowApi.validateRun({
       workflow_slug: workflowSlug.value,
+      analysis_horizon: batchForm.analysisHorizon,
       selected_nodes: batchForm.analysts,
       stage_overrides: buildStageOverrides(),
     })
+    if (version !== validateRunVersion) return
     runErrors.value = res.data?.valid ? [] : res.data?.errors || []
     runPlan.value = res.data?.plan
   } catch (error) {
@@ -529,6 +552,7 @@ const onSelectedNodesChange = (slugs: string[]) => {
   batchForm.analysts = slugs
   scheduleValidateRun()
 }
+
 
 const onStageStatesChange = (states: Record<string, StageState>) => {
   stageStates.value = states
@@ -635,7 +659,7 @@ const initializeModelSettings = async () => {
 
     // 获取所有可用的模型列表
     const llmConfigs = await configApi.getLLMConfigs()
-    availableModels.value = (llmConfigs as any).filter((config: any) => config.enabled)
+    availableModels.value = (llmConfigs as any).filter((config: any) => config.enabled && config.model_type !== 'embedding')
 
     // 未设置默认模型时，回退到第一个启用的模型（不写死具体模型 ID）
     const firstModel = availableModels.value[0]?.model_name || ''
@@ -688,6 +712,11 @@ onMounted(async () => {
   }
 
   // 读取路由查询参数以便从筛选页预填充（路由参数优先级最高）
+  applyRouteQuery()
+})
+
+/** 应用路由 query（筛选页批量分析入口）：预填股票代码并触发解析 */
+const applyRouteQuery = () => {
   const q = route.query as any
   if (q?.stocks) {
     const parts = String(q.stocks).split(',').map((s) => s.trim()).filter(Boolean)
@@ -696,15 +725,20 @@ onMounted(async () => {
     // 触发解析以更新 symbols
     parseStockCodes()
   }
+}
+
+// 同路由 query 变化（App.vue 按 route.name 复用组件实例）时重新预填
+watch(() => route.query, () => {
+  applyRouteQuery()
 })
 
 const removeStock = (index: number) => {
   const removedCode = stockCodes.value[index]
   stockCodes.value.splice(index, 1)
-  
+
   // 更新输入框
   stockInput.value = stockCodes.value.join('\n')
-  
+
   // 从无效列表中移除
   const invalidIndex = invalidCodes.value.indexOf(removedCode)
   if (invalidIndex > -1) {
@@ -748,6 +782,11 @@ const submitBatchAnalysis = async () => {
     return
   }
 
+  if (batchForm.analysisHorizon !== 'short' &&
+      (!workflowSpec.value || workflowSpec.value.research_profile?.horizon !== batchForm.analysisHorizon)) {
+    ElMessage.error('请等待对应周期研究工作流加载完成')
+    return
+  }
   if (runErrors.value.length) {
     ElMessage.error(`当前选择不满足工作流依赖：${runErrors.value[0]}`)
     return
@@ -755,7 +794,7 @@ const submitBatchAnalysis = async () => {
 
   try {
     await ElMessageBox.confirm(
-      `确定要提交批量分析任务吗？\n批次：${batchForm.title}\n股票数量：${stockCodes.value.length}只`,
+      `确定要提交批量分析任务吗？\n批次：${batchForm.title}\n分析周期：${analysisHorizonLabel(batchForm.analysisHorizon)}\n股票数量：${stockCodes.value.length}只`,
       '确认提交',
       {
         confirmButtonText: '确定',
@@ -774,6 +813,7 @@ const submitBatchAnalysis = async () => {
       stock_codes: symbols.value,  // 兼容字段
       workflow_slug: workflowSlug.value || undefined,
       parameters: {
+        analysis_horizon: batchForm.analysisHorizon,
         // 若全部代码可识别为同一市场则携带；否则省略让后端自行判断
         market_type: (() => {
           const markets = new Set(symbols.value.map(s => getMarketByStockCode(s)))
@@ -782,7 +822,7 @@ const submitBatchAnalysis = async () => {
         selected_analysts: normalizeAnalystIds(batchForm.analysts), // 确保使用英文ID
         selected_nodes: normalizeAnalystIds(batchForm.analysts),
         stage_overrides: buildStageOverrides(),
-        language: batchForm.language,
+        // 投资期限（short/mid/long；后端 None/short=旧行为零漂移）        language: batchForm.language,
         analyst_model: modelSettings.value.analystModel,
         debate_model: modelSettings.value.debateModel,
 

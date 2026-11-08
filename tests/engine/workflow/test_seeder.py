@@ -105,7 +105,7 @@ class TestSeederIdempotent:
         # 幂等：第二遍全部 kept（无插入/升级/tombstone 动作）
         stats2 = seeder.sync_all()
         assert stats2["agents"] == {"inserted": 0, "upgraded": 0, "kept": 14, "tombstoned": 0}
-        assert stats2["workflows"] == {"inserted": 0, "upgraded": 0, "kept": 1, "tombstoned": 0}
+        assert stats2["workflows"] == {"inserted": 0, "upgraded": 0, "kept": 3, "tombstoned": 0}
         _ = stats
 
     def test_builtin_upgrade_on_seed_hash_drift(self, migrated_env):

@@ -643,7 +643,7 @@ class ScreeningQueryService:
             return {"field": field, "count": 0}
 
         except Exception as e:
-            logger.error(f"获取字段统计失败: {e}")
+            logger.error(f"获取字段统计失败: {e}", exc_info=True)
             return {"field": field, "error": str(e)}
 
     async def get_available_values(self, field: str, limit: int = 100) -> List[str]:
@@ -659,7 +659,7 @@ class ScreeningQueryService:
                 return values[:limit]
             return []
         except Exception as e:
-            logger.error(f"获取字段可选值失败: {e}")
+            logger.error(f"获取字段可选值失败: {e}", exc_info=True)
             return []
 
     # ── 通用条件构建 ──
@@ -712,14 +712,3 @@ class ScreeningQueryService:
         except (TypeError, ValueError):
             return False
         return True
-
-
-# 全局服务实例
-_screening_query_service: Optional[ScreeningQueryService] = None
-
-
-def get_screening_query_service() -> ScreeningQueryService:
-    global _screening_query_service
-    if _screening_query_service is None:
-        _screening_query_service = ScreeningQueryService()
-    return _screening_query_service

@@ -49,6 +49,14 @@ def create_risk_manager(llm, memory):
             from app.utils.stock_utils import StockUtils
 
             market_info = StockUtils.get_market_info(ticker)
+            from app.engine.decision_semantics import (
+                ACCOUNT_POSITION_LABELS,
+                normalize_account_position,
+            )
+
+            account_position = normalize_account_position(
+                state.get("account_position", "UNKNOWN")
+            )
 
             company_name = await resolve_company_name(ticker, market_info)
             currency = market_info["currency_name"]
@@ -58,7 +66,7 @@ def create_risk_manager(llm, memory):
 
             if not base_prompt:
                 error_msg = "❌ 未找到 risk-manager 智能体配置，请检查 agent_specs 智能体库（DB）。"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 raise ValueError(error_msg)
 
             context_prefix = build_context_prefix(ticker, company_name, currency)
@@ -73,7 +81,7 @@ def create_risk_manager(llm, memory):
             # 裁决前注入相似情景历史记忆（写读对称）
             from app.engine.agents.utils.memory import fetch_memory_brief
 
-            memory_brief = await fetch_memory_brief(memory, f"{trader_plan}\n\n{risky_report}\n\n{safe_report}")
+            memory_brief = await fetch_memory_brief(memory, f"{trader_plan}\n\n{risky_report}\n\n{safe_report}", as_of=state.get("trade_date"))
             if memory_brief and not memory_brief.startswith("暂无"):
                 messages.append(Message(role=Role.USER, content=f"=== 历史风控反思（类似情景） ===\n{memory_brief}"))
                 logger.info("👔 [Risk Manager] 已注入历史风控记忆")
@@ -84,6 +92,9 @@ def create_risk_manager(llm, memory):
 <report>
 {trader_plan}
 </report>
+
+=== 账户持仓状态（系统事实） ===
+{ACCOUNT_POSITION_LABELS[account_position]} ({account_position})
 
 === 激进风险分析报告 (Risky Case) ===
 <report>
@@ -104,10 +115,10 @@ def create_risk_manager(llm, memory):
 
 请基于以上所有资料（基础报告 + 三方辩论 + 原始计划），生成一份【最终风控裁决报告】。
 报告应包含以下章节：
-1. **风控裁决摘要**：明确的投资评级（买入/持有/卖出/观望）和核心风控理由。
+1. **风控裁决摘要**：分别给出研究观点、未持仓动作（BUY/WATCH）和已持仓动作（HOLD/REDUCE/SELL），不得用一个“持有”同时代表两类账户。
 2. **风险-收益权衡**：评估激进派的机会主义与保守派的风险规避，结合中性派的平衡观点，说明最终决策的依据。
 3. **关键风险提示**：列出必须要关注的尾部风险。
-4. **最终执行指令**：给交易员的具体指令（如修正后的建仓比例、严格的止损位、对冲策略等）。
+4. **最终执行指令**：明确账户状态、未持仓动作、已持仓动作、仓位上限及逐条退出条件。UNKNOWN 时必须保留两套分账户指令。
 
 请直接生成报告内容。
 """
@@ -152,7 +163,7 @@ def create_risk_manager(llm, memory):
                 os.replace(tmp_filename, filename)
                 logger.info(f"👔 [Risk Manager] 已生成裁决报告: {filename}")
             except Exception as e:
-                logger.error(f"👔 [ERROR] 保存裁决报告失败: {e}")
+                logger.error(f"👔 [ERROR] 保存裁决报告失败: {e}", exc_info=True)
 
             # 7. 更新状态（canonical：仅裁决结论，其余键由 export_legacy_state 派生）
             new_risk_debate_state = dict(risk_debate_state)
@@ -172,13 +183,18 @@ def create_risk_manager(llm, memory):
                 update["final_decision_signal"] = dict(final_submission.fields)
             return update
 
-        except Exception:
+        except Exception as exc:
+            from app.llm.failures import describe_failure
+
             logger.error(
-                "👔 [Risk Manager] 节点执行异常，降级返回以保持流程继续",
+                "👔 [Risk Manager] 节点执行异常，保留失败原因供质量检查拦截",
                 exc_info=True,
             )
             # 降级状态：保留上游 risk_debate_state 原值，仅写入错误说明
-            fallback_content = "⚠️ 首席风控官节点执行异常，未能生成有效裁决报告。"
+            fallback_content = (
+                "⚠️ 首席风控官节点执行异常，未能生成有效裁决报告。"
+                f"原因：{describe_failure(exc)['message']}"
+            )
             new_risk_debate_state = dict(risk_debate_state)
             new_risk_debate_state.update(
                 {

@@ -43,6 +43,11 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
     """
     tz = settings.TIMEZONE
 
+    # The poll itself is cheap; all tracks default to opt-out. A persistent
+    # per-session ledger prevents catch-up from replaying paid daily analyses.
+    from app.worker.research_tracking_jobs import register_research_tracking_jobs
+    register_research_tracking_jobs(scheduler)
+
     # ── 启动新架构 SchedulerEngine（三市场域级同步）──
     _start_scheduler_engine(scheduler)
 
@@ -51,7 +56,9 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
     # 检查 Tushare 是否可用（DB 优先，.env 兜底；A 股优先 TUSHARE_CN_TOKEN，回退 TUSHARE_TOKEN）
     try:
         from app.utils.ds_key_utils import get_datasource_api_key
-        tushare_available = bool(get_datasource_api_key("tushare"))
+        tushare_available = bool(
+            settings.TUSHARE_ENABLED and get_datasource_api_key("tushare")
+        )
     except Exception:
         tushare_available = bool(
             settings.TUSHARE_ENABLED
@@ -59,8 +66,8 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
         )
 
     if tushare_available:
-        preferred_sources = ["tushare", "akshare", "baostock"]
-        logger.info("股票基础信息同步优先数据源: Tushare > AKShare > BaoStock")
+        preferred_sources = ["akshare", "baostock"]
+        logger.info("Tushare 已被当前部署禁用；基础信息使用 AKShare > BaoStock")
     else:
         preferred_sources = ["akshare", "baostock"]
         logger.info("股票基础信息同步优先数据源: AKShare > BaoStock")
@@ -74,7 +81,13 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
         async with _startup_sync_lock:
             await run_basics_sync_func(force=False, preferred_sources=preferred_sources)
 
-    _sync_task = asyncio.create_task(_run_startup_sync())
+    # 启动期同步任务走 task_registry（critical=False：shutdown 时统一 cancel，
+    # 与 task_registry 文档注释的 _startup_sync 设计一致），完成后回调记录结果
+    from app.core.task_registry import task_registry
+
+    _sync_task = task_registry.register(
+        _run_startup_sync(), name="basics_startup_sync", critical=False
+    )
     _sync_task.add_done_callback(_handle_basics_sync_task_result)
 
     if settings.SYNC_STOCK_BASICS_ENABLED:
@@ -101,7 +114,7 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
 
     # ── Quotes ingestion（实时行情入库）──
     if settings.QUOTES_INGEST_ENABLED:
-        from app.services.quotes_ingestion_service import QuotesIngestionService
+        from app.data.sync.quotes_ingestion_service import QuotesIngestionService
 
         quotes_ingestion = QuotesIngestionService()
         await quotes_ingestion.ensure_indexes()
@@ -122,14 +135,9 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
     )
     logger.info("A股完整性检查已配置: 每日 17:00")
 
-    # ── 选股每日推荐（20:15 factor_scores 批算完成后）──
-    add_resilient_job(
-        scheduler, _run_screening_daily_recommendations,
-        CronTrigger(hour=20, minute=47, timezone=tz),
-        id="screening_daily_recommendations",
-        name="选股每日推荐生成",
-    )
-    logger.info("选股每日推荐任务已注册: 每交易日 20:47")
+    from app.worker.screening_jobs import register_screening_jobs
+    register_screening_jobs(scheduler)
+    register_knowledge_jobs(scheduler)
 
     # ── 港股全量同步（通过 SchedulerEngine 已自动注册，此处仅注册状态检查等辅助任务）──
     _register_hk_auxiliary_jobs(scheduler)
@@ -137,13 +145,17 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
 
 
 def _start_scheduler_engine(scheduler: AsyncIOScheduler):
-    """启动新架构 SchedulerEngine，将域级同步任务注册到主调度器上。"""
+    """启动新架构 SchedulerEngine，将域级同步任务注册到主调度器上。
+
+    engine.start() 幂等：内部有 scheduler.running 与 _jobs_registered 双重
+    防重（main._init_scheduler 已先行 start 过时此处为 no-op），避免重复
+    注册与重复加载 schedule.yaml。
+    """
     try:
         from app.data.scheduler.engine import SchedulerEngine
 
         engine = SchedulerEngine(scheduler=scheduler)
-        engine._register_all_jobs()
-        engine._load_all_schedules()
+        engine.start()
 
         SchedulerEngine._instance = engine
         logger.info("SchedulerEngine 已集成到主调度器")
@@ -169,7 +181,7 @@ def _handle_basics_sync_task_result(task: asyncio.Task) -> None:
 
 def _register_hk_auxiliary_jobs(sched: AsyncIOScheduler):
     """注册港股辅助任务（基础信息同步 + 日线同步 + 状态检查，默认暂停）。"""
-    from app.worker.hk.hk_sync_service import (
+    from app.data.sync.hk_sync_service import (
         run_hk_basic_info_sync, run_hk_daily_quotes_sync, run_hk_status_check,
     )
     tz = settings.TIMEZONE
@@ -206,7 +218,7 @@ def _register_hk_auxiliary_jobs(sched: AsyncIOScheduler):
 
 def _register_us_auxiliary_jobs(sched: AsyncIOScheduler):
     """注册美股辅助任务（基础信息同步 + 日线同步 + 状态检查，默认暂停）。"""
-    from app.worker.us.us_sync_service import (
+    from app.data.sync.us_sync_service import (
         run_us_basic_info_sync, run_us_daily_quotes_sync, run_us_status_check,
     )
     tz = settings.TIMEZONE
@@ -243,10 +255,21 @@ def _register_us_auxiliary_jobs(sched: AsyncIOScheduler):
 
 # ── 辅助异步任务函数 ──
 
+async def _run_kb_incremental_index():
+    """知识库增量索引（未配置向量模型时各市场自动 skip）"""
+    try:
+        from app.data.knowledge import run_incremental
+
+        summary = await run_incremental()
+        logger.info("知识库增量索引完成: %s", summary)
+    except Exception as e:
+        logger.error(f"知识库增量索引失败: {e}", exc_info=True)
+
+
 async def _run_cn_integrity_check():
     """A股数据完整性检查"""
     try:
-        from app.services.cn_data_integrity_service import get_integrity_service
+        from app.data.sync.cn_data_integrity_service import get_integrity_service
         service = get_integrity_service()
         report = await service.run_full_check()
         logger.info("完整性检查完成: errors=%d, warnings=%d", report.error_count, report.warning_count)
@@ -255,25 +278,20 @@ async def _run_cn_integrity_check():
 
 
 async def _run_screening_daily_recommendations():
-    """每日推荐生成（幂等覆盖；失败只记日志不重试——次日自然覆盖）。
+    """Compatibility entry point; the implementation has a single owner."""
+    from app.worker.screening_jobs import run_screening_daily_recommendations
+    return await run_screening_daily_recommendations()
 
-    推荐 20:47 落库后，若用户开启 screening_daily_insight_enabled，
-    串联一次 L1 自动研判（默认策略 Top-20）；研判失败不影响已落库的
-    推荐列表（内层独立 try，insight_status=failed 仅作标注）。
-    """
-    try:
-        from app.services.screening.strategy_service import StrategyService
-        summary = await StrategyService().generate_daily_recommendations()
-        logger.info("选股每日推荐完成: %s", summary)
-    except Exception as e:
-        logger.error(f"选股每日推荐生成失败: {e}", exc_info=True)
-        return
-    try:
-        from app.services.screening.insight_service import (
-            ScreeningInsightService,
+
+def register_knowledge_jobs(scheduler):
+    """Register explicitly enabled KB work without reviving bulk sync jobs."""
+    tz = settings.TIMEZONE
+    # ── 知识库增量索引（stock_news 向量化；独立 cron，与结算链路解耦） ──
+    if settings.KB_INDEX_ENABLED:
+        add_resilient_job(
+            scheduler, _run_kb_incremental_index,
+            IntervalTrigger(minutes=settings.KB_INDEX_INTERVAL_MINUTES, timezone=tz),
+            id="kb_news_index",
+            name="知识库增量索引",
         )
-        outcome = await ScreeningInsightService().run_daily_auto_if_enabled()
-        if outcome is not None:
-            logger.info("每日自动研判完成: %s", outcome)
-    except Exception as e:
-        logger.error(f"每日自动研判异常: {e}", exc_info=True)
+        logger.info(f"知识库增量索引已启动: 每 {settings.KB_INDEX_INTERVAL_MINUTES} 分钟")

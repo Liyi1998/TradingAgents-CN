@@ -74,6 +74,12 @@ const routes: RouteRecordRaw[] = [
         meta: { title: '批量分析', requiresAuth: true }
       },
       {
+        path: 'research',
+        name: 'ResearchTracking',
+        component: () => import('@/views/Analysis/ResearchTracking.vue'),
+        meta: { title: '短线持续研究', requiresAuth: true }
+      },
+      {
         path: 'tasks/:taskId',
         name: 'AnalysisTaskDetail',
         component: () => import('@/views/Analysis/TaskDetail.vue'),
@@ -188,6 +194,29 @@ const routes: RouteRecordRaw[] = [
   { path: '/data/quality', redirect: '/data' },
   { path: '/data/viewer', redirect: '/data' },
   { path: '/data/sources', redirect: '/data' },
+  // ==================== 知识库 ====================
+  {
+    path: '/knowledge',
+    name: 'Knowledge',
+    component: () => import('@/layouts/BasicLayout.vue'),
+    meta: {
+      title: '知识库',
+      icon: 'Collection',
+      requiresAuth: true,
+      transition: 'fade'
+    },
+    children: [
+      {
+        path: '',
+        name: 'KnowledgeHome',
+        component: () => import('@/views/Knowledge/index.vue'),
+        meta: {
+          title: '知识库',
+          requiresAuth: true
+        }
+      }
+    ]
+  },
   {
     path: '/learning',
     name: 'Learning',
@@ -276,6 +305,30 @@ const routes: RouteRecordRaw[] = [
   },
   { path: '/queue', redirect: '/tasks' },
   { path: '/analysis/history', redirect: '/tasks?tab=completed' },
+  {
+    path: '/settlement',
+    name: 'Settlement',
+    component: () => import('@/layouts/BasicLayout.vue'),
+    meta: {
+      title: '结算记分卡',
+      icon: 'Trophy',
+      requiresAuth: true,
+      transition: 'fade'
+    },
+    children: [
+      {
+        path: '',
+        name: 'SettlementHome',
+        component: () => import('@/views/Settlement/index.vue'),
+        meta: {
+          title: '结算记分卡',
+          icon: 'Trophy',
+          requiresAuth: true,
+          transition: 'fade'
+        }
+      }
+    ]
+  },
   {
     path: '/reports',
     name: 'Reports',

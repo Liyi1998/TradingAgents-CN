@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:wyckoff-method-9aa15aef
+  frontend:
+    image: tradingagents-cn-hub-frontend:wyckoff-method-9aa15aef

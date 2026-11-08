@@ -79,7 +79,9 @@ def set_csrf_cookie(response: Response, token: str) -> None:
     - 生产（DEBUG=False）：Secure=True
     - 开发：Secure=False（允许 HTTP localhost）
     """
-    secure = not settings.DEBUG
+    secure = settings.CSRF_COOKIE_SECURE
+    if secure is None:
+        secure = not settings.DEBUG
     response.set_cookie(
         key=CSRF_COOKIE_NAME,
         value=token,

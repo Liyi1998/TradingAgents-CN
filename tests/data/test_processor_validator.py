@@ -95,6 +95,16 @@ class TestValidator:
         valid, errors = self.validator.validate(records, "market_quotes", "CN")
         assert len(valid) == 1
 
+    def test_cn_market_quotes_allows_unlimited_ipo_gain(self):
+        records = [{
+            "symbol": "301707",
+            "last_price": 116.52,
+            "pct_chg": 396.89,
+        }]
+        valid, errors = self.validator.validate(records, "market_quotes", "CN")
+        assert len(valid) == 1
+        assert errors == []
+
     def test_empty_records(self):
         valid, errors = self.validator.validate([], "basic_info", "CN")
         assert valid == []

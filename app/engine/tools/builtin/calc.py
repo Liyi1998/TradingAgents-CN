@@ -489,6 +489,21 @@ def calc_batch(tasks: list) -> str:
         return "错误：tasks 必须为数组"
     if not tasks:
         return "错误：tasks 不能为空"
+    # 兼容本地 v1.4 的旧调用形状 calc_batch(["1+1", "2*3"])；
+    # 新的 ToolDef 只向模型暴露结构化 tasks，避免继续产生旧格式。
+    if all(isinstance(task, str) for task in tasks):
+        if len(tasks) > _BATCH_MAX_TASKS:
+            return f"错误：单次最多计算 {_BATCH_MAX_TASKS} 个表达式"
+        legacy_lines = []
+        for index, expression in enumerate(tasks, 1):
+            try:
+                result = _eval_expression(expression)
+                legacy_lines.append(f"{index}. {expression} = {_q4(result)}")
+            except (ValueError, SyntaxError, ZeroDivisionError, OverflowError) as exc:
+                legacy_lines.append(
+                    f"{index}. 错误：{exc.__class__.__name__}: {exc}"
+                )
+        return "\n".join(legacy_lines)
     if len(tasks) > _BATCH_MAX_TASKS:
         return f"错误：单批任务数不得超过 {_BATCH_MAX_TASKS}，请拆分提交"
     lines = []

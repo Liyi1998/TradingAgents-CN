@@ -85,7 +85,9 @@ class OpenAILLMClient(BaseLLMClient):
         self.thinking_effort = thinking_effort
         # 厂家标识（数据库 provider 名），思考档位方言判定（thinking.py）
         self.provider = provider or ""
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        # The runner owns retry limits. SDK retries multiply each application attempt
+        # (e.g. four app attempts × three SDK attempts on the same 504).
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=timeout, max_retries=0)
 
     # ── canonical → OpenAI 消息 ───────────────────────────────────
 
@@ -100,46 +102,44 @@ class OpenAILLMClient(BaseLLMClient):
         if system:
             api_messages.append({"role": "system", "content": system})
 
-        pending_tools: List[Dict[str, Any]] = []  # 暂存 tool 消息，保证先于 user 文本
-
-        def flush_tools():
-            api_messages.extend(pending_tools)
-            pending_tools.clear()
-
         for msg in messages:
             if msg.role == Role.SYSTEM:
                 api_messages.append({"role": "system", "content": str(msg.content)})
                 continue
 
-            for b in msg.blocks():
-                if isinstance(b, TextBlock):
-                    if msg.role == Role.ASSISTANT:
-                        api_messages.append({"role": "assistant", "content": b.text})
-                    else:
-                        flush_tools()
-                        api_messages.append({"role": "user", "content": b.text})
-                elif isinstance(b, ToolUseBlock):
-                    # tool_use 附着到 assistant 消息的 tool_calls
-                    last = api_messages[-1] if api_messages else None
-                    if not (last and last.get("role") == "assistant" and "tool_calls" in last):
-                        last = {"role": "assistant", "content": "", "tool_calls": []}
-                        api_messages.append(last)
-                    last["tool_calls"].append(
-                        {
-                            "id": b.id,
-                            "type": "function",
-                            "function": {"name": b.name, "arguments": json.dumps(b.input, ensure_ascii=False)},
-                        }
-                    )
-                elif isinstance(b, ToolResultBlock):
-                    pending_tools.append(
+            blocks = msg.blocks()
+            text = "".join(b.text for b in blocks if isinstance(b, TextBlock))
+            if msg.role == Role.ASSISTANT:
+                # Keep one canonical assistant turn as one API message. Never merge
+                # calls across turns or move earlier tool outputs behind a later call.
+                calls = [
+                    {
+                        "id": b.id,
+                        "type": "function",
+                        "function": {"name": b.name, "arguments": json.dumps(b.input, ensure_ascii=False)},
+                    }
+                    for b in blocks if isinstance(b, ToolUseBlock)
+                ]
+                if text or calls:
+                    api_message: Dict[str, Any] = {"role": "assistant", "content": text}
+                    if calls:
+                        api_message["tool_calls"] = calls
+                    api_messages.append(api_message)
+                continue
+
+            # Tool results belong immediately after their assistant turn, including
+            # error outputs. Mixed user messages emit all results before user text.
+            for b in blocks:
+                if isinstance(b, ToolResultBlock):
+                    api_messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": b.tool_use_id,
                             "content": b.content,
                         }
                     )
-        flush_tools()
+            if text:
+                api_messages.append({"role": "user", "content": text})
         return api_messages
 
     def _to_api_tools(self, tools: Optional[List[ToolDef]]) -> Optional[List[Dict[str, Any]]]:

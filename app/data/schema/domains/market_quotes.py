@@ -26,6 +26,10 @@ class MarketQuotesSchema(CommonFields):
 
     # 交易日期
     trade_date: Optional[str] = None
+    quote_observed_at: Optional[str] = None  # Source timestamp with explicit timezone
+    quote_time_basis: Optional[str] = None
+    price_basis: Optional[str] = None
+    currency: Optional[str] = None
 
     # 港股准实时增强
     quote_source_type: Optional[str] = None  # delayed / realtime

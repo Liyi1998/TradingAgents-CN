@@ -32,6 +32,30 @@ class BrokenJob:
         raise RuntimeError("init failed")
 
 
+class SlowJob:
+    """用于验证超时取消的任务。"""
+
+    cancelled = False
+
+    async def execute(self):
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            type(self).cancelled = True
+            raise
+
+
+class RecordingMonitor:
+    def __init__(self):
+        self.completions = []
+
+    def on_task_start(self, market, domain):
+        pass
+
+    def on_task_complete(self, market, domain, success, latency_ms=0):
+        self.completions.append((market, domain, success, latency_ms))
+
+
 class RecordingJob:
     """记录引擎注入的 sync_mode / preferred_source 的 Job（按执行顺序追加到类列表）。"""
 
@@ -199,6 +223,26 @@ class TestMakeJobFunc:
         scheduler_engine._registry.register("daily_quotes", "CN", ErrorJob)
         job_func = scheduler_engine._make_job_func("CN", "daily_quotes")
         await job_func()
+
+    @pytest.mark.asyncio
+    async def test_job_timeout_cancels_coroutine_and_clears_monitor(
+        self, scheduler_engine, monkeypatch
+    ):
+        SlowJob.cancelled = False
+        monitor = RecordingMonitor()
+        scheduler_engine._registry.register("adj_factors", "CN", SlowJob)
+        scheduler_engine._job_configs[("CN", "adj_factors")] = {
+            "timeout_seconds": 0.1
+        }
+        monkeypatch.setattr(scheduler_engine, "_get_monitor", lambda: monitor)
+
+        await scheduler_engine._run_job_with_dependencies(
+            "CN", "adj_factors", set()
+        )
+
+        assert SlowJob.cancelled is True
+        assert len(monitor.completions) == 1
+        assert monitor.completions[0][2] is False
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 """
 
 import logging
+import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -10,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 def format_result(data: Any, title: str, max_rows: int = 2000) -> str:
     """Format data to Markdown"""
+    import pandas as pd
+
+    # DataFrame.__str__ obeys terminal display limits and silently hides columns.
+    # Tool consumers need every field, including sparse fields from other sources.
+    if isinstance(data, pd.DataFrame):
+        data = data.to_dict(orient="records")
     if data is None:
         return f"# {title}\n\nNo data found."
 
@@ -26,13 +33,17 @@ def format_result(data: Any, title: str, max_rows: int = 2000) -> str:
         # 列表全量输出，不按行数截断：隐藏的行对 LLM 不可见，会丢失数据
 
         # Create markdown table
-        headers = list(data[0].keys())
+        headers = list(dict.fromkeys(key for item in data for key in item))
         header_row = "| " + " | ".join(headers) + " |"
         separator_row = "| " + " | ".join(["---"] * len(headers)) + " |"
 
         rows = []
         for item in data:
-            row = "| " + " | ".join([str(item.get(h, "")) for h in headers]) + " |"
+            def cell(value):
+                if value is None or (isinstance(value, float) and not math.isfinite(value)):
+                    return "未提供"
+                return str(value).replace("|", "\\|").replace("\n", "<br>")
+            row = "| " + " | ".join(cell(item.get(h)) for h in headers) + " |"
             rows.append(row)
 
         result = f"# {title}\n\n{header_row}\n{separator_row}\n" + "\n".join(rows)

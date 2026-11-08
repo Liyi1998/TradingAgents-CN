@@ -3,7 +3,8 @@ agent 循环（对齐 claude-code query.ts 的核心模式）
 
 核心约定：
 - 唯一退出信号：响应中没有 ToolUseBlock → 自然停止（StopReason.END_TURN）
-- max_turns 安全兜底；max_output_tokens 截断恢复（升级重发 + 恢复消息，上限 3 次）
+- max_turns / max_tool_calls 双重安全兜底；max_output_tokens 截断恢复
+  （升级重发 + 恢复消息，上限 3 次）
 - 每轮发送前分层压缩检查：预测式 / 阈值 / 阻塞兜底（compact/auto_compactor.py）
 - API 调用经 with_retry（10 次指数退避，限流 3 次触发 fallback）
 - 工具结果之后、下次调用之前：drain 用户消息队列（system-reminder 包装注入）
@@ -23,7 +24,7 @@ import logging
 from .compact.auto_compactor import AutoCompactor, CompactConfig
 from .compact.token_counter import TokenCounter
 from .core.base import BaseLLMClient
-from .core.errors import ContextWindowExceededError
+from .core.errors import ContextWindowExceededError, LLMError
 from .core.types import ChatResponse, Message, Role, ToolResultBlock, ToolUseBlock
 from .limits import resolve_output_limits
 from .orchestration.concurrency import partition_tool_calls, run_batches
@@ -33,11 +34,27 @@ from .events import (
     unwrap_system_reminder,
 )
 from .retry import DEFAULT_MAX_RETRIES, FallbackTriggeredError, with_retry
+from .tools.result_status import tool_result_is_error
 
 logger = logging.getLogger("app.llm.runner")
 
+# token 用量记录函数：应用层启动时注入（token_usage_recorder.record）。
+# llm 层不 import services（依赖方向：应用层 → llm）；未注入时跳过记录。
+_usage_recorder = None
+
+
+def set_usage_recorder(record_fn) -> None:
+    """注入 token 用量记录函数（签名同 token_usage_recorder.record）。"""
+    global _usage_recorder
+    _usage_recorder = record_fn
+
+
 DEFAULT_MAX_TURNS = 16
 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3  # 恢复消息注入次数上限
+TOOL_CALL_LIMIT_RESULT = (
+    "工具调用预算已耗尽，本次调用未执行。请停止调用工具，"
+    "仅根据已经取得的工具结果完成最终正文。"
+)
 RECOVERY_INSTRUCTION = (
     "Output token limit hit. Resume directly from where you stopped — no apology, "
     "no repetition, continue the unfinished content."
@@ -87,6 +104,7 @@ class RunResult:
     compacted: bool = False
     stop_reason: str = ""
     user_messages_injected: int = 0
+    salvaged_after_max_turns: bool = False  # 工具循环耗尽后经一次无工具收敛调用抢救出正文
 
 
 async def run_conversation(
@@ -97,6 +115,7 @@ async def run_conversation(
     tools: Optional[List[Any]] = None,
     registry: Optional[Any] = None,
     max_turns: int = DEFAULT_MAX_TURNS,
+    max_tool_calls: Optional[int] = None,
     max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     thinking_budget: Optional[int] = None,
@@ -106,6 +125,7 @@ async def run_conversation(
     history: Optional[List[Message]] = None,
     on_text_delta: Optional[Callable[[str], None]] = None,
     compact_config: Optional[CompactConfig] = None,
+    allow_compaction: bool = True,
     enable_skill_listing: bool = False,
     skill_dirs: Optional[List[str]] = None,
     task_id: str = "",
@@ -114,6 +134,7 @@ async def run_conversation(
     user_id: str = "",
     event_sink: Optional[Any] = None,
     inbox: Optional[Any] = None,
+    stop_when: Optional[Callable[[], bool]] = None,
 ) -> RunResult:
     """跑一轮完整对话（含工具调用、自动压缩、用户消息注入与事件流）。
 
@@ -123,6 +144,8 @@ async def run_conversation(
         system: 系统提示词
         tools: ToolDef 列表（缺省用 registry.defs()）
         registry: ToolRegistry（执行工具用；tools 与 registry 二者至少给一个）
+        max_tool_calls: 实际执行的工具调用总量上限。与 max_turns 不同，
+            同一轮并发请求的多个工具会分别计数；None 表示不单独限制。
         history: 已有历史（多轮对话时传入，会原地延续）
         on_text_delta: 流式文本回调（可选）
         enable_skill_listing: 注入 skill 清单（渐进式披露，需 registry 中有 `skill` 工具）
@@ -151,10 +174,14 @@ async def run_conversation(
             await event_sink.emit(event_type, agent_key=agent_key, phase=phase, **payload)
 
     def record_usage(c: BaseLLMClient, resp: ChatResponse) -> None:
-        """token 用量落库（fire-and-forget，recorder 自吞错）"""
-        from app.services.token_usage_recorder import token_usage_recorder
+        """token 用量落库（fire-and-forget，recorder 自吞错）。
 
-        token_usage_recorder.record(
+        记录函数由应用层启动时注入（set_usage_recorder）；未注入时跳过——
+        llm 层不 import services（依赖方向：应用层 → llm）。
+        """
+        if _usage_recorder is None:
+            return
+        _usage_recorder(
             provider=getattr(c, "protocol", "unknown"),
             model_name=getattr(resp, "model", "") or getattr(c, "model", ""),
             usage=resp.usage,
@@ -197,7 +224,7 @@ async def run_conversation(
             break
 
         # 发送前分层压缩检查（预测式 / 常规阈值 / 阻塞兜底）
-        need_compact = (
+        need_compact = allow_compaction and (
             compactor.should_compact(messages)
             or compactor.should_compact_predictive(messages)
             or compactor.is_blocking(messages)
@@ -246,11 +273,21 @@ async def run_conversation(
                 elif event.type == "message" and event.response:
                     resp_local = event.response
             if resp_local is None:
-                raise RuntimeError("未收到完整响应（流中断）")
+                raise LLMError("未收到完整响应（流中断）")
             return resp_local
 
+        async def _on_retry(attempt: int, exc: Exception, delay_ms: int) -> None:
+            from .failures import describe_failure
+
+            failure = describe_failure(exc)
+            await emit("llm_retry", attempt=attempt, delay_ms=delay_ms, **failure)
+            await emit("status", text=f"{failure['message']}；正在进行第 {attempt} 次有界重试")
+
         try:
-            resp = await with_retry(_call, max_retries=retry_times if retry_times is not None else DEFAULT_MAX_RETRIES)
+            resp = await with_retry(
+                _call, max_retries=retry_times if retry_times is not None else DEFAULT_MAX_RETRIES,
+                on_retry=_on_retry,
+            )
         except FallbackTriggeredError:
             # 限流连续触发（对齐 claude-code query.ts）：本轮响应尚未入历史，
             # 切换备模型直接重放整个请求；无备模型或已切换过则上抛
@@ -264,6 +301,8 @@ async def run_conversation(
                 continue
             raise
         except ContextWindowExceededError:
+            if not allow_compaction:
+                raise
             if not reacted_too_long:
                 # reactive compact：API 真实超窗 → 单次兜底压缩后重试本轮
                 reacted_too_long = True
@@ -272,7 +311,7 @@ async def run_conversation(
                 await emit("compact", level="reactive", messages=len(messages))
                 continue
             result.stop_reason = "context_window_exceeded"
-            logger.error("❌ [runner] reactive compact 后仍超窗，停止")
+            logger.error("❌ [runner] reactive compact 后仍超窗，停止", exc_info=True)
             break
 
         messages.append(resp.message)
@@ -327,7 +366,7 @@ async def run_conversation(
                 )
                 messages.append(Message(role=Role.USER, content=RECOVERY_INSTRUCTION))
                 continue
-            logger.error("❌ [runner] 截断恢复耗尽，保留截断结果继续")
+            logger.warning("❌ [runner] 截断恢复耗尽，保留截断结果继续")
             # 拼接各截断轮已生成文本（此前只取最后一轮，前几轮内容被整体丢弃）
             result.final_text = "".join(truncated_text_parts).strip() or resp.text()
             result.stop_reason = resp.stop_reason.value
@@ -368,20 +407,66 @@ async def run_conversation(
             result.stop_reason = resp.stop_reason.value
             break
 
-        # ── 同轮多工具：并发分区执行 ─────────────────────────────────
-        outputs = await _execute_partitioned(
-            reg, tool_uses, safe_map, extra_defs=extra_defs, emit=emit, task_id=task_id
+        # ── 同轮多工具：总量预算 + 并发分区执行 ───────────────────────
+        # max_turns 只能限制 LLM 轮数，无法阻止模型在单轮并发请求几十个工具。
+        # 因此在执行前按真实工具调用数裁剪，并为未执行的 tool_use 补齐
+        # ToolResultBlock，保持协议配对合法。调用方可据 stop_reason 再做
+        # 一次 tools=[] 的强制收尾。
+        executable_uses = tool_uses
+        skipped_uses: List[ToolUseBlock] = []
+        if max_tool_calls is not None:
+            remaining = max(0, max_tool_calls - result.tool_calls_executed)
+            executable_uses = tool_uses[:remaining]
+            skipped_uses = tool_uses[remaining:]
+
+        executed_outputs = await _execute_partitioned(
+            reg,
+            executable_uses,
+            safe_map,
+            extra_defs=extra_defs,
+            emit=emit,
+            task_id=task_id,
         )
-        result.tool_calls_executed += len(tool_uses)
+        output_by_id = {
+            tool_use.id: output
+            for tool_use, output in zip(executable_uses, executed_outputs)
+        }
+        for tool_use in skipped_uses:
+            output_by_id[tool_use.id] = TOOL_CALL_LIMIT_RESULT
+            await emit(
+                "tool_call_skipped",
+                tool=tool_use.name,
+                tool_use_id=tool_use.id,
+                input=tool_use.input,
+                reason="max_tool_calls",
+            )
+
+        result.tool_calls_executed += len(executable_uses)
         result_blocks = [
             ToolResultBlock(
                 tool_use_id=tu.id,
-                content=out,
-                is_error=out.startswith("错误") or out.startswith("工具执行失败"),
+                content=output_by_id[tu.id],
+                is_error=(tu in skipped_uses) or tool_result_is_error(output_by_id[tu.id]),
             )
-            for tu, out in zip(tool_uses, outputs)
+            for tu in tool_uses
         ]
         messages.append(Message(role=Role.USER, content=result_blocks))
+
+        # A validated report submission is terminal for its owning node. Do not
+        # spend another request on a courtesy closing message (which can fail
+        # after a complete report has already been accepted).
+        if stop_when is not None and stop_when():
+            result.stop_reason = "submitted"
+            break
+
+        if max_tool_calls is not None and result.tool_calls_executed >= max_tool_calls:
+            logger.warning(
+                "⚠️ [runner] 达到工具调用总量上限 %s（本轮跳过 %s 个），强制停止工具阶段",
+                max_tool_calls,
+                len(skipped_uses),
+            )
+            result.stop_reason = "max_tool_calls"
+            break
 
         # ── 用户消息注入（对齐 queued_command attachment：工具结果后、下次调用前）──
         if inbox is not None:
@@ -393,6 +478,66 @@ async def run_conversation(
                     "user_message_injected",
                     text=unwrap_system_reminder(msg.content),
                 )
+
+    # ── max_turns 兜底收敛（对齐上游 max_tool_rounds：超限后强制收敛写报告）──
+    # 工具循环耗尽时 final_text 为空（自然停止分支未走到），整轮花费换一份空报告；
+    # 补一次无工具调用让模型用手头材料直接产出正文。收敛调用不传 tools，
+    # 杜绝二次工具循环；失败保持空正文，由调用方降级。
+    if result.stop_reason == "max_turns" and not result.final_text:
+        try:
+            messages.append(
+                Message(
+                    role=Role.USER,
+                    content=(
+                        "工具调用轮数已达上限，不能再调用任何工具。"
+                        "请立即基于以上已获取的全部信息，输出最终的报告或回答正文。"
+                    ),
+                )
+            )
+            await emit("llm_request", tools=0, estimated_tokens=counter.count(messages), messages=len(messages))
+
+            async def _salvage_call() -> ChatResponse:
+                resp_local: Optional[ChatResponse] = None
+                async for event in active_client.chat_stream(
+                    messages,
+                    system=system,
+                    tools=None,
+                    max_tokens=escalated_max_tokens or max_tokens,
+                    temperature=temperature,
+                    thinking_budget=thinking_budget,
+                    thinking_effort=thinking_effort,
+                ):
+                    if event.type == "text_delta":
+                        if on_text_delta:
+                            on_text_delta(event.text)
+                        await emit("text_delta", text=event.text)
+                    elif event.type == "message" and event.response:
+                        resp_local = event.response
+                if resp_local is None:
+                    raise RuntimeError("未收到完整响应（流中断）")
+                return resp_local
+
+            resp = await with_retry(
+                _salvage_call, max_retries=retry_times if retry_times is not None else DEFAULT_MAX_RETRIES
+            )
+            result.total_tokens += resp.usage.total
+            record_usage(active_client, resp)
+            result.final_text = resp.text()
+            result.salvaged_after_max_turns = True
+            logger.info(
+                f"[runner] max_turns 收敛调用抢救出正文 {len(result.final_text)} 字符 "
+                f"(agent={agent_key})"
+            )
+            await emit(
+                "llm_response",
+                stop_reason=resp.stop_reason.value,
+                input_tokens=resp.usage.input_tokens,
+                output_tokens=resp.usage.output_tokens,
+                model=getattr(resp, "model", ""),
+                text=result.final_text,
+            )
+        except Exception:  # noqa: BLE001 - 收敛失败保持空正文，不外抛
+            logger.warning(f"⚠️ [runner] max_turns 收敛调用失败，保持空正文 (agent={agent_key})", exc_info=True)
 
     result.turns = min(turns, max_turns)
     return result
@@ -430,7 +575,7 @@ async def _execute_partitioned(
                 tool_use_id=tu.id,
                 output=out[:TOOL_RESULT_MAX_CHARS],
                 duration_ms=int((time.time() - start) * 1000),
-                is_error=out.startswith("错误") or out.startswith("工具执行失败"),
+                is_error=tool_result_is_error(out),
             )
         return out
 

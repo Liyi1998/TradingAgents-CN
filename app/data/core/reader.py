@@ -34,6 +34,53 @@ def _strip_nan(value: Any) -> Any:
     return value
 
 
+def _financial_window_limit(filters: Dict, start_date: Optional[str], end_date: Optional[str]) -> int:
+    """Keep legacy 20-row reads; full history requires an explicit bounded window.
+
+    Multiple sources/statements can share one quarter. A document-count limit
+    must not silently turn a requested multi-year history into recent quarters.
+    The repository still checks disclosure evidence before returning each row.
+    """
+    if filters.get("full_financial_window") is not True:
+        return 20
+    if not start_date or not end_date:
+        raise ValueError("完整财务窗口必须同时提供起止日期")
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(end_date, "%Y-%m-%d").date()
+        try:
+            latest_end = start.replace(year=start.year + 6)
+        except ValueError:
+            # A six-year boundary can move a leap day into a non-leap year.
+            latest_end = start.replace(year=start.year + 6, day=28)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("完整财务窗口日期无效") from exc
+    if start > end or end > latest_end:
+        raise ValueError("完整财务窗口须为不超过六年的有序日期范围")
+    return 0
+
+
+def _apply_projection(domain: str, data: Any) -> None:
+    """读取出口的字段方言投影（就地修改）——消费方不再做双字段兼容。
+
+    - news：保证 content 非空（缺失时回填 summary）
+    - basic_info：保证 name 键存在（name → name_zh → name_en 兜底链）
+    """
+    if domain == "news" and isinstance(data, list):
+        for doc in data:
+            if isinstance(doc, dict) and not doc.get("content"):
+                summary = doc.get("summary")
+                if summary:
+                    doc["content"] = summary
+    elif domain == "basic_info":
+        docs = data if isinstance(data, list) else [data]
+        for doc in docs:
+            if isinstance(doc, dict) and not doc.get("name"):
+                fallback = doc.get("name_zh") or doc.get("name_en")
+                if fallback:
+                    doc["name"] = fallback
+
+
 class Reader:
     """统一读取层。消费方通过 Reader 获取标准数据，不直接访问 MongoDB。"""
 
@@ -64,13 +111,14 @@ class Reader:
                 DragonTigerRepo, BlockTradeRepo,
                 ConnectStatusRepo, SouthboundHoldingRepo, PrePostMarketRepo,
                 FactorScoresRepo, ScreeningRecommendationsRepo,
-                ScreeningInsightsRepo,
+                ScreeningInsightsRepo, IndexQuotesRepo,
             )
 
             repo_map = {
                 "basic_info": BasicInfoRepo,
                 "trade_calendar": TradeCalendarRepo,
                 "daily_quotes": DailyQuotesRepo,
+                "index_quotes": IndexQuotesRepo,
                 "daily_indicators": DailyIndicatorsRepo,
                 "adj_factors": AdjFactorsRepo,
                 "corporate_actions": CorporateActionsRepo,
@@ -96,6 +144,10 @@ class Reader:
                 self._repo_cache[domain] = repo
                 return repo
             return None
+
+    def supports_domain(self, domain: str) -> bool:
+        """domain 是否有对应仓储（DataInterface 读取域校验用）。"""
+        return self._get_repo(domain) is not None
 
     async def get_data(
         self, market: str, domain: str, symbol: Optional[str] = None,
@@ -132,7 +184,7 @@ class Reader:
             data = await repo.get_range(exchange, market,
                                         start_date or "1970-01-01", end_date or "2099-12-31")
 
-        elif domain in ("daily_quotes", "daily_indicators", "adj_factors",
+        elif domain in ("daily_quotes", "index_quotes", "daily_indicators", "adj_factors",
                         "corporate_actions", "factor_scores"):
             if symbol:
                 period_filter = filters.get("period") if filters else None
@@ -148,7 +200,12 @@ class Reader:
         elif domain == "financial_data":
             if symbol:
                 statement_type = filters.get("statement_type")
-                data = await repo.get_by_symbol(symbol, market, statement_type=statement_type)
+                data = await repo.get_by_symbol(
+                    symbol, market, statement_type=statement_type,
+                    start_date=start_date, end_date=end_date,
+                    limit=(_financial_window_limit(filters, start_date, end_date)
+                           if filters.get("full_financial_window") else filters.get("limit", 20)),
+                )
 
         elif domain == "market_quotes":
             if symbol:
@@ -158,20 +215,28 @@ class Reader:
                 data = await repo.get_all(market, limit=limit)
 
         elif domain == "news":
+            limit = filters.get("limit", 20 if symbol and not (start_date or end_date) else 100)
             if symbol:
-                limit = filters.get("limit", 20)
-                data = await repo.get_by_symbol(symbol, market, limit=limit)
+                data = await repo.get_by_symbol(symbol, market, limit=limit, start_date=start_date, end_date=end_date, category=filters.get("category"))
             else:
-                limit = filters.get("limit", 100)
-                data = await repo.get_all(market, limit=limit)
+                data = await repo.get_all(market, limit=limit, start_date=start_date, end_date=end_date, category=filters.get("category"))
 
         elif domain == "intraday_quotes":
             if symbol:
                 freq = filters.get("freq")
+                range_start = start_date or "1970-01-01 00:00:00"
+                range_end = end_date or "2099-12-31 23:59:59"
+                # 上层分析通常传 YYYY-MM-DD，而分时集合保存的是
+                # YYYY-MM-DD HH:MM:SS。直接做字符串范围查询会把结束日
+                # 当天全部排除，因此将纯日期扩展到当天起止时间。
+                if len(str(range_start)) == 10:
+                    range_start = f"{range_start} 00:00:00"
+                if len(str(range_end)) == 10:
+                    range_end = f"{range_end} 23:59:59"
                 data = await repo.get_by_symbol_and_range(
                     symbol, market,
-                    start_date or "1970-01-01 00:00:00",
-                    end_date or "2099-12-31 23:59:59",
+                    range_start,
+                    range_end,
                     freq=freq,
                 )
 
@@ -192,7 +257,7 @@ class Reader:
         elif domain == "dragon_tiger":
             if symbol:
                 limit = filters.get("limit", 50)
-                data = await repo.get_by_symbol(symbol, market, limit=limit)
+                data = await repo.get_by_symbol(symbol, market, limit=limit, start_date=start_date, end_date=end_date)
             elif start_date:
                 limit = filters.get("limit", 100)
                 data = await repo.get_by_date(start_date, market, limit=limit)
@@ -200,7 +265,7 @@ class Reader:
         elif domain == "block_trade":
             if symbol:
                 limit = filters.get("limit", 50)
-                data = await repo.get_by_symbol(symbol, market, limit=limit)
+                data = await repo.get_by_symbol(symbol, market, limit=limit, start_date=start_date, end_date=end_date)
             else:
                 limit = filters.get("limit", 100)
                 data = await repo.get_by_date_range(
@@ -239,12 +304,15 @@ class Reader:
         if not data:
             return None, FreshnessState.UNKNOWN
 
+        # 出口投影：消除数据源字段方言（消费方不再做字段兼容）
+        _apply_projection(domain, data)
+
         # 新鲜度判定
         freshness = await self.check_freshness(market, symbol or "", domain, data)
 
         # 异步通知刷新（stale 时且有 symbol）
         if freshness == FreshnessState.STALE and symbol:
-            await self.notify_refresh_async(market, symbol, domain)
+            await self.notify_refresh_async(market, symbol, domain, start_date, end_date)
 
         return _strip_nan(data), freshness
 
@@ -255,6 +323,7 @@ class Reader:
     _LATEST_SORT_FIELDS: Dict[str, str] = {
         "trade_calendar": "cal_date",
         "daily_quotes": "trade_date",
+        "index_quotes": "trade_date",
         "daily_indicators": "trade_date",
         "adj_factors": "trade_date",
         "corporate_actions": "trade_date",
@@ -499,19 +568,15 @@ class Reader:
                 # 无业务日期字段时回退到「收盘后阈值 + 自然日预算」宽松判定，
                 # 避免周末/节假日误报 stale。
                 threshold_minutes = domain_rule.get("threshold_minutes", 60)
-                record_date = None
-                if isinstance(data, dict):
-                    record_date = data.get("trade_date") or data.get("cal_date")
-                elif isinstance(data, list) and data:
-                    for d in reversed(data):
-                        if isinstance(d, dict) and d.get("trade_date"):
-                            record_date = d.get("trade_date")
-                            break
+                # MoneyFlowRepo and several event repositories return newest
+                # first. Reversing them selected the OLDEST business date and
+                # repeatedly refreshed newly completed windows as "stale".
+                record_date = self.latest_business_date(data)
                 if record_date:
                     try:
-                        from app.data.core.market import get_latest_trade_day
+                        from app.data.core.freshness import get_expected_trading_date
 
-                        latest_td = await get_latest_trade_day(market)
+                        latest_td = await get_expected_trading_date(market, domain)
                         if latest_td is not None:
                             # 记录业务日期 >= 最近交易日 → fresh（含今天已入库）
                             rec_d = str(record_date)[:10].replace("/", "-")
@@ -523,11 +588,17 @@ class Reader:
                     except Exception:
                         pass  # 日历不可用时走下方时间兜底
                 # 时间兜底：age 在阈值内 → fresh；超过阈值但未跨自然日预算
-                # （收盘后数据跨周末属正常，72h 预算对齐 data_health 语义）
+                # （收盘后数据跨周末属正常；预算取 data_health.yaml 单一真相源
+                #   ——HK/US 96h/默认 72h，此前硬编码 72 与域健康判定口径相左）
                 age_minutes = (now - updated).total_seconds() / 60
                 if age_minutes < threshold_minutes:
                     return FreshnessState.FRESH
-                max_hours = domain_rule.get("max_stale_hours", 72)
+                from app.data.config import load_yaml
+                from app.data.core.health import trading_day_budget_hours
+
+                max_hours = trading_day_budget_hours(
+                    load_yaml("data_health.yaml"), market
+                )
                 return (
                     FreshnessState.FRESH
                     if age_minutes < max_hours * 60
@@ -539,12 +610,27 @@ class Reader:
 
         return FreshnessState.UNKNOWN
 
-    async def notify_refresh_async(self, market: str, symbol: str, domain: str) -> None:
+    @staticmethod
+    def latest_business_date(data: Any) -> Optional[str]:
+        rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        dates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("trade_date") or row.get("cal_date") or "")[:10].replace("/", "-")
+            try:
+                dates.append(datetime.strptime(text, "%Y-%m-%d").date().isoformat())
+            except ValueError:
+                continue
+        return max(dates, default=None)
+
+    async def notify_refresh_async(self, market: str, symbol: str, domain: str,
+                                   start_date: str = None, end_date: str = None) -> None:
         """异步通知刷新服务（非阻塞）。"""
         try:
             if self._refresh_queue is None:
                 from app.data.storage.redis.pubsub import RefreshQueue
                 self._refresh_queue = RefreshQueue()
-            await self._refresh_queue.publish_refresh(market, symbol, domain)
+            await self._refresh_queue.publish_refresh(market, symbol, domain, start_date, end_date)
         except Exception as e:
             logger.debug(f"异步刷新通知失败: {e}")

@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 
 
 class NotificationsService:
-    def __init__(self):
+    def __init__(self, db=None):
+        self.db = db
         self.collection = "notifications"
         self.channel_prefix = "notifications:"
         self.retain_days = 90
@@ -25,15 +26,15 @@ class NotificationsService:
 
     async def _ensure_indexes(self):
         try:
-            db = get_mongo_db()
+            db = self.db if self.db is not None else get_mongo_db()
             await db[self.collection].create_index([("user_id", 1), ("created_at", -1)])
             await db[self.collection].create_index([("user_id", 1), ("status", 1)])
         except Exception as e:
             logger.warning(f"创建索引失败(忽略): {e}")
 
-    async def create_and_publish(self, payload: NotificationCreate) -> str:
+    async def create_and_publish(self, payload: NotificationCreate, *, dedupe_key: str | None = None) -> str:
         await self._ensure_indexes()
-        db = get_mongo_db()
+        db = self.db if self.db is not None else get_mongo_db()
         doc = {
             "user_id": payload.user_id,
             "type": payload.type,
@@ -46,8 +47,16 @@ class NotificationsService:
             "created_at": now_tz(),
             "metadata": payload.metadata or {},
         }
-        res = await db[self.collection].insert_one(doc)
-        doc_id = str(res.inserted_id)
+        if dedupe_key:
+            import hashlib
+            identity = ObjectId(hashlib.sha256((payload.user_id+":"+dedupe_key).encode()).hexdigest()[:24])
+            res = await db[self.collection].update_one({"_id": identity}, {"$setOnInsert": doc}, upsert=True)
+            doc_id = str(identity)
+            if res.upserted_id is None:
+                return doc_id
+        else:
+            res = await db[self.collection].insert_one(doc)
+            doc_id = str(res.inserted_id)
 
         payload_to_publish = {
             "id": doc_id,
@@ -89,11 +98,11 @@ class NotificationsService:
         return doc_id
 
     async def unread_count(self, user_id: str) -> int:
-        db = get_mongo_db()
+        db = self.db if self.db is not None else get_mongo_db()
         return await db[self.collection].count_documents({"user_id": user_id, "status": "unread"})
 
     async def list(self, user_id: str, *, status: Optional[str] = None, ntype: Optional[str] = None, page: int = 1, page_size: int = 20) -> NotificationList:
-        db = get_mongo_db()
+        db = self.db if self.db is not None else get_mongo_db()
         q: Dict[str, Any] = {"user_id": user_id}
         if status in ("read", "unread"):
             q["status"] = status
@@ -116,7 +125,7 @@ class NotificationsService:
         return NotificationList(items=items, total=total, page=page, page_size=page_size)
 
     async def mark_read(self, user_id: str, notif_id: str) -> bool:
-        db = get_mongo_db()
+        db = self.db if self.db is not None else get_mongo_db()
         try:
             oid = ObjectId(notif_id)
         except Exception as e:
@@ -126,7 +135,7 @@ class NotificationsService:
         return res.modified_count > 0
 
     async def mark_all_read(self, user_id: str) -> int:
-        db = get_mongo_db()
+        db = self.db if self.db is not None else get_mongo_db()
         res = await db[self.collection].update_many({"user_id": user_id, "status": "unread"}, {"$set": {"status": "read"}})
         return res.modified_count
 

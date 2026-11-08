@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Annotated, Dict, List
+from typing import Annotated, Dict, List, Optional
 from urllib.parse import quote_plus
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -70,8 +70,13 @@ def _runtime_secret(name: str) -> str:
 class Settings(BaseSettings):
     # 基础配置
     DEBUG: bool = Field(default=False)
+    # None 保留原行为（生产环境随 DEBUG 自动启用 Secure）；本地 HTTP 部署可显式关闭。
+    CSRF_COOKIE_SECURE: Optional[bool] = Field(default=None)
     HOST: str = Field(default="0.0.0.0")
     PORT: int = Field(default=8000)
+
+    # 结算后自动反思并写入交易记忆（trader_memory）：每日 settled 记录 × 1 次廉价 LLM 调用
+    SETTLEMENT_REFLECTION_ENABLED: bool = Field(default=False)
     # NoDecode：关闭 pydantic-settings 源层对 List[str] 的强 JSON 解析
     # （否则裸 `*` 等写法在 EnvSettingsSource 阶段就抛 SettingsError），
     # 原始字符串交由下方 _parse_str_list 宽容解析
@@ -270,6 +275,12 @@ class Settings(BaseSettings):
     QUOTES_BACKFILL_ON_STARTUP: bool = Field(default=True)
     QUOTES_BACKFILL_ON_OFFHOURS: bool = Field(default=True)
 
+    # 免费数据底座冷启动：DuckDB 保持源数据真相，MongoDB 只缓存近期窗口。
+    FREE_DATA_AUTO_BACKFILL_ENABLED: bool = Field(default=True)
+    JINCE_INITIAL_LOOKBACK_DAYS: int = Field(default=400, ge=30, le=3650)
+    JINCE_DAILY_QUOTES_BATCH_SIZE: int = Field(default=20000, ge=100, le=50000)
+    JINCE_INCREMENTAL_OVERLAP_DAYS: int = Field(default=10, ge=0, le=60)
+
     # 实时行情接口轮换配置
     QUOTES_ROTATION_ENABLED: bool = Field(
         default=True,
@@ -368,7 +379,12 @@ class Settings(BaseSettings):
     # ==================== 数据新鲜度巡检（catchup 兜底）====================
     # cron misfire 过期即丢弃；巡检每 N 分钟评估各域检查点是否落后于
     # 「收盘后应有的最新交易日」，落后即自动补数（幂等增量）
-    DATA_FRESHNESS_PATROL_ENABLED: bool = Field(default=True, description="启用数据新鲜度巡检自动补数")
+    # 合入上游能力但先关闭新增自动写入；专项验收后单独启用。
+    DATA_FRESHNESS_PATROL_ENABLED: bool = Field(default=False, description="启用数据新鲜度巡检自动补数")
+    DATA_FRESHNESS_PATROL_MARKETS: str = Field(default="CN", description="巡检市场白名单，逗号分隔")
+    DATA_FRESHNESS_PATROL_MAX_JOBS: int = Field(default=4, ge=1, le=20, description="每轮最多定向补数域数")
+    DATA_SYNC_MAX_SYMBOLS_PER_RUN: int = Field(default=200, ge=1, le=10000, description="无批量能力时单次同步股票上限；超过预算跳过，不推进检查点")
+    DATA_REFRESH_CONSUMER_ENABLED: bool = Field(default=False, description="启用按需刷新队列消费器")
     DATA_FRESHNESS_PATROL_MINUTES: int = Field(default=30, ge=5, le=1440, description="新鲜度巡检周期（分钟）")
 
     # ==================== 港股全量同步配置 ====================
@@ -406,6 +422,18 @@ class Settings(BaseSettings):
     # ==================== WebSocket 连接限制 ====================
     WEBSOCKET_MAX_CONNECTIONS_PER_TASK: int = Field(default=5, ge=1, le=50, description="单任务 WebSocket 最大连接数")
     WEBSOCKET_MAX_TOTAL_CONNECTIONS: int = Field(default=1000, ge=1, le=10000, description="全局 WebSocket 最大连接数")
+
+    # ==================== 知识库（stock_news 向量检索） ====================
+    KB_RETRIEVAL_ENABLED: bool = False  # Explicit opt-in: query embeddings may consume model quota
+    KB_INDEX_ENABLED: bool = Field(default=False, description="知识库增量索引定时任务开关")
+    KB_INDEX_INTERVAL_MINUTES: int = Field(default=30, ge=5, le=1440, description="知识库增量索引间隔（分钟）")
+    KB_EMBEDDING_TOP_K: int = Field(default=6, ge=1, le=20, description="分析预注入检索条数 top-K")
+    KB_EMBEDDING_BATCH_SIZE: int = Field(default=32, ge=1, le=128, description="向量模型单批编码文档数")
+    KB_EMBEDDING_MAX_CHARS: int = Field(default=6000, ge=500, le=50000, description="单篇新闻参与向量化的最大字符数")
+    KB_CHROMA_DIR: str = Field(default="data/kb_chroma", description="知识库 ChromaDB 持久化目录（相对 runtime 根）")
+    KB_EMBEDDING_TIMEOUT_SECONDS: float = Field(default=8, ge=1, le=60)
+    KB_INDEX_MAX_BATCHES: int = Field(default=4, ge=1, le=100)
+    SETTLEMENT_MEMORY_DIR: str = Field(default="data/settlement_memory")
 
     # 数据目录配置
     TRADINGAGENTS_DATA_DIR: str = Field(default="data")

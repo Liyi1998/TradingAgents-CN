@@ -1,8 +1,9 @@
 """工具层数据访问公共函数。
 
-统一"读取 → 库空则触发按需刷新 → 再读"的回退模式，避免各工具在库空时
-只返回"请先同步数据"。降级逻辑（选源/重试/熔断）留在数据层内部，
-本模块只做编排：read 失败或空数据时调用 di.refresh 补数后重读一次。
+「读取 → 库空自动补数 → 再读」的编排已下沉到数据层
+（DataInterface.read(auto_refresh=True)，见 app/data/core/interface.py）；
+本模块保留为同步上下文的薄封装，engine 工具统一经此取数，
+符号归一化（000001.SZ/sz000001/1 → 000001）同样由数据层完成。
 """
 
 import logging
@@ -12,69 +13,66 @@ from app.core.async_utils import run_async
 
 logger = logging.getLogger(__name__)
 
-_REFRESH_TIMEOUT = 30  # 秒，与 news 工具既有回退保持一致
+
+def render_data_quality(result: dict | None) -> str:
+    """Machine-produced missingness remains visible inside the model's evidence."""
+    import json
+    quality = (result or {}).get("quality") or {"status": "failed", "reason": "no_read_result"}
+    keys = ("status", "reason", "data_cutoff", "missing_fields", "missing_dates",
+            "missing_fields_by_date", "requirement_contract", "contract_issues", "sources",
+            "refresh_status", "refresh_source", "fallback_from", "refresh_error")
+    keys += ("optional_field_status", "daily_cross_check", "peer_refresh_status")
+    payload = {key: quality[key] for key in keys if key in quality}
+    return ("数据获取与缺项说明：" + json.dumps(payload, ensure_ascii=False, default=str)
+            + "\n缺项如实披露，继续分析其余证据；依赖缺项的数值、评分或合计不可计算，禁止补零或无限重试。")
+
+
+def needs_bounded_refresh(result: dict, market: str, end_date: str | None = None) -> bool:
+    """Complete historical ranges do not need wall-clock refresh; current stale data do."""
+    if result.get("quality", {}).get("status") not in {"success", "no_events", "not_applicable"}:
+        return True
+    if result.get("quality", {}).get("status") in {"no_events", "not_applicable"}:
+        return False
+    from datetime import datetime
+    from app.data.core.market import get_market_timezone
+    today = datetime.now(get_market_timezone(market)).date().isoformat()
+    if end_date and str(end_date)[:10] < today:
+        return False
+    freshness = result.get("freshness")
+    return getattr(freshness, "value", freshness) != "fresh"
 
 
 def read_with_refresh(
     market: str,
     domain: str,
     symbol: Optional[str] = None,
-    timeout: int = _REFRESH_TIMEOUT,
+    timeout: int = 30,
     **read_kwargs: Any,
 ) -> Optional[Dict[str, Any]]:
-    """经 DataInterface 读取数据；库空时按需刷新该域后重读一次。
+    """经 DataInterface 读取数据；库空时数据层自动补数后重读一次。
 
     Args:
         market: 市场类型（CN/HK/US）
         domain: 数据域（daily_quotes / financial_data / ...）
-        symbol: 股票代码（标准化后的 6 位/5 位/ticker）；无 symbol 时无法按需刷新
-        timeout: 按需刷新超时秒数
+        symbol: 股票代码（容忍多种写法，数据层自动归一）；无 symbol 时不触发补数
+        timeout: 数据层按需刷新超时秒数
         **read_kwargs: 透传给 di.read 的参数（start_date/end_date/filters 等）
 
     Returns:
-        DataInterface.read 的完整结果 dict（含 data/freshness 等字段），
-        两次读取均无数据时返回 None。不抛异常，失败只记 warning。
+        DataInterface.read 的完整 envelope（含 data/freshness/auto_refreshed 等），
+        无数据或读取失败时返回 None。不抛异常，失败只记 warning。
     """
     from app.data.core.interface import DataInterface
 
+    for key in ("start_date", "end_date"):
+        value = str(read_kwargs.get(key) or "")
+        if len(value) == 8 and value.isdigit():
+            read_kwargs[key] = f"{value[:4]}-{value[4:6]}-{value[6:8]}"
     di = DataInterface.get_instance()
 
-    def _has_data(result: Optional[Dict[str, Any]]) -> bool:
-        if not result:
-            return False
-        data = result.get("data")
-        if data is None:
-            return False
-        if isinstance(data, (list, dict)):
-            return len(data) > 0
-        return bool(data)
-
     try:
-        result = run_async(di.read(market, domain, symbol=symbol, **read_kwargs))
-        if _has_data(result):
-            return result
-    except Exception as e:
-        logger.warning(f"[data_access] 读取 {market}/{domain}/{symbol} 失败: {e}")
-
-    # 库空/读取失败 → 按需刷新后重读（无 symbol 无法按需刷新，直接放弃）
-    if not symbol:
-        return None
-    try:
-        refresh_result = run_async(
-            di.refresh(market, symbol, domains=[domain], force=True, timeout=timeout)
-        )
-        if not (refresh_result and refresh_result.domains.get(domain)):
-            logger.info(f"[data_access] {market}/{domain}/{symbol} 按需刷新无结果（可能不支持该域或源不可用）")
-            return None
-    except Exception as e:
-        logger.warning(f"[data_access] {market}/{domain}/{symbol} 按需刷新失败: {e}")
-        return None
-
-    try:
-        result = run_async(di.read(market, domain, symbol=symbol, **read_kwargs))
-        if _has_data(result):
-            return result
-    except Exception as e:
-        logger.warning(f"[data_access] 刷新后重读 {market}/{domain}/{symbol} 失败: {e}")
-
-    return None
+        return run_async(di.read_ready(market, domain, symbol=symbol, timeout=timeout, **read_kwargs))
+    except Exception as exc:
+        logger.warning("有界数据获取 %s/%s/%s 失败: %s", market, domain, symbol, exc, exc_info=True)
+        return {"data": [], "market": market, "domain": domain, "symbol": symbol,
+                "quality": {"status": "failed", "reason": type(exc).__name__}}

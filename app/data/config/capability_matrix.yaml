@@ -2,77 +2,69 @@
 
 CN:
   basic_info:
-    tushare: full
     akshare: full
     baostock: full
+    tencent: partial
   trade_calendar:
-    tushare: full
     akshare: full
     baostock: full
   daily_quotes:
-    tushare: full
+    duckdb: full
     akshare: full
     baostock: full
-  daily_indicators:
+  index_quotes:
+    baostock: partial  # 沪深300/创业板等已核验指数；北证50/科创50不可用时保留缺项
     tushare: full
+  daily_indicators:
+    tencent: partial
     akshare: partial
     baostock: none
   adj_factors:
-    tushare: full
     akshare: full
     baostock: full
+  corporate_actions:
+    akshare: full
   financial_data:
-    tushare: full
     akshare: partial
     baostock: none
   market_quotes:
-    tushare: full
+    tencent: full
     akshare: full
     baostock: none
   news:
-    tushare: full
     akshare: partial
     baostock: none
   intraday_quotes:
-    tushare: full
+    tencent: partial
     akshare: full
   money_flow:
-    tushare: full
     akshare: full
+    sina: partial
   margin_trading:
-    tushare: full
     akshare: full
   dragon_tiger:
-    tushare: full
     akshare: full
   block_trade:
-    tushare: full
     akshare: full
 
 HK:
   basic_info:
-    tushare_hk: full
     akshare_hk: full
     yfinance_hk: partial
     tencent_hk: partial
   trade_calendar:
-    tushare_hk: full
     akshare_hk: partial
     yfinance_hk: partial
   daily_quotes:
-    tushare_hk: full
     akshare_hk: full
     yfinance_hk: full
   daily_indicators:
-    tushare_hk: partial
     akshare_hk: full
     yfinance_hk: full
   adj_factors:
-    tushare_hk: full
     akshare_hk: full
     yfinance_hk: full
   financial_data:
-    tushare_hk: full
     akshare_hk: full
     yfinance_hk: full
   corporate_actions:
@@ -80,7 +72,6 @@ HK:
     yfinance_hk: partial
   market_quotes:
     tencent_hk: full
-    tushare_hk: full
     akshare_hk: full
     yfinance_hk: full
   news:
@@ -88,36 +79,28 @@ HK:
     yfinance_hk: partial
   connect_status:
     akshare_hk: full
-    tushare_hk: partial
   southbound_holding:
-    tushare_hk: full
     akshare_hk: full
 
 US:
   basic_info:
     finnhub: full
     yfinance: partial
-    tushare_us: partial
     alpha_vantage: partial
   trade_calendar:
     finnhub: full
-    tushare_us: full
     yfinance: partial
   daily_quotes:
     yfinance: full
-    tushare_us: full
     finnhub: full
     alpha_vantage: full
   daily_indicators:
     yfinance: full
     finnhub: full
-    tushare_us: partial
     alpha_vantage: partial
   adj_factors:
-    tushare_us: full
     yfinance: partial
   financial_data:
-    tushare_us: full
     yfinance: full
     finnhub: full
     alpha_vantage: full

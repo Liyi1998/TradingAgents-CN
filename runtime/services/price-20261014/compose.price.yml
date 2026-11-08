@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:price-232a9bbc
+  frontend:
+    image: tradingagents-cn-hub-frontend:price-232a9bbc

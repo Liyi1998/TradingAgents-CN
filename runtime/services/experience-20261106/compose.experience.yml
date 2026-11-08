@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:experience-2e8d253a
+  frontend:
+    image: tradingagents-cn-hub-frontend:experience-2e8d253a

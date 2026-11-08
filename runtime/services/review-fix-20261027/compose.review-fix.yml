@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:review-fix-a228fb71
+  frontend:
+    image: tradingagents-cn-hub-frontend:report-levels-f2adf393

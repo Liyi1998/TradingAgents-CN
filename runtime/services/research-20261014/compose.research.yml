@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-560e0410
+  frontend:
+    image: tradingagents-cn-hub-frontend:research-560e0410

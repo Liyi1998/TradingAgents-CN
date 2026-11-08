@@ -110,7 +110,7 @@ class SystemInitService:
             
             db = db_manager.mongo_db
             if db is None:
-                logger.error("❌ 数据库未连接，跳过初始化")
+                logger.warning("❌ 数据库未连接，跳过初始化")
                 return
 
             # 1. 检查是否需要导入配置
@@ -169,7 +169,7 @@ class SystemInitService:
                 data_wrapper = json.load(f)
             
             if "data" not in data_wrapper:
-                logger.error("❌ 配置文件格式错误: 缺少 'data' 字段")
+                logger.warning("❌ 配置文件格式错误: 缺少 'data' 字段")
                 return
                 
             data = data_wrapper["data"]
@@ -205,7 +205,7 @@ class SystemInitService:
             logger.info(f"✅ 数据导入完成，共插入 {total_inserted} 条文档")
             
         except Exception as e:
-            logger.error(f"❌ 导入初始数据失败: {e}")
+            logger.error(f"❌ 导入初始数据失败: {e}", exc_info=True)
 
     @classmethod
     async def _ensure_default_admin(cls, db: AsyncIOMotorDatabase):

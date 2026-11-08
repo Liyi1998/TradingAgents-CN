@@ -1,0 +1,4 @@
+services:
+  backend:
+    environment:
+      JINCE_API_BASE_URL: "http://host.docker.internal:18080"

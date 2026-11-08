@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-resume-f87649a8
+  frontend:
+    image: tradingagents-cn-hub-frontend:research-resume-f87649a8

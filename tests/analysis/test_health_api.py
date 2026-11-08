@@ -13,12 +13,23 @@ from fastapi import FastAPI
 
 @pytest_asyncio.fixture
 async def health_client():
+    from app.core import database
+    from app.core.service_lifecycle import ServiceLifecycle
+
+    await database.init_database()
     app = FastAPI()
+    app.state.service_lifecycle = ServiceLifecycle()
+    app.state.service_lifecycle.mark_ready()
     from app.routers.health import router
     app.include_router(router)
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
-        yield ac
+    try:
+        async with AsyncClient(transport=transport, base_url="http://testserver") as ac:
+            yield ac
+    finally:
+        app.state.service_lifecycle.mark_stopping()
+        await database.close_db()
+        app.state.service_lifecycle.mark_stopped()
 
 
 class TestHealthEndpoint:
@@ -147,3 +158,31 @@ class TestVersionCache:
             assert health.get_version() == first
         finally:
             health._version_cache = original
+
+
+@pytest.mark.asyncio
+async def test_initial_free_data_backfill_uses_blocking_scheduler_api(monkeypatch):
+    """冷启动补齐应使用 trigger_job 当前的阻塞签名。"""
+    from app.main import _run_initial_free_data_backfill
+    from app.data.core.interface import DataInterface
+
+    class FakeDataInterface:
+        async def get_domain_stats(self, market, domains):
+            return {domain: {"records": 1} for domain in domains}
+
+    class FakeEngine:
+        def __init__(self):
+            self.calls = []
+
+        async def trigger_job(self, market, domain, mode=None, source=None):
+            self.calls.append((market, domain, mode, source))
+            return f"{market.lower()}_{domain}"
+
+    fake_di = FakeDataInterface()
+    engine = FakeEngine()
+    monkeypatch.setattr(DataInterface, "get_instance", staticmethod(lambda: fake_di))
+    await _run_initial_free_data_backfill(
+        engine, __import__("logging").getLogger(__name__)
+    )
+
+    assert engine.calls == [("CN", "daily_quotes", "incremental", "duckdb")]

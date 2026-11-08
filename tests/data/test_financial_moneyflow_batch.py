@@ -119,7 +119,7 @@ class TestTushareBatchContract:
             "roe": 18.0, "roa": 1.5, "grossprofit_margin": 35.0,
             "netprofit_margin": 20.0, "debt_to_assets": 60.0,
             "current_ratio": 1.8, "eps": 1.2, "bps": 10.0,
-            "total_revenue": 100.0, "n_income": 20.0,
+            "total_revenue": 100.0, "n_income": 23.0, "n_income_attr_p": 20.0,
         }])
         results = TushareCNAdapter().adapt_financial_data(df)
         assert len(results) == 1
@@ -128,8 +128,19 @@ class TestTushareBatchContract:
         assert r.report_period == "2026-06-30"
         assert r.revenue == 100.0
         assert r.net_profit == 20.0
+        assert r.net_profit_attributable == 20.0
+        assert r.net_profit_consolidated == 23.0
+        assert r.net_profit_basis == "attributable"
         assert r.roe == 18.0
         assert r.debt_ratio == 60.0
+
+    def test_consolidated_profit_is_not_attributable(self):
+        df = pd.DataFrame([{"ts_code": "000001.SZ", "end_date": "20260630",
+                            "statement_type": "indicator", "n_income": 20.0}])
+        record = TushareCNAdapter().adapt_financial_data(df)[0]
+        assert record.net_profit is None
+        assert record.net_profit_attributable is None
+        assert record.net_profit_consolidated == 20.0
 
     def test_adapt_daily_indicators_dividend_yield(self):
         """dv_ttm → dividend_yield 股息率映射（高ROE低估值策略依赖）。"""
@@ -260,8 +271,12 @@ class TestSyncJobBatchExemption:
     def test_financial_and_money_flow_exempt_from_symbol_list(self):
         from app.data.scheduler.jobs.cn import CNFinancialDataJob, CNMoneyFlowJob
 
-        assert CNFinancialDataJob()._needs_symbol_list() is False
-        assert CNMoneyFlowJob()._needs_symbol_list() is False
+        for cls in (CNFinancialDataJob, CNMoneyFlowJob):
+            job = cls()
+            job.preferred_source = "tushare"
+            assert job._needs_symbol_list() is False
+            job.preferred_source = "akshare"
+            assert job._needs_symbol_list() is True
 
 
 # ============================================================
@@ -304,7 +319,9 @@ class TestQualityStatementTypeHardening:
                  "statement_type": stmt},
                 {"$set": {
                     "symbol": "TESTQ001", "report_period": "2026-06-30",
+                    "announce_date": "2026-08-28",
                     "statement_type": stmt, "net_profit": np_,
+                    "net_profit_basis": "attributable",
                     "roe": 18.0, "gross_margin": 35.0, "debt_ratio": 45.0,
                     "data_source": "test",
                 }}, upsert=True)
@@ -312,12 +329,14 @@ class TestQualityStatementTypeHardening:
             {"symbol": "TESTQ001", "report_period": "2025-06-30"},
             {"$set": {
                 "symbol": "TESTQ001", "report_period": "2025-06-30",
+                "announce_date": "2025-08-28",
                 "statement_type": "indicator", "net_profit": 20.0,
+                "net_profit_basis": "attributable",
                 "roe": 16.0, "gross_margin": 33.0, "debt_ratio": 50.0,
                 "data_source": "test",
             }}, upsert=True)
         try:
-            out = await FactorScoreEngine()._compute_quality("CN")
+            out = await FactorScoreEngine()._compute_quality("CN", "2026-09-30")
             # indicator 行 net_profit=30 → yoy = 30/20-1 = 50%
             assert out.loc["TESTQ001", "net_profit_yoy"] == pytest.approx(50.0)
             assert out.loc["TESTQ001", "roe"] == 18.0

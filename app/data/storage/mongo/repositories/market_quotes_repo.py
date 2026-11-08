@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Optional
 
-from pymongo import UpdateOne
+from pymongo import ReplaceOne
 
 from app.data.storage.mongo.client import get_motor_db
 from app.data.storage.mongo.collections import get_collection_name
@@ -22,14 +22,9 @@ class MarketQuotesRepo:
             if not sym:
                 continue
             filter_doc = {"symbol": sym}
-            update_doc = {"$set": rec}
-            new_updated = rec.get("last_updated")
-            if new_updated:
-                update_doc = {
-                    "$set": {k: v for k, v in rec.items() if k != "last_updated"},
-                    "$max": {"last_updated": new_updated},
-                }
-            ops.append(UpdateOne(filter_doc, update_doc, upsert=True))
+            # A snapshot is indivisible: never combine an older price with a
+            # newer $max timestamp, or retain another source's proof fields.
+            ops.append(ReplaceOne(filter_doc, rec, upsert=True))
         if not ops:
             return 0
         return await batched_bulk_write(coll, ops)

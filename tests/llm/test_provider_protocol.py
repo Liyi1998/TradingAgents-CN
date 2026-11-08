@@ -6,6 +6,8 @@
 - 模型配置不再携带 protocol（白名单已移除，残留字段被忽略）
 """
 
+import threading
+
 from app.llm.providers import (
     _CONFIG_FIELDS,
     _normalize_llm_configs,
@@ -92,3 +94,15 @@ class TestNormalize:
         ])
         assert defaults["myvendor"]["protocol"] == "anthropic"
         assert defaults["other"]["protocol"] is None
+
+
+def test_worker_thread_detection_uses_real_thread():
+    from app.llm.providers import _in_worker_thread
+
+    observed = []
+    worker = threading.Thread(target=lambda: observed.append(_in_worker_thread()))
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert observed == [True]

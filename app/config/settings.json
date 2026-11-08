@@ -6,9 +6,9 @@
   "currency_preference": "CNY",
   "auto_save_usage": true,
   "max_usage_records": 10000,
-  "data_dir": "C:\\Users\\li_ao\\Documents\\TradingAgents\\data",
-  "cache_dir": "C:\\Users\\li_ao\\Documents\\TradingAgents\\data\\cache",
-  "results_dir": "C:\\Users\\li_ao\\Documents\\TradingAgents\\results",
+  "data_dir": "runtime/data",
+  "cache_dir": "runtime/cache",
+  "results_dir": "runtime/results",
   "auto_create_dirs": true,
   "openai_enabled": false
 }

@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-tracking-3af8505a
+  frontend:
+    image: tradingagents-cn-hub-frontend:research-tracking-3af8505a

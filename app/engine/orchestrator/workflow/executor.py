@@ -51,7 +51,9 @@ def _materialize_node(slug: str, node: PlannedNode, deps: PipelineDeps):
     def _trader():
         from app.engine.agents.stage_2.trader import create_trader
 
-        return create_trader(deps.debate_client, _slot_memory(deps, node.memory))
+        return create_trader(
+            deps.debate_client, _slot_memory(deps, node.memory), horizon=(deps.config or {}).get("horizon")
+        )
 
     def _summary():
         from app.engine.agents.stage_4.summary_agent import create_summary_agent
@@ -97,7 +99,12 @@ def _slot_memory(deps: PipelineDeps, slot: Optional[str]):
 
 
 def _materialize_side(node: PlannedNode, deps: PipelineDeps, group, side_key: str):
-    """辩论侧辩手物化：内置 5 辩手走各自工厂（带组拓扑），自定义 slug 走通用工厂"""
+    """辩论侧辩手物化：内置 5 辩手走各自工厂（带组拓扑），自定义 slug 走通用工厂
+
+    期限贯通：researcher 与通用辩手带 horizon（风险组不注入——其评估对象
+    已是带期限的交易计划）
+    """
+    _horizon = (deps.config or {}).get("horizon")
     if node.slug in _BUILTIN_RESEARCHER_SIDES:
         from app.engine.agents.stage_2.researcher_factory import create_researcher
 
@@ -106,6 +113,7 @@ def _materialize_side(node: PlannedNode, deps: PipelineDeps, group, side_key: st
             _slot_memory(deps, node.memory),
             side=_BUILTIN_RESEARCHER_SIDES[node.slug],
             group=group,
+            horizon=_horizon,
         )
     if node.slug in _BUILTIN_RISK_SIDES:
         from app.engine.agents.stage_3.debator_factory import create_debator
@@ -126,7 +134,7 @@ def _materialize_side(node: PlannedNode, deps: PipelineDeps, group, side_key: st
         memory=node.memory or "",
         terminal=node.terminal,
     )
-    return create_generic_debater(deps.debate_client, binding, group)
+    return create_generic_debater(deps.debate_client, binding, group, horizon=_horizon)
 
 
 def _materialize_judge(node: PlannedNode, deps: PipelineDeps, group):
@@ -140,7 +148,9 @@ def _materialize_judge(node: PlannedNode, deps: PipelineDeps, group):
     if node.slug == "research-manager":
         from app.engine.agents.stage_2.research_manager import create_research_manager
 
-        return create_research_manager(deps.debate_client, deps.invest_judge_memory)
+        return create_research_manager(
+            deps.debate_client, deps.invest_judge_memory, horizon=(deps.config or {}).get("horizon")
+        )
     if node.slug == "risk-manager":
         from app.engine.agents.stage_3.risk_manager import create_risk_manager
 
@@ -155,7 +165,13 @@ def _materialize_judge(node: PlannedNode, deps: PipelineDeps, group):
         memory=node.memory or "",
         terminal=node.terminal,
     )
-    return create_generic_judge(deps.debate_client, binding, group, memory=_slot_memory(deps, node.memory))
+    return create_generic_judge(
+        deps.debate_client,
+        binding,
+        group,
+        memory=_slot_memory(deps, node.memory),
+        horizon=(deps.config or {}).get("horizon"),
+    )
 
 
 async def run_compiled(
@@ -174,6 +190,13 @@ async def run_compiled(
     不属于拓扑，保持经 deps.config 透传（现状行为）。
     """
     config = deps.config or {}
+    from ..pipeline import (
+        _is_invalid_report_content,
+        _require_valid_debate_rounds,
+        _require_valid_reports,
+        _require_valid_summary,
+        _require_valid_text,
+    )
     debate_parallel = bool(config.get("debate_parallel", True))
 
     completed_box = [0]
@@ -185,6 +208,9 @@ async def run_compiled(
     def _progress_text(node_name: str) -> str:
         """节点名 → 中文进度文案（registry；无映射回退节点名）"""
         try:
+            from .research import research_display_name
+            if period_name := research_display_name(node_name):
+                return f"🔍 {period_name}"
             return registry.progress_text(node_name) or f"🔍 {node_name}"
         except Exception as e:  # noqa: BLE001
             logger.warning(f"⚠️ [orchestrator] 进度文案解析失败: {e}")
@@ -224,6 +250,8 @@ async def run_compiled(
         from app.llm.limiter import alimit
 
         key = event_key or registry.event_key_for_node(node_name)
+        from .research import research_display_name
+        display_name = research_display_name(node_name) or display_name
         start = time.time()
         if event_sink is not None:
             event_sink.mark_running(key)
@@ -363,6 +391,7 @@ async def run_compiled(
             max_tool_calls=int(config.get("max_tool_calls", 12)),
             mcp_tools=mcp_tools,
             enable_subagent=bool(config.get("enable_subagent", False)),
+            horizon=config.get("horizon"),
         )
         concurrency = max(1, int(stage.concurrency or 1))
         # 模型级并发限额（LLMConfig.max_concurrency）封顶编排并行度：灵活占位语义
@@ -372,10 +401,13 @@ async def run_compiled(
         # 进度分母在此确定（分析师实际装配数 + 各阶段展开节点数）
         total_units_box[0] = plan.total_units(len(specs))
 
-        async def _run_analyst(internal_key: str, spec) -> Dict[str, Any]:
+        emitted_analyst_reports: Dict[str, str] = {}
+
+        async def _run_analyst(internal_key: str, spec, *, recovery: bool = False) -> Dict[str, Any]:
             """单个分析师并行单元：事件/计时/进度 + run_analyst（失败降级）"""
             node_name = registry.format_analyst_node(internal_key)
             start = time.time()
+            update = {}
             if event_sink is not None:
                 event_sink.mark_running(internal_key)
                 await event_sink.emit(
@@ -388,14 +420,16 @@ async def run_compiled(
                 from app.llm.limiter import alimit
 
                 async with semaphore, alimit(deps.analyst_limit_key, deps.analyst_limit):
-                    return await run_analyst(spec, deps.analyst_client, state, event_sink=event_sink)
+                    node_state = {**state, "_analyst_retry_times": 0} if recovery else state
+                    update = await run_analyst(spec, deps.analyst_client, node_state, event_sink=event_sink)
+                    return update
             except Exception as e:  # noqa: BLE001 - run_analyst 内部已有降级，此处兜底
                 logger.error(f"❌ [orchestrator] 分析师 {spec.name} 异常: {e}", exc_info=True)
                 _record_error(state, node_name, str(e), start, retried=False)
                 return {}
             finally:
                 elapsed = time.time() - start
-                node_timings[node_name] = elapsed
+                node_timings[node_name] = node_timings.get(node_name, 0) + elapsed
                 logger.info(f"⏱️ [{node_name}] 耗时: {elapsed:.2f}秒")
                 if event_sink is not None:
                     event_sink.mark_completed(internal_key)
@@ -404,12 +438,46 @@ async def run_compiled(
                         agent_key=internal_key,
                         duration_ms=int(elapsed * 1000),
                     )
-                    await _emit_unit_done(node_name, stage.event_phase, internal_key)
+                    await _emit_report_ready(
+                        event_sink, update, agent_key=internal_key, phase=stage.event_phase,
+                        before_reports={**emitted_analyst_reports, **(state.get("reports") or {})},
+                        display_name=spec.name,
+                    )
+                    emitted_analyst_reports.update(update.get("reports") or {})
+                    if not recovery:
+                        await _emit_unit_done(node_name, stage.event_phase, internal_key)
 
-        analyst_results = await asyncio.gather(*[_run_analyst(k, s) for k, s in specs.items()])
+        resume_reports = config.get("resume_analyst_reports") or {}
+        pending_specs = {}
+        reused_keys = []
+        for internal_key, spec in specs.items():
+            report_key = f"{internal_key}_report"
+            content = resume_reports.get(report_key)
+            if _is_invalid_report_content(content):
+                pending_specs[internal_key] = spec
+                continue
+            reused_keys.append(report_key)
+            from app.engine.data_preflight import declare_role
+            declare_role(state.setdefault("analysis_context", {}), internal_key,
+                         spec.declared_tool_ids, spec.inject_specs, reused=True)
+            update = {report_key: content, "reports": {report_key: content}}
+            _merge_state_update(state, update)
+            if event_sink is not None:
+                await event_sink.emit(
+                    "report_reused", agent_key=internal_key, phase=stage.event_phase,
+                    source_task_id=config.get("resume_source_task_id"), report_key=report_key,
+                    text="复用原任务同日完整报告，未重新调用模型；数据时点沿用原报告",
+                )
+            await _emit_report_ready(
+                event_sink, update, agent_key=internal_key, phase=stage.event_phase,
+                before_reports={}, display_name=spec.name,
+            )
+            await _emit_unit_done(registry.format_analyst_node(internal_key), stage.event_phase, internal_key)
+
+        analyst_results = await asyncio.gather(*[_run_analyst(k, s) for k, s in pending_specs.items()])
         # 按 specs 序回填合并（与旧串行执行的 state 报告顺序一致）
-        for (_internal_key, _spec), update in zip(specs.items(), analyst_results):
-            _before = dict(state.get("reports") or {})
+        for (_internal_key, _spec), update in zip(pending_specs.items(), analyst_results):
+            _before = {**(state.get("reports") or {}), **emitted_analyst_reports}
             _merge_state_update(state, update or {})
             await _emit_report_ready(
                 event_sink,
@@ -417,6 +485,34 @@ async def run_compiled(
                 agent_key=_internal_key,
                 phase=stage.event_phase,
                 before_reports=_before,
+            )
+
+        from app.llm.failures import describe_failure
+
+        if int(config.get("analyst_recovery_attempts", 1)) > 0:
+            for internal_key, spec in pending_specs.items():
+                content = (state.get("reports") or {}).get(f"{internal_key}_report")
+                failure = describe_failure(content)
+                if not _is_invalid_report_content(content) or not failure["retryable"]:
+                    continue
+                if event_sink is not None:
+                    await event_sink.emit(
+                        "status", agent_key=internal_key, phase=stage.event_phase,
+                        text=f"{spec.name}：{failure['message']}；保留其余报告，单独补跑一次",
+                    )
+                update = await _run_analyst(internal_key, spec, recovery=True)
+                _merge_state_update(state, update or {})
+
+        _require_valid_reports(
+            state.get("reports"), [f"{key}_report" for key in specs], "基础分析阶段"
+        )
+        if reused_keys:
+            state["reports"]["analysis_recovery_report"] = (
+                "## 分析恢复记录\n\n"
+                f"原任务：{config.get('resume_source_task_id', '')}\n\n"
+                f"复用同日完整分析师报告：{', '.join(reused_keys)}。\n\n"
+                "以上报告沿用原生成时点的数据，本次没有重新验证其全部内容。"
+                "缺失分析师已补跑，后续研究、风险评估与交易结论重新生成；这不是全量实时重分析。"
             )
 
     async def _run_debate_stage(stage: PlannedDebate) -> None:
@@ -471,6 +567,9 @@ async def run_compiled(
                         limit_key=deps.debate_limit_key,
                         limit=deps.debate_limit,
                     )
+            _require_valid_debate_rounds(
+                state.get(stage.state_key), side_keys, _round + 1, stage.event_phase
+            )
         await _run_node(
             stage.judge.node_name,
             _materialize_judge(stage.judge, deps, group),
@@ -479,6 +578,10 @@ async def run_compiled(
             critical=True,
             limit_key=deps.debate_limit_key,
             limit=deps.debate_limit,
+        )
+        _require_valid_text(
+            (state.get(stage.state_key) or {}).get("judge_decision"),
+            stage.judge.node_name, stage.event_phase,
         )
 
     async def _run_single_stage(stage: PlannedSingle) -> None:
@@ -491,6 +594,13 @@ async def run_compiled(
             limit_key=deps.debate_limit_key,
             limit=deps.debate_limit,
         )
+        if stage.node.kind.value == "summarizer":
+            _require_valid_summary(state.get("structured_summary"))
+        else:
+            _require_valid_text(
+                state.get(stage.node.report_key) or (state.get("reports") or {}).get(stage.node.report_key),
+                stage.node.node_name, stage.event_phase,
+            )
 
     for stage in plan.stages:
         state["_phase"] = stage.event_phase

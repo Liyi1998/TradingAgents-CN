@@ -12,6 +12,10 @@ class StockBasicInfoSchema(CommonFields):
     full_symbol: Optional[str] = None  # 带后缀，如 000001.SZ / 00700.HK / AAPL.NASDAQ
     exchange: Optional[str] = None
     industry: Optional[str] = None
+    industry_source: Optional[str] = None
+    industry_classification: Optional[str] = None
+    industry_as_of: Optional[str] = None
+    industry_contract: Optional[str] = None
     list_status: Optional[str] = None  # L/D/P/S
     list_date: Optional[str] = None
     delist_date: Optional[str] = None

@@ -6,7 +6,6 @@ import logging
 from typing import Any, Dict, Optional
 
 import pandas as pd
-import pandas.errors
 
 from app.data.sources.base.exceptions import (
     DataFormatError,
@@ -14,6 +13,10 @@ from app.data.sources.base.exceptions import (
     DataSourceUnavailableError,
 )
 from app.data.sources.base.mappers import map_network_exception
+from app.data.schema.base.types import _parse_date
+from app.data.schema.domains.financial_data import (
+    FINANCIAL_CONTRACT, financial_date, financial_number,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,47 +42,72 @@ _ZCFZ_KEY_COLS = {
 }
 
 
+
 def _safe_float(value) -> Optional[float]:
     """安全转 float，支持中文单位（亿/万）和百分号换算。
 
     示例：
     - "3.5亿"   → 3.5e8
-    - "12.5%"   → 0.125
+    - "12.5%"   → 12.5（标准库百分比使用百分点）
     - "1,234.5" → 1234.5
     - None / NaN / "--" / "-" → None
     """
-    if value is None:
+    if value is None or isinstance(value, bool) or type(value).__name__ == "bool_":
         return None
+    multiplier = 1.0
     try:
-        multiplier = 1.0
         if isinstance(value, str):
             value = value.strip()
             if not value or value.lower() in ("nan", "null", "none", "--", "-"):
                 return None
             value = value.replace(",", "")
+            multiplier = 1.0
             # 优先匹配百分号（无单位前缀），其次匹配亿/万单位
             if value.endswith("%"):
-                return float(value[:-1]) / 100.0
+                return financial_number(value[:-1])
             if value.endswith("亿"):
                 multiplier = 1e8
                 value = value[:-1]
             elif value.endswith("万"):
                 multiplier = 1e4
                 value = value[:-1]
-        if isinstance(value, float) and value != value:
-            return None
-        return float(value) * multiplier
-    except (ValueError, TypeError, AttributeError):
+        number = financial_number(value)
+        return financial_number(number * multiplier) if number is not None else None
+    except (ValueError, TypeError, AttributeError, OverflowError):
         return None
 
 
 def _extract_report_period(raw_row: Dict) -> Optional[str]:
     """从多种可能的字段中提取报告期。"""
-    for key in ("报告期", "end_date", "ANN_DATE", "report_date"):
+    for key in ("REPORT_DATE", "报告期", "报告日", "报表日期", "end_date", "report_date"):
         v = raw_row.get(key)
-        if v:
-            return str(v)
+        if v is not None and not pd.isna(v):
+            value = str(v).strip()
+            if len(value) == 4 and value.isdigit():
+                value += "1231"
+            parsed = financial_date(value)
+            if parsed:
+                return parsed
     return None
+
+
+def _fetch_sina_table(symbol: str, statement: str) -> pd.DataFrame:
+    """Public Sina endpoint used by AKShare, with a real HTTP timeout."""
+    import requests
+
+    response = requests.get("https://quotes.sina.cn/cn/api/openapi.php/CompanyFinanceService.getFinanceReport2022",
+                            params={"paperCode": symbol, "source": {"balance": "fzb", "income": "lrb", "cashflow": "llb"}[statement],
+                                    "type": "0", "page": "1", "num": "20"}, timeout=(3, 6))
+    response.raise_for_status()
+    body = response.json()["result"]["data"]
+    records = []
+    for period in body.get("report_date", [])[:20]:
+        date = period["date_value"]
+        raw = body["report_list"][date]
+        row = {item["item_title"]: item.get("item_value") for item in raw.get("data", [])}
+        row.update({"报告日": date, "公告日期": raw.get("publish_date"), "币种": raw.get("rCurrency"), "provider_channel": "sina_finance"})
+        records.append(row)
+    return pd.DataFrame(records)
 
 
 def _normalize_report_period(raw) -> Optional[str]:
@@ -89,74 +117,78 @@ def _normalize_report_period(raw) -> Optional[str]:
     "2025-06-30 00:00:00"——前者归一为年报期 YYYY-12-31（否则入库后
     引擎 YoY 同期匹配断裂），后者截断时间部分。
     """
-    if not raw:
+    if raw is None:
         return None
     s = str(raw).strip().split()[0].replace("-", "").replace("/", "")
     if len(s) == 4 and s.isdigit():
         s += "1231"
-    if len(s) == 8 and s.isdigit():
-        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
-    return str(raw)
+    return financial_date(s)
 
 
-def _build_financial_row(code: str, tables: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-    """从多张财务报表合并出一行标准化记录。"""
-    # 各表取最新一期（第一行）
-    abstract_row = tables.get("abstract")
-    balance_row = tables.get("balance")
-    income_row = tables.get("income")
-    cashflow_row = tables.get("cashflow")
 
-    a = abstract_row.iloc[0].to_dict() if abstract_row is not None and not abstract_row.empty else {}
-    b = balance_row.iloc[0].to_dict() if balance_row is not None and not balance_row.empty else {}
-    i = income_row.iloc[0].to_dict() if income_row is not None and not income_row.empty else {}
-    c = cashflow_row.iloc[0].to_dict() if cashflow_row is not None and not cashflow_row.empty else {}
+def _build_financial_row(code: str, tables: Dict[str, pd.DataFrame], report_period: str = None) -> Dict[str, Any]:
+    """只合并同一报告期，不把最新摘要与不同季度的三表拼在一起。"""
+    periods = [_extract_report_period(row) for table in tables.values() if table is not None
+               for row in table.to_dict("records")]
+    report_period = report_period or max((p for p in periods if p), default=None)
 
-    report_period = _normalize_report_period(
-        _extract_report_period(a) or _extract_report_period(b) or _extract_report_period(i)
-    )
+    def matched(name):
+        table = tables.get(name)
+        return next((row for row in table.to_dict("records") if _extract_report_period(row) == report_period), {}) if table is not None else {}
 
-    # 收入 / 利润 — 优先从 abstract（摘要）提取，再从 income（利润表）提取
-    revenue = _safe_float(
-        a.get("营业收入") or a.get("revenue")
-        or i.get("营业收入") or i.get("revenue") or i.get("total_revenue")
-    )
-    net_profit = _safe_float(
-        a.get("净利润") or a.get("net_profit")
-        or i.get("净利润") or i.get("net_profit") or i.get("n_income_attr_p")
-    )
-    total_assets = _safe_float(b.get("总资产") or b.get("total_assets"))
-    total_equity = _safe_float(
-        b.get("所有者权益合计") or b.get("total_equity")
-        or b.get("total_hldr_eqy_exc_min_int")
-    )
-    total_liab = _safe_float(b.get("总负债") or b.get("total_liab"))
-    # 资产负债率 %：东财资产负债表无直接比率列，由总负债/总资产推导
-    debt_ratio = None
-    if total_liab is not None and total_assets:
-        debt_ratio = round(total_liab / total_assets * 100.0, 4)
-    roe = _safe_float(a.get("净资产收益率") or a.get("roe"))
-    gross_margin = _safe_float(a.get("毛利率") or a.get("grossprofit_margin") or a.get("gross_margin"))
-    net_margin = _safe_float(a.get("净利率") or a.get("netprofit_margin") or a.get("net_margin"))
-    eps = _safe_float(a.get("每股收益") or a.get("基本每股收益") or a.get("eps"))
-    bps = _safe_float(a.get("每股净资产") or a.get("bps"))
-    operating_cashflow = _safe_float(
-        c.get("经营活动产生的现金流量净额") or c.get("n_cashflow_act")
-    )
+    a, b, i, c = (matched(name) for name in ("abstract", "balance", "income", "cashflow"))
+
+    def pick(*pairs):
+        for row, keys in pairs:
+            for key in keys:
+                value = _safe_float(row.get(key))
+                if value is not None:
+                    return value
+        return None
+
+    # Exact statement amounts take precedence over rounded abstract amounts.
+    revenue = pick((i, ("OPERATE_INCOME", "TOTAL_OPERATE_INCOME", "营业收入", "营业总收入", "revenue", "total_revenue")), (a, ("营业收入", "营业总收入", "revenue")))
+    attributed_profit = pick((i, ("PARENT_NETPROFIT", "归属于母公司所有者的净利润", "归属于母公司股东的净利润", "n_income_attr_p")))
+    consolidated_profit = pick((i, ("NETPROFIT", "净利润", "net_profit", "n_income")))
+    deducted_profit = pick((a, ("扣非净利润", "扣除非经常性损益后的净利润")), (i, ("DEDUCT_PARENT_NETPROFIT",)))
+    net_profit = attributed_profit
+    total_assets = pick((b, ("TOTAL_ASSETS", "资产总计", "总资产", "total_assets")))
+    total_equity = pick((b, ("TOTAL_EQUITY", "所有者权益(或股东权益)合计", "所有者权益合计", "total_equity", "total_hldr_eqy_exc_min_int")))
+    total_liab = pick((b, ("TOTAL_LIABILITIES", "负债合计", "总负债", "total_liab")))
+    roe = pick((a, ("净资产收益率", "roe")))
+    gross_margin = pick((a, ("毛利率", "销售毛利率", "grossprofit_margin", "gross_margin")))
+    net_margin = pick((a, ("净利率", "销售净利率", "netprofit_margin", "net_margin")))
+    debt_ratio = pick((a, ("资产负债率", "debt_ratio")))
+    if debt_ratio is None and total_assets and total_liab is not None:
+        debt_ratio = total_liab / total_assets * 100
+    current_ratio = pick((a, ("流动比率", "current_ratio")))
+    eps = pick((a, ("每股收益", "基本每股收益", "eps")))
+    bps = pick((a, ("每股净资产", "bps")))
+    operating_cashflow = pick((c, ("NETCASH_OPERATE", "经营活动产生的现金流量净额", "n_cashflow_act")))
     revenue_ttm = _safe_float(a.get("营业收入TTM") or a.get("revenue_ttm"))
     net_profit_ttm = _safe_float(a.get("净利润TTM") or a.get("net_profit_ttm"))
 
-    return {
+    record = {
         "symbol": code,
         "report_period": report_period,
-        "report_date": report_period,
-        # 多表合并的一行快照记录，与 tushare 批量口径一致；
-        # validator 必填 statement_type，缺省整批会被拒收
         "statement_type": "indicator",
+        "report_date": report_period,
         "data_source": "akshare",
+        "announce_date": None,
+        "currency": "CNY",
+        "monetary_unit": "元",
+        "available_statements": ",".join(name for name, row in zip(("abstract", "balance", "income", "cashflow"), (a, b, i, c)) if row),
+        "statement_sources": ",".join(f"{name}:{row.get('provider_channel', 'unknown')}" for name, row in zip(("abstract", "balance", "income", "cashflow"), (a, b, i, c)) if row),
+        "cash_and_equivalents": pick((b, ("MONETARYFUNDS", "货币资金"))),
+        "accounts_receivable": pick((b, ("ACCOUNTS_RECE", "应收账款"))),
+        "capital_expenditure": pick((c, ("CONSTRUCT_LONG_ASSET", "购建固定资产、无形资产和其他长期资产支付的现金"))),
         "revenue": revenue,
         "revenue_ttm": revenue_ttm,
         "net_profit": net_profit,
+        "net_profit_attributable": attributed_profit,
+        "net_profit_consolidated": consolidated_profit,
+        "net_profit_deducted": deducted_profit,
+        "net_profit_basis": "attributable" if attributed_profit is not None else "unknown",
         "net_profit_ttm": net_profit_ttm,
         "total_assets": total_assets,
         "total_equity": total_equity,
@@ -165,10 +197,92 @@ def _build_financial_row(code: str, tables: Dict[str, pd.DataFrame]) -> Dict[str
         "gross_margin": gross_margin,
         "net_margin": net_margin,
         "debt_ratio": debt_ratio,
+        "current_ratio": current_ratio,
         "eps": eps,
         "bps": bps,
         "operating_cashflow": operating_cashflow,
     }
+    matched_rows = {"abstract": a, "balance": b, "income": i, "cashflow": c}
+    disclosures = {}
+    for name, raw in matched_rows.items():
+        if not raw:
+            continue
+        dates = [financial_date(raw.get(key)) for key in ("NOTICE_DATE", "公告日期", "ann_date", "announce_date")]
+        known = [value for value in dates if value and report_period and value >= report_period]
+        disclosures[name] = {"report_period": report_period, "announce_date": max(known, default=None),
+                             "provider_channel": raw.get("provider_channel", "unknown"), "included": True}
+    record["announce_date"] = max((item["announce_date"] for item in disclosures.values()
+                                   if item["announce_date"]), default=None)
+    record["financial_contract"] = FINANCIAL_CONTRACT
+    record["report_type"] = "consolidated_ytd"
+    record["source_disclosures"] = disclosures
+    record["field_provenance"] = {}
+    # A THS abstract without its own disclosure date cannot borrow the balance
+    # sheet's date. Derive only from exact, same-period dated statement amounts.
+    derivations = {}
+    dated_income = bool(disclosures.get("income", {}).get("announce_date"))
+    dated_abstract = bool(disclosures.get("abstract", {}).get("announce_date"))
+    operating_revenue = pick((i, ("OPERATE_INCOME", "营业收入")))
+    operating_cost = pick((i, ("OPERATE_COST", "营业成本")))
+    income_eps = pick((i, ("BASIC_EPS", "基本每股收益")))
+    if dated_income and operating_revenue and operating_revenue > 0 and operating_cost is not None and operating_cost >= 0:
+        record["gross_margin"] = (operating_revenue - operating_cost) / operating_revenue * 100
+        derivations["gross_margin"] = {"table": "income", "method": "derived_income_revenue_cost", "formula": "(operating_revenue-operating_cost)/operating_revenue*100", "inputs": {"operating_revenue": operating_revenue, "operating_cost": operating_cost}}
+    if dated_income and income_eps is not None:
+        record["eps"] = income_eps
+        derivations["eps"] = {"table": "income", "method": "reported_basic_eps"}
+    if not dated_abstract and disclosures.get("balance", {}).get("announce_date") and total_assets and total_assets > 0 and total_liab is not None and total_liab >= 0:
+        record["debt_ratio"] = total_liab / total_assets * 100
+        derivations["debt_ratio"] = {"table": "balance", "method": "derived_liabilities_over_assets"}
+    debt_from_abstract = pick((a, ("资产负债率", "debt_ratio"))) is not None
+    revenue_from_income = pick((i, ("OPERATE_INCOME", "TOTAL_OPERATE_INCOME", "营业收入", "营业总收入", "revenue", "total_revenue"))) is not None
+    deducted_from_abstract = pick((a, ("扣非净利润", "扣除非经常性损益后的净利润"))) is not None
+    fields = {"roe": "abstract", "gross_margin": "abstract", "net_profit": "income",
+              "net_profit_attributable": "income", "net_profit_consolidated": "income",
+              "debt_ratio": "abstract" if debt_from_abstract else "balance",
+              "revenue": "income" if revenue_from_income else "abstract",
+              "net_profit_deducted": "abstract" if deducted_from_abstract else "income",
+              "revenue_ttm": "abstract", "net_profit_ttm": "abstract",
+              "total_assets": "balance", "total_equity": "balance", "total_liab": "balance",
+              "cash_and_equivalents": "balance", "accounts_receivable": "balance",
+              "capital_expenditure": "cashflow", "operating_cashflow": "cashflow",
+              "net_margin": "abstract", "current_ratio": "abstract", "eps": "abstract", "bps": "abstract"}
+    ratios = {"roe", "gross_margin", "net_margin", "debt_ratio", "current_ratio"}
+    for field, table in fields.items():
+        derived = derivations.get(field, {})
+        table = derived.get("table", table)
+        evidence = disclosures.get(table, {})
+        value = record.get(field)
+        source_row = matched_rows[table]
+        currencies = [str(source_row[key]).strip().upper() for key in ("币种", "rCurrency", "CURRENCY", "currency")
+                      if source_row.get(key) is not None and not pd.isna(source_row[key])]
+        units = [str(source_row[key]).strip() for key in ("monetary_unit", "金额单位", "单位")
+                 if source_row.get(key) is not None and not pd.isna(source_row[key])]
+        # These endpoints normally publish CNY/yuan (THS embeds 亿/万 in each
+        # value). Explicit conflicting currency/table units must not be silently
+        # relabeled; a separate, verified conversion is required for such rows.
+        unit_proven = (all(unit in {"元", "人民币元", "CNY"} for unit in units)
+                       and all(currency in {"CNY", "RMB", "人民币", "人民币元"} for currency in currencies))
+        source_proven = evidence.get("provider_channel") not in {None, "", "unknown"}
+        needs_units = field not in ratios or bool(derived)
+        if needs_units and not unit_proven:
+            record[field] = None
+        record["field_provenance"]["total_liabilities" if field == "total_liab" else field] = {
+            **evidence, "data_source": "akshare",
+            "method": derived.get("method") or ("derived_liabilities_over_assets" if field == "debt_ratio" and not debt_from_abstract else "reported"),
+            "basis": "attributable" if field in {"net_profit", "net_profit_attributable"} else "consolidated" if field == "net_profit_consolidated" else "reported",
+            "currency": "CNY" if unit_proven else None,
+            "monetary_unit": "元" if unit_proven else None,
+            "status": ("missing" if value is None else
+                       "unproven_unit" if needs_units and not unit_proven else
+                       "unproven_source" if not source_proven else
+                       "available" if evidence.get("announce_date") else "unproven_disclosure"),
+        }
+        if derived.get("inputs"):
+            record["field_provenance"][field].update(inputs=derived["inputs"], formula=derived["formula"])
+    if record["net_profit"] is None:
+        record["net_profit_basis"] = "unknown"
+    return record
 
 
 async def fetch_financial_data(
@@ -194,36 +308,49 @@ async def fetch_financial_data(
 
         from app.data.sources.cn.akshare.api.anti_scraping import wait_rate_limit
 
+        from app.data.sources.cn.stock_name_utils import infer_exchange
+
+        exchange = infer_exchange(code)
+        prefix = {"SSE": "SH", "SZSE": "SZ", "BSE": "BJ"}.get(exchange, "")
+        em_symbol = f"{prefix}{code}"
+        sina_symbol = em_symbol.lower()
         fetch_tasks = [
-            ("abstract", lambda: (wait_rate_limit(), ak.stock_financial_abstract_ths(symbol=code, indicator="按年度"))[1]),
-            ("balance", lambda: (wait_rate_limit(), ak.stock_balance_sheet_by_report_em(symbol=code))[1]),
-            ("income", lambda: (wait_rate_limit(), ak.stock_profit_sheet_by_report_em(symbol=code))[1]),
-            ("cashflow", lambda: (wait_rate_limit(), ak.stock_cash_flow_sheet_by_report_em(symbol=code))[1]),
+            ("abstract", lambda: (wait_rate_limit(), ak.stock_financial_abstract_ths(symbol=code, indicator="按报告期"))[1]),
+            ("balance", lambda: (wait_rate_limit(), ak.stock_balance_sheet_by_report_em(symbol=em_symbol))[1]),
+            ("income", lambda: (wait_rate_limit(), ak.stock_profit_sheet_by_report_em(symbol=em_symbol))[1]),
+            ("cashflow", lambda: (wait_rate_limit(), ak.stock_cash_flow_sheet_by_report_em(symbol=em_symbol))[1]),
         ]
 
-        for name, fn in fetch_tasks:
+        async def fetch_table(name, fn):
             try:
-                df = await asyncio.to_thread(fn)
+                df = await asyncio.wait_for(asyncio.to_thread(fn), timeout=8)
                 if df is not None and not df.empty:
                     if start_date or end_date:
                         df = _filter_df_by_report_period(df, start_date, end_date)
                     if df is not None and not df.empty:
+                        df = df.copy()
+                        df["provider_channel"] = "ths_abstract" if name == "abstract" else "eastmoney_statement"
                         tables[name] = df
-            except (
-                KeyError,
-                IndexError,
-                AttributeError,
-                ValueError,
-                TypeError,
-                pandas.errors.EmptyDataError,
-            ) as e:
+            except Exception as e:
                 # 单个子表数据格式异常（AKShare 返回结构变化或缺字段）：跳过该表，不影响其他表
                 # TypeError 也按子表级异常处理：东财系报表接口（*_by_report_em）
                 # 在页面结构变化/网络被拒时 akshare 内部抛 'NoneType' object is
                 # not subscriptable；单表降级跳过，不影响 THS 摘要等其他子表
                 logger.debug(f"AKShare获取财务数据 {name} 格式异常: {e}")
-                continue
-            # 其他异常（网络/超时/未知）不在此处吞掉，让其上抛到外层异常分类器处理
+                return
+        await asyncio.gather(*(fetch_table(name, fn) for name, fn in fetch_tasks))
+        # 免费新浪三表回退；失败只影响当前子表，不丢弃其他已经成功的表。
+        async def fallback_table(name, label):
+            if name in tables:
+                return
+            try:
+                df = await asyncio.wait_for(asyncio.to_thread(_fetch_sina_table, sina_symbol, name), timeout=10)
+                df = _filter_df_by_report_period(df, start_date, end_date)
+                if not df.empty:
+                    tables[name] = df
+            except Exception as exc:
+                logger.debug("新浪财报回退 %s/%s: %s", code, name, exc)
+        await asyncio.gather(*(fallback_table(name, label) for name, label in (("balance", "资产负债表"), ("income", "利润表"), ("cashflow", "现金流量表"))))
 
     except (asyncio.TimeoutError, ConnectionError, TimeoutError) as exc:
         # 网络异常：可重试
@@ -239,8 +366,10 @@ async def fetch_financial_data(
     if not tables:
         raise DataNotFoundError("akshare", _DOMAIN, f"code={code} 所有财务子表均无数据")
 
-    row = _build_financial_row(code, tables)
-    return pd.DataFrame([row])
+    periods = sorted({_extract_report_period(row) for table in tables.values() for row in table.to_dict("records")} - {None}, reverse=True)
+    if not periods:
+        raise DataFormatError("akshare", _DOMAIN, f"code={code} 无可核验报告期")
+    return pd.DataFrame([_build_financial_row(code, tables, period) for period in periods[:20]])
 
 
 def _filter_df_by_report_period(
@@ -249,40 +378,33 @@ def _filter_df_by_report_period(
     """按报告期列过滤 AKShare 财务 DataFrame。
 
     AKShare 各财务报表的报告期列名不统一（REPORT_DATE / 报告期 / 报表日期等），
-    这里尝试常见列名。日期统一去掉分隔符后做字符串比较。
-    返回过滤后的 DataFrame；若无匹配列则原样返回（不阻塞业务）。
+    这里尝试常见列名并核验真实日期；未知报告期不进入一个已限定的窗口。
     """
-    period_cols = ["REPORT_DATE", "报告期", "报表日期", "报告日", "ANN_DATE"]
+    period_cols = ["REPORT_DATE", "报告期", "报表日期", "报告日", "end_date", "report_date"]
     col = None
     for c in period_cols:
         if c in df.columns:
             col = c
             break
     if col is None:
-        return df
+        return df.iloc[0:0].copy()
 
-    start = str(start_date).replace("-", "") if start_date else None
-    end = str(end_date).replace("-", "") if end_date else None
-
-    def _norm(v):
-        if v is None:
-            return ""
-        s = str(v).replace("-", "")
-        # THS 摘要（stock_financial_abstract_ths 按年度）的报告期列是年份 int
-        # （1989、1990…），直接字符串比较会被任何日期范围过滤光；按年报期
-        # Y1231 归一
-        if len(s) == 4 and s.isdigit():
-            s += "1231"
-        return s
-
-    # 初始必须为全 True 的 bool Series：此前误用 str Series 起步，
-    # 与后续 bool 条件做 & 时抛 "operation 'and_' not supported for dtype 'str'"
-    mask = pd.Series(True, index=df.index)
+    start, end = financial_date(start_date), financial_date(end_date)
+    if (start_date and not start) or (end_date and not end) or (start and end and start > end):
+        raise ValueError("Invalid financial report date bounds")
+    periods = df[col].map(_normalize_report_period)
+    mask = periods.notna()
     if start:
-        mask = mask & df[col].apply(lambda v: _norm(v) >= start)
+        mask = mask & periods.ge(start)
     if end:
-        mask = mask & df[col].apply(lambda v: _norm(v) <= end)
-    return df[mask]
+        mask = mask & periods.le(end)
+    filtered = df[mask].copy()
+    if not filtered.empty:
+        filtered["__period_sort"] = periods.loc[filtered.index]
+        filtered = filtered.sort_values(
+            "__period_sort", ascending=False, na_position="last"
+        ).drop(columns=["__period_sort"])
+    return filtered
 
 
 # ── 按报告期批量模式（东财全市场，tushare 积分不足时的批量主源）─────
@@ -295,7 +417,7 @@ def _rename_key_cols(df: pd.DataFrame, key_cols: Dict[str, str]) -> pd.DataFrame
     return renamed
 
 
-async def fetch_financial_data_by_period(period: str) -> pd.DataFrame:
+async def fetch_financial_data_by_period(period: str, symbols=None) -> pd.DataFrame:
     """东财业绩报表 + 资产负债表按报告期合并全市场财务快照。
 
     stock_yjbb_em（每股收益/营收/净利/ROE/毛利率）左连 stock_zcfz_em
@@ -307,44 +429,27 @@ async def fetch_financial_data_by_period(period: str) -> pd.DataFrame:
     Raises:
         DataNotFoundError: 该报告期两接口均无数据（未披露/停市）
     """
-    date_str = str(period).replace("-", "")
-    report_period = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    from app.data.sources.cn.akshare.api.financial_disclosures import (
+        fetch_period_rows, normalize_period_rows,
+    )
 
-    from app.data.sources.cn.akshare.api.anti_scraping import wait_rate_limit
-
-    def _fetch_em(fetch_fn):
-        wait_rate_limit()
-        return fetch_fn()
-
-    import akshare as ak
-
-    try:
-        yjbb = await asyncio.to_thread(
-            _fetch_em, lambda: ak.stock_yjbb_em(date=date_str))
-        zcfz = await asyncio.to_thread(
-            _fetch_em, lambda: ak.stock_zcfz_em(date=date_str))
-    except (asyncio.TimeoutError, ConnectionError, TimeoutError) as exc:
-        raise map_network_exception(exc, "akshare", _DOMAIN)
-    except (KeyError, IndexError, AttributeError, ValueError) as exc:
-        raise DataFormatError("akshare", _DOMAIN, f"period={period}: {exc}")
-    except Exception as exc:
-        raise DataSourceUnavailableError("akshare", _DOMAIN, f"period={period}: {exc}")
-
-    if (yjbb is None or yjbb.empty) and (zcfz is None or zcfz.empty):
-        raise DataNotFoundError(
-            "akshare", _DOMAIN, f"报告期 {period} 业绩报表与资产负债表均无数据")
-
-    yjbb = _rename_key_cols(yjbb, _YJBB_KEY_COLS)
-    zcfz = _rename_key_cols(zcfz, _ZCFZ_KEY_COLS)
-
-    frames = []
-    for df in (yjbb, zcfz):
-        df = df.drop_duplicates(subset="symbol", keep="first")
-        frames.append(df[df["symbol"].notna()])
-    merged = frames[0].merge(frames[1], on="symbol", how="left")
-    merged["report_period"] = report_period
-    merged["statement_type"] = "indicator"
-    logger.info(f"AKShare 财务批量 {report_period}: {len(merged)} 行")
+    results = await asyncio.gather(*(
+        asyncio.to_thread(fetch_period_rows, report, period, symbols)
+        for report in ("RPT_LICO_FN_CPD", "RPT_DMSK_FN_BALANCE")
+    ), return_exceptions=True)
+    if all(isinstance(result, Exception) for result in results):
+        raise DataSourceUnavailableError("akshare", _DOMAIN, f"{period}: both financial reports unavailable") from results[0]
+    available = []
+    for name, result in zip(("indicator", "balance"), results):
+        if isinstance(result, Exception):
+            logger.warning("Financial report unavailable %s/%s: %s", period, name, type(result).__name__)
+            available.append([])
+        else:
+            available.append(result)
+    merged = normalize_period_rows(*available, period=period)
+    if merged.empty:
+        raise DataNotFoundError("akshare", _DOMAIN, f"{period}: no normalized financial rows")
+    logger.info("AKShare disclosed financial batch %s: %d rows", period, len(merged))
     return merged
 
 

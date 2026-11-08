@@ -2,11 +2,17 @@
 
 import asyncio
 import logging
+import hashlib
+import json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from app.data.core.domain import DataDomain
+from app.data.core.adjustment_refresh import (
+    CN_ADJUSTMENT_HISTORY_START, assert_cn_adjustment_horizon, refresh_fetch_range,
+    cn_adjustment_snapshot_horizon,
+)
 from app.data.core.result import RefreshResult, DomainRefreshResult
 from app.data.core.registry.capability import CapabilityRegistry
 from app.data.core.registry.priority import PriorityConfig
@@ -24,6 +30,7 @@ _SUPPORTED_ON_DEMAND_DOMAINS = {
     "basic_info",
     "trade_calendar",
     "daily_quotes",
+    "index_quotes",
     "daily_indicators",
     "adj_factors",
     "corporate_actions",
@@ -41,6 +48,7 @@ _SUPPORTED_ON_DEMAND_DOMAINS = {
 # 按日期增量刷新的域：{domain: (date_field, default_lookback_days)}
 _INCREMENTAL_DOMAINS = {
     "daily_quotes": ("trade_date", 60),
+    "index_quotes": ("trade_date", 60),
     "daily_indicators": ("trade_date", 60),
     "adj_factors": ("trade_date", 60),
     "financial_data": ("report_period", 365),
@@ -79,6 +87,10 @@ class DataRefreshService:
         domains: Optional[List[str]] = None,
         force: bool = False,
         timeout: int = 30,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        coverage_filters: Optional[dict] = None,
     ) -> RefreshResult:
         """刷新指定股票的数据。
 
@@ -94,16 +106,21 @@ class DataRefreshService:
         """
         result = RefreshResult(symbol=symbol, market=market)
         start_time = time.time()
+        for value in (start_date, end_date):
+            if value:
+                datetime.strptime(value, "%Y-%m-%d")
+        if start_date and end_date and start_date > end_date:
+            raise ValueError("start_date必须不晚于end_date")
 
         if domains is None:
-            domains = [d.value for d in DataDomain if d.value in _SUPPORTED_ON_DEMAND_DOMAINS]
+            domains = [d.value for d in DataDomain if d.value in _SUPPORTED_ON_DEMAND_DOMAINS and d.value != "index_quotes"]
         else:
             domains = list(domains)
 
         # 并行刷新各域
         tasks = []
         for domain in domains:
-            tasks.append(self._refresh_domain(market, symbol, domain, force, timeout))
+            tasks.append(self._refresh_domain(market, symbol, domain, force, timeout, start_date, end_date, coverage_filters))
 
         domain_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -174,10 +191,20 @@ class DataRefreshService:
             logger.debug(f"查询最近交易日失败，降级为今天: {e}")
             end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+        if market == "CN" and domain == "adj_factors":
+            start = CN_ADJUSTMENT_HISTORY_START
+            # The last effective event is not the last checked corporate-action
+            # horizon; a sparse event date cannot establish freshness.
+            latest_db_date = None
         return start, end, latest_db_date
 
+    async def _assert_cn_adjustment_horizon(self, symbol: str, end_date: str) -> None:
+        await assert_cn_adjustment_horizon(symbol, end_date)
+
     async def _refresh_domain(
-        self, market: str, symbol: str, domain: str, force: bool, timeout: int
+        self, market: str, symbol: str, domain: str, force: bool, timeout: int,
+        requested_start: Optional[str] = None, requested_end: Optional[str] = None,
+        coverage_filters: Optional[dict] = None,
     ) -> DomainRefreshResult:
         """刷新单个域。"""
         start = time.time()
@@ -191,9 +218,13 @@ class DataRefreshService:
 
         # 冷却期检查
         cooldown_key = f"cooldown:{market}:{symbol}:{domain}"
+        if requested_start or requested_end:
+            cooldown_key += f":{requested_start or ''}:{requested_end or ''}"
+        if coverage_filters:
+            cooldown_key += ":" + hashlib.sha256(json.dumps(coverage_filters, sort_keys=True, default=str).encode()).hexdigest()[:16]
         if not force and _cooldown_cache.get(cooldown_key):
-            dr.status = "fresh"
-            return dr
+            from copy import deepcopy
+            return deepcopy(_cooldown_cache.get(cooldown_key))
 
         # 获取分布式锁
         lock = DistributedLock(f"lock:{market}:{domain}:{symbol}", ttl=timeout)
@@ -212,45 +243,62 @@ class DataRefreshService:
             # 增量域：只拉取最新记录之后的数据
             fetch_kwargs = {}
             end_date: Optional[str] = None
-            latest_db_date: Optional[str] = None
             if domain in _INCREMENTAL_DOMAINS:
-                start_date, end_date, latest_db_date = await self._get_incremental_date_range(
+                start_date, end_date, _ = await self._get_incremental_date_range(
                     market, symbol, domain
                 )
-                fetch_kwargs["start_date"] = start_date
-                fetch_kwargs["end_date"] = end_date
+                fetch_start, fetch_end = refresh_fetch_range(
+                    market, domain, start_date, end_date, requested_start, requested_end)
+                fetch_kwargs["start_date"] = fetch_start
+                fetch_kwargs["end_date"] = fetch_end
+                end_date = requested_end or end_date
+                if market == "CN" and domain == "adj_factors":
+                    await self._assert_cn_adjustment_horizon(symbol, end_date)
+            elif domain in {"trade_calendar", "news"}:
+                if requested_start:
+                    fetch_kwargs["start_date"] = requested_start
+                if requested_end:
+                    fetch_kwargs["end_date"] = requested_end
+            elif domain == "basic_info" and requested_end:
+                fetch_kwargs["end_date"] = requested_end
 
             fetch_result = await asyncio.wait_for(
-                router.fetch(market, domain, symbol, **fetch_kwargs),
+                router.fetch(market, domain, symbol, **fetch_kwargs,
+                             coverage_filters=coverage_filters, timeout=timeout),
                 timeout=timeout,
             )
 
-            # 区分"源失败"与"源正常但无新数据"：
-            # 若库中已有最新日期 >= 请求 end_date（最近交易日），说明数据已是最新，
-            # 即使源返回空也属正常（无新增交易日），标 fresh 而非 failed。
+            # 刷新状态如实反映源结果。缓存日期不能证明字段或窗口完整；
+            # 源失败仍为 failed，消费方可以继续使用经覆盖校验的缓存。
             if not fetch_result.success:
-                if latest_db_date and end_date and latest_db_date >= end_date:
-                    dr.status = "fresh"
-                    dr.source = fetch_result.source
-                    dr.latency_ms = int((time.time() - start) * 1000)
-                    return dr
+
                 dr.status = "failed"
                 dr.error = fetch_result.error or "所有数据源失败"
                 dr.fallback_from = fetch_result.fallback_from
                 dr.latency_ms = int((time.time() - start) * 1000)
+                _cooldown_cache.set(cooldown_key, dr, ttl=60)
                 return dr
 
             if not fetch_result.records:
-                dr.status = "fresh"
+                dr.status = "no_events" if domain in {"dragon_tiger", "block_trade"} else "empty"
                 dr.source = fetch_result.source
                 dr.latency_ms = int((time.time() - start) * 1000)
+                _cooldown_cache.set(cooldown_key, dr, ttl=300)
                 return dr
 
+            if market == "CN" and domain == "adj_factors":
+                returned_horizon = cn_adjustment_snapshot_horizon(fetch_result.records)
+                if returned_horizon != end_date:
+                    raise ValueError("CN adjustment source did not prove the requested horizon")
+                # Recheck after source I/O; do not publish over a newer snapshot
+                # that another writer completed while the request was running.
+                await self._assert_cn_adjustment_horizon(symbol, returned_horizon)
             count = await self._write_to_mongo(fetch_result.records, domain, market)
 
-            dr.status = "refreshed"
+            dr.status = "partial" if fetch_result.status == "partial" else "refreshed"
             dr.source = fetch_result.source
             dr.fallback_from = fetch_result.fallback_from
+            dr.error = fetch_result.error
             dr.record_count = count
             dr.latency_ms = int((time.time() - start) * 1000)
 
@@ -265,7 +313,7 @@ class DataRefreshService:
                     source=fetch_result.source or "",
                     last_sync_date=end_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                     record_count=count,
-                    status="success",
+                    status="success" if dr.status == "refreshed" and count else "partial",
                     duration_ms=dr.latency_ms,
                     scope="single",
                     trigger="manual",
@@ -274,18 +322,20 @@ class DataRefreshService:
             except Exception as cp_err:
                 logger.debug(f"写 checkpoint 失败（不影响刷新结果）: {cp_err}")
 
-            _cooldown_cache.set(cooldown_key, True, ttl=300)
+            _cooldown_cache.set(cooldown_key, dr, ttl=300)
             return dr
 
         except asyncio.TimeoutError:
             dr.status = "timeout"
             dr.error = f"超时 ({timeout}s)"
+            _cooldown_cache.set(cooldown_key, dr, ttl=60)
             dr.latency_ms = int((time.time() - start) * 1000)
             return dr
         except Exception as e:
             logger.warning(f"刷新 {market}/{symbol}/{domain} 失败: {e}")
             dr.status = "failed"
             dr.error = str(e)
+            _cooldown_cache.set(cooldown_key, dr, ttl=60)
             dr.latency_ms = int((time.time() - start) * 1000)
             return dr
 

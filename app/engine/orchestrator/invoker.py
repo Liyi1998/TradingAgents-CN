@@ -15,7 +15,7 @@ single_turn 节点 tools=[submit_report]、max_turns=2（生成 + 提交），
 替代「取最后一轮回复」的隐式报告截取。
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from app.constants.llm_defaults import DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_TOKENS
 from app.engine.orchestrator.workflow.submission import Submission
@@ -62,6 +62,8 @@ async def run_agent_turn(
     temperature: Optional[float] = None,
     tools: Optional[List[Any]] = None,
     max_turns: int = 1,
+    analysis_horizon: Optional[str] = None,
+    stop_when: Optional[Callable[[], bool]] = None,
 ) -> str:
     """单轮业务节点调用（经 run_conversation）。
 
@@ -77,6 +79,13 @@ async def run_agent_turn(
     Returns:
         模型回复文本（空响应返回空串，由调用方按 H-2 语义降级）
     """
+    from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT, prompt_context
+    context = ACTIVE_ANALYSIS_CONTEXT.get()
+    if context:
+        system += prompt_context(context)
+    from app.engine.research_contract import append_research_contract
+    horizon = analysis_horizon if analysis_horizon is not None else (context or {}).get("analysis_horizon")
+    system = append_research_contract(system, horizon, agent_key=agent_key)
     bundle, primary, fallback, retries, compact_config = _bundle_params(llm)
 
     eff_max_tokens = max_tokens or (bundle.max_tokens if bundle else None) or DEFAULT_MAX_TOKENS
@@ -102,6 +111,7 @@ async def run_agent_turn(
         phase=phase,
         user_id=user_id,
         event_sink=event_sink,
+        stop_when=stop_when,
     )
     return result.final_text or ""
 
@@ -145,6 +155,9 @@ async def run_node_turn(
     )
 
     box = SubmissionBox()
+    if node_type in ("trader", "terminal"):
+        from app.engine.strategy_partition import GENERATION_INSTRUCTION
+        system += "\n" + GENERATION_INSTRUCTION
     submit_tool = make_submit_report_tool(
         box,
         node_type=node_type,
@@ -155,7 +168,7 @@ async def run_node_turn(
         phase=phase,
         display_name=display_name,
     )
-    final_text = await run_agent_turn(
+    final_text = await await_node_submission(run_agent_turn(
         llm,
         history,
         user_message,
@@ -167,5 +180,23 @@ async def run_node_turn(
         event_sink=event_sink,
         tools=[submit_tool],
         max_turns=2,
-    )
-    return finalize_submission(box, final_text=final_text, fallback_fields=fallback_fields)
+        analysis_horizon=(state or {}).get("analysis_horizon"),
+        stop_when=lambda: box.value is not None,
+    ), box)
+    submission = finalize_submission(box, final_text=final_text, fallback_fields=fallback_fields)
+    if node_type in ("trader", "terminal") and state is not None and report_key:
+        from app.engine.strategy_partition import partition_strategy
+        state.setdefault("strategy_partitions", {})[report_key] = partition_strategy(submission.content)
+    return submission
+
+
+async def await_node_submission(conversation, box) -> str:
+    """Preserve an accepted valid submission on transport failure, not cancellation."""
+    from app.llm.core.errors import LLMError
+    try:
+        return await conversation
+    except (LLMError, TimeoutError, ConnectionError):
+        from app.engine.orchestrator.pipeline import _is_invalid_report_content
+        if box.value is None or box.value.source != "structured" or _is_invalid_report_content(box.value.content):
+            raise
+        return ""

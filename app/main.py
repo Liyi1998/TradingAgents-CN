@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 import uvicorn
 import logging
 import re
@@ -35,6 +36,8 @@ from app.routers import (
     favorites,
     config,
     reports,
+    jev_decisions,
+    research_tracking,
     database,
     operation_logs,
     tags,
@@ -43,6 +46,7 @@ from app.routers import (
     model_capabilities,
     cache,
     logs,
+    knowledge,
 )
 from app.routers import mcp, tools
 from app.routers import chat as chat_router
@@ -195,7 +199,7 @@ async def _print_config_summary(logger):
 
         logger.info("=" * 70)
     except Exception as e:
-        logger.error(f"Failed to print config summary: {e}")
+        logger.error(f"Failed to print config summary: {e}", exc_info=True)
 
 
 async def _init_database(logger):
@@ -207,6 +211,49 @@ async def _init_database(logger):
 
     user_service.set_database(get_mongo_db())
     logger.info("✅ UserService 数据库连接已初始化")
+
+
+async def _wire_module_injections(logger):
+    """跨模块依赖注入接线（依赖方向统一为应用层 → 各模块）。
+
+    - llm：系统配置加载器与 token 用量记录（llm 不再 import services）
+    - data.knowledge：向量模型配置解析（data 不再 import llm）
+    - 业务集合索引保障（core.database 不再 import data.storage）
+    """
+    try:
+        from app.services.config import config_service
+        from app.llm import providers as llm_providers
+
+        llm_providers.set_system_config_loader(config_service.get_system_config)
+        logger.info("✅ llm 系统配置加载器已注入")
+    except Exception as e:
+        logger.warning(f"⚠️ llm 系统配置加载器注入失败: {e}")
+
+    try:
+        from app.llm import runner as llm_runner
+        from app.services.token_usage_recorder import token_usage_recorder
+
+        llm_runner.set_usage_recorder(token_usage_recorder.record)
+        logger.info("✅ llm token 用量记录已注入")
+    except Exception as e:
+        logger.warning(f"⚠️ llm token 用量记录注入失败: {e}")
+
+    try:
+        from app.data.knowledge import config as kb_config
+        from app.llm.providers import resolve_embedding_config
+
+        kb_config.set_embedding_config_resolver(resolve_embedding_config)
+        logger.info("✅ 知识库向量配置解析器已注入")
+    except Exception as e:
+        logger.warning(f"⚠️ 知识库向量配置解析器注入失败: {e}")
+
+    try:
+        from app.data.core.interface import DataInterface
+
+        await DataInterface.get_instance().ensure_indexes()
+        logger.info("✅ 业务集合索引保障完成")
+    except Exception as e:
+        logger.warning(f"⚠️ 业务集合索引创建失败: {e}")
 
 
 async def _init_secrets(logger):
@@ -255,7 +302,7 @@ async def _init_config_bridge(logger):
         if not bridge_success:
             logger.warning("⚠️  配置桥接未成功完成，TradingAgents 将使用 .env 文件中的配置")
     except asyncio.TimeoutError:
-        logger.error("❌ 配置桥接超时（30 秒），启动流程将降级使用 .env 配置")
+        logger.error("❌ 配置桥接超时（30 秒），启动流程将降级使用 .env 配置", exc_info=True)
     except Exception as e:
         logger.warning(f"⚠️  配置桥接失败: {e}")
 
@@ -293,6 +340,40 @@ async def _init_scheduler(logger):
     engine = SchedulerEngine(scheduler=apscheduler)
     engine.start()
 
+    # 交易时段每 6 分钟用腾讯财经抓取全市场快照，AKShare 免费回退。
+    if settings.QUOTES_INGEST_ENABLED:
+        from apscheduler.triggers.interval import IntervalTrigger
+        from app.data.sync.quotes_ingestion_service import QuotesIngestionService
+
+        quotes_service = QuotesIngestionService()
+        await quotes_service.ensure_indexes()
+        apscheduler.add_job(
+            quotes_service.run_once,
+            trigger=IntervalTrigger(
+                seconds=settings.QUOTES_INGEST_INTERVAL_SECONDS,
+                timezone=settings.TIMEZONE,
+            ),
+            id="quotes_ingestion_service",
+            name="腾讯实时行情入库",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            "腾讯实时行情入库已配置: 每 %d 秒",
+            settings.QUOTES_INGEST_INTERVAL_SECONDS,
+        )
+
+    # 推荐生成不是数据域同步任务；只注册该消费任务，不复活旧启动同步链。
+    from app.worker.screening_jobs import register_screening_jobs
+
+    register_screening_jobs(apscheduler)
+
+    # User-enabled research is also a consumer, separate from bulk data sync.
+    from app.worker.research_tracking_jobs import register_research_tracking_jobs
+
+    register_research_tracking_jobs(apscheduler)
+
     # 启动调度任务监控（超时检测、卡住任务恢复、执行统计、手动触发并发保护）。
     # H1 修复：此前 SchedulerMonitor.start() 从未被调用，导致 _get_monitor()
     # 永远返回 None，手动触发并发保护、超时检测、统计全部失效。
@@ -305,9 +386,39 @@ async def _init_scheduler(logger):
     set_scheduler_instance(apscheduler)
     logger.info("调度器服务已初始化（统一调度引擎）")
 
+    if settings.FREE_DATA_AUTO_BACKFILL_ENABLED:
+        from app.core.task_registry import task_registry
+
+        task_registry.register(
+            _run_initial_free_data_backfill(engine, logger),
+            name="initial_free_data_backfill",
+            critical=False,
+        )
+
+    from app.worker.scheduler_setup import register_knowledge_jobs
+    register_knowledge_jobs(apscheduler)
+
+    # 决策结算记分：每日收盘数据入库后结算到期决策（P0）
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+
+        from app.services.settlement_service import run_settlement_job
+        from app.worker.scheduler_setup import add_resilient_job
+
+        add_resilient_job(
+            apscheduler,
+            run_settlement_job,
+            CronTrigger(hour=20, minute=30, timezone=settings.TIMEZONE),
+            id="decision_settlement_daily",
+            name="决策结算记分",
+        )
+        logger.info("决策结算 job 已注册（每日 20:30）")
+    except Exception as e:
+        logger.warning(f"决策结算 job 注册失败（不阻塞应用）: {e}", exc_info=True)
+
     # 数据新鲜度巡检（catchup 兜底）：启动延迟巡检一次 + 周期巡检。
     # cron 的 misfire 过期即丢弃，停机期间错过的交易日由巡检发现落后并补数。
-    if getattr(settings, "DATA_FRESHNESS_PATROL_ENABLED", True):
+    if settings.DATA_FRESHNESS_PATROL_ENABLED:
         try:
             from app.core.task_registry import task_registry
             from app.data.scheduler.freshness_patrol import (
@@ -331,15 +442,47 @@ async def _init_scheduler(logger):
 
     # 按需刷新队列消费器：打通 reader(stale) → Redis 队列 → 按需增量刷新闭环。
     # 此前队列只有生产者（点开 K 线图触发），消费侧缺失导致刷新消息永不执行。
-    try:
-        from app.data.scheduler.refresh_consumer import start_refresh_consumer
+    if settings.DATA_REFRESH_CONSUMER_ENABLED:
+        try:
+            from app.data.scheduler.refresh_consumer import start_refresh_consumer
 
-        start_refresh_consumer()
-        logger.info("✅ 按需刷新队列消费器已启动")
-    except Exception as e:
-        logger.warning(f"⚠️ 刷新队列消费器启动失败（不阻塞应用）: {e}", exc_info=True)
+            start_refresh_consumer()
+            logger.info("✅ 按需刷新队列消费器已启动")
+        except Exception as e:
+            logger.warning(f"⚠️ 刷新队列消费器启动失败（不阻塞应用）: {e}", exc_info=True)
 
     return apscheduler
+
+
+async def _run_initial_free_data_backfill(engine: SchedulerEngine, logger) -> None:
+    """执行可续跑的免费冷启动补齐，不覆盖已有用户数据。"""
+    from app.data.core.interface import DataInterface
+
+    di = DataInterface.get_instance()
+    targets = [
+        ("daily_quotes", "full", "duckdb"),
+        ("daily_indicators", "incremental", "tencent"),
+        ("financial_data", "incremental", "akshare"),
+        ("market_quotes", "full", "tencent"),
+        ("news", "incremental", "akshare"),
+    ]
+    try:
+        stats = await di.get_domain_stats("CN", [item[0] for item in targets])
+        for domain, mode, source in targets:
+            records = int(stats.get(domain, {}).get("records") or 0)
+            # 日线始终执行一次：空库走受限全量，部分库走增量并重叠若干天，
+            # 从而能在上次冷启动被重启打断时安全续跑。其它快照域有记录即保留。
+            if domain == "daily_quotes":
+                mode = "full" if records == 0 else "incremental"
+            elif records > 0:
+                continue
+            logger.info("冷启动免费数据补齐: CN/%s source=%s", domain, source)
+            await engine.trigger_job("CN", domain, mode=mode, source=source)
+        logger.info("冷启动免费数据补齐完成")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error("冷启动免费数据补齐失败: %s", exc, exc_info=True)
 
 
 async def _init_mcp(logger):
@@ -359,7 +502,7 @@ async def _init_mcp(logger):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"MCP 健康检查失败: {e}")
+                logger.error(f"MCP 健康检查失败: {e}", exc_info=True)
                 await asyncio.sleep(30)
 
     # 通过 task_registry 注册（critical=False：shutdown 时直接 cancel）
@@ -388,7 +531,7 @@ def _check_default_secrets(logger: logging.Logger):
         if not is_using_default_secret(env_key):
             continue
         if is_production:
-            logger.error(
+            logger.warning(
                 f"{'!' * 70}\n"
                 f"  FATAL: {env_key} 使用了默认/示例值，生产环境禁止启动！\n"
                 f"  请在 .env 中设置强随机密钥后重试。\n"
@@ -403,12 +546,8 @@ def _check_default_secrets(logger: logging.Logger):
         )
 
 
-async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    setup_logging()
-    logger = logging.getLogger("app.main")
-
-    # 设置默认异步线程池上限（影响 asyncio.to_thread / run_in_executor 默认池）
+def _setup_async_runtime(logger):
+    """设置默认异步线程池上限（影响 asyncio.to_thread / run_in_executor 默认池）。"""
     try:
         import asyncio as _asyncio
         from concurrent.futures import ThreadPoolExecutor
@@ -420,35 +559,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ 设置默认线程池上限失败: {e}")
 
-    # 验证启动配置
+
+def _validate_startup(logger):
+    """启动配置校验 + 默认密钥安全检查。"""
     from app.core.startup_validator import validate_startup_config
 
     validate_startup_config()
-
-    # 安全检查：默认密钥告警
     _check_default_secrets(logger)
 
-    await _init_database(logger)
 
-    # 注册主事件循环，供 worker thread 中的 async 操作使用
-    # 注意：必须用 get_running_loop() 而非 get_event_loop()
-    # - lifespan 在已运行的 loop 中执行，get_event_loop() 在 Python 3.12+ 抛 DeprecationWarning
-    # - get_event_loop() 在没有 running loop 时会创建新 loop，但 lifespan 不会用它
+def _register_main_loop(logger):
+    """注册主事件循环（async_utils 桥与 token 用量记录器的跨线程写入依赖）。
+
+    必须用 get_running_loop() 而非 get_event_loop()：lifespan 在已运行的
+    loop 中执行，get_event_loop() 在 Python 3.12+ 抛 DeprecationWarning。
+    """
     from app.core.async_utils import set_main_loop
 
     set_main_loop(asyncio.get_running_loop())
 
-    # 注入主循环给 token 用量记录器（跨线程 fire-and-forget 写 Mongo，模式同 analysis_events）
     from app.services.token_usage_recorder import token_usage_recorder
 
     token_usage_recorder.set_server_loop(asyncio.get_running_loop())
 
-    await _init_secrets(logger)
-    await _init_system_defaults(logger)
 
-    # ==================== 工作流/智能体种子同步（幂等） ====================
-    # agent_specs / workflow_specs 注入与升级；首次迁移会保留旧 YAML 中的用户修改。
-    # 失败不阻断启动——store 读取路径自带本地种子降级。
+def _sync_workflow_seeds(logger):
+    """工作流/智能体种子同步（幂等；失败不阻断——读取路径自带本地种子降级）。"""
     try:
         from app.engine.orchestrator.workflow import seeder as workflow_seeder
 
@@ -456,12 +592,141 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ 工作流种子同步失败（读取将降级本地种子）: {e}", exc_info=True)
 
+
+def _start_source_health_monitor(logger):
+    """启动数据源健康监控（每 30s 刷入 MongoDB），返回实例供 shutdown 停止。"""
+    from app.data.monitoring.source_health import SourceHealthMonitor
+
+    monitor = SourceHealthMonitor()
+    monitor.start()
+    logger.info("✅ 数据源健康监控已启动（每 30s 刷入 MongoDB）")
+    return monitor
+
+
+async def _ensure_skill_dependencies(logger):
+    """Skill 依赖启动时重装（幂等；容器重启后 site-packages 会丢失）。
+
+    自动安装可在 settings.SKILL_AUTO_INSTALL=false 时关闭。
+    """
+    try:
+        from app.engine.tools.skill.dependency_installer import (
+            ensure_all_skills_dependencies,
+        )
+
+        result = await ensure_all_skills_dependencies()
+        logger.info(
+            f"✅ Skill 依赖检查完成: total={result['total']}, "
+            f"installed={result['installed']}, "
+            f"failed={result['failed']}, skipped={result['skipped']}"
+        )
+    except Exception as e:
+        logger.warning(f"⚠️  Skill 依赖启动安装失败（不阻塞启动）: {e}")
+
+
+async def _shutdown_backend(logger, scheduler, health_monitor):
+    """关闭时清理（顺序：先停止产生新任务的服务 → 等待 task_registry 完成 → 关闭 DB）。"""
+    # 0a. 停止 Redis 自愈协程
+    try:
+        from app.middleware.rate_limit import stop_redis_recovery_loop
+
+        stop_redis_recovery_loop()
+    except Exception as e:
+        logger.warning(f"Redis 自愈协程停止失败: {e}")
+
+    # 0. 停止数据源健康监控
+    try:
+        health_monitor.stop()
+        logger.info("🛑 数据源健康监控已停止")
+    except Exception as e:
+        logger.warning(f"数据源健康监控停止失败: {e}")
+
+    # 1. MCP 健康检查任务由 task_registry.shutdown 统一 cancel（见下方 4.5）
+    # 这里仅关闭 MCP 连接
+    try:
+        from app.llm.mcp import service as mcp_service
+
+        await mcp_service.shutdown()
+        logger.info("🛑 MCP 连接已关闭")
+    except Exception as e:
+        logger.warning(f"MCP 连接关闭失败: {e}")
+
+    # 3. 停止调度监控（必须在调度器之前停止）
+    try:
+        from app.data.scheduler.monitors import SchedulerMonitor
+
+        monitor = SchedulerMonitor()
+        monitor.stop()
+        logger.info("🛑 调度任务监控已停止")
+    except Exception as e:
+        logger.warning(f"调度任务监控停止失败: {e}")
+
+    # 3.1 停止调度器
+    if scheduler:
+        try:
+            scheduler.shutdown(wait=True)
+            logger.info("🛑 Scheduler stopped")
+        except Exception as e:
+            logger.warning(f"Scheduler shutdown error: {e}")
+
+    # 4. 关闭分析服务线程池
+    try:
+        from app.services.analysis import get_analysis_service
+
+        svc = get_analysis_service()
+        svc._shutdown_pool(wait=True)
+        logger.info("🛑 Analysis service thread pool stopped")
+    except Exception as e:
+        logger.warning(f"Analysis service thread pool shutdown error: {e}")
+
+    # 4.5 等待 task_registry 中所有 critical 后台任务完成（如操作日志 flush）
+    # 必须在 close_db 之前，否则 critical 任务写入会失败
+    try:
+        from app.core.task_registry import task_registry
+
+        await task_registry.shutdown(timeout=5.0)
+        stats = task_registry.get_stats()
+        logger.info(
+            f"🛑 TaskRegistry shutdown 完成: created={stats['total_created']} "
+            f"completed={stats['total_completed']} failed={stats['total_failed']}"
+        )
+    except Exception as e:
+        logger.warning(f"TaskRegistry shutdown 失败: {e}")
+
+    # 5. 关闭数据库连接（先失效数据侧桥接缓存，防重连后指向已关闭实例）
+    try:
+        from app.data.core.interface import DataInterface
+
+        DataInterface.get_instance().reset_connections()
+    except Exception as e:
+        logger.debug(f"数据侧连接缓存重置失败（可能未初始化）: {e}")
+    await close_db()
+    logger.info("TradingAgents FastAPI backend stopped")
+
+
+@asynccontextmanager
+async def _managed_lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    setup_logging()
+    logger = logging.getLogger("app.main")
+
+    _setup_async_runtime(logger)
+    _validate_startup(logger)
+
+    await _init_database(logger)
+    await _wire_module_injections(logger)
+    _register_main_loop(logger)
+
+    await _init_secrets(logger)
+    await _init_system_defaults(logger)
+
+    _sync_workflow_seeds(logger)
+
     await _migrate_protocol_to_providers(logger)
     await _init_config_bridge(logger)
     await _apply_dynamic_settings(logger)
 
     # 启动 Redis 自愈协程（限流中间件依赖）
-    from app.middleware.rate_limit import start_redis_recovery_loop, stop_redis_recovery_loop
+    from app.middleware.rate_limit import start_redis_recovery_loop
 
     start_redis_recovery_loop()
 
@@ -486,104 +751,36 @@ async def lifespan(app: FastAPI):
         logger.error(f"❌ MCP 初始化失败: {e}", exc_info=True)
         logger.warning("⚠️  应用将在 MCP 功能不可用的情况下继续运行")
 
-    # ==================== 数据源健康监控 ====================
-    from app.data.monitoring.source_health import SourceHealthMonitor
+    health_monitor = _start_source_health_monitor(logger)
 
-    health_monitor = SourceHealthMonitor()
-    health_monitor.start()
-    logger.info("✅ 数据源健康监控已启动（每 30s 刷入 MongoDB）")
-
-    # ==================== Skill 依赖启动时重装（幂等） ====================
-    # 容器重启后 site-packages 会丢失，此处从 skill_state 重装已记录的依赖。
-    # 自动安装可在 settings.SKILL_AUTO_INSTALL=false 时关闭。
-    try:
-        from app.engine.tools.skill.dependency_installer import (
-            ensure_all_skills_dependencies,
-        )
-
-        result = await ensure_all_skills_dependencies()
-        logger.info(
-            f"✅ Skill 依赖检查完成: total={result['total']}, "
-            f"installed={result['installed']}, "
-            f"failed={result['failed']}, skipped={result['skipped']}"
-        )
-    except Exception as e:
-        logger.warning(f"⚠️  Skill 依赖启动安装失败（不阻塞启动）: {e}")
+    await _ensure_skill_dependencies(logger)
 
     try:
         yield
     finally:
-        # 关闭时清理（顺序：先停止产生新任务的服务 → 等待 task_registry 完成 → 关闭 DB）
-        # 0a. 停止 Redis 自愈协程
-        try:
-            from app.middleware.rate_limit import stop_redis_recovery_loop
+        await _shutdown_backend(logger, scheduler, health_monitor)
 
-            stop_redis_recovery_loop()
-        except Exception as e:
-            logger.warning(f"Redis 自愈协程停止失败: {e}")
 
-        # 0. 停止数据源健康监控
-        try:
-            health_monitor.stop()
-            logger.info("🛑 数据源健康监控已停止")
-        except Exception as e:
-            logger.warning(f"数据源健康监控停止失败: {e}")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Publish lifecycle state before cleanup can invalidate request resources."""
+    from app.core.service_lifecycle import ServiceLifecycle
 
-        # 1. MCP 健康检查任务由 task_registry.shutdown 统一 cancel（见下方 4.5）
-        # 这里仅关闭 MCP 连接
-        try:
-            from app.llm.mcp import service as mcp_service
-
-            await mcp_service.shutdown()
-            logger.info("🛑 MCP 连接已关闭")
-        except Exception as e:
-            logger.warning(f"MCP 连接关闭失败: {e}")
-
-        # 3. 停止调度监控（必须在调度器之前停止）
-        try:
-            from app.data.scheduler.monitors import SchedulerMonitor
-
-            monitor = SchedulerMonitor()
-            monitor.stop()
-            logger.info("🛑 调度任务监控已停止")
-        except Exception as e:
-            logger.warning(f"调度任务监控停止失败: {e}")
-
-        # 3.1 停止调度器
-        if scheduler:
+    state = ServiceLifecycle()
+    app.state.service_lifecycle = state
+    try:
+        async with _managed_lifespan(app):
+            state.mark_ready()
             try:
-                scheduler.shutdown(wait=True)
-                logger.info("🛑 Scheduler stopped")
-            except Exception as e:
-                logger.warning(f"Scheduler shutdown error: {e}")
-
-        # 4. 关闭分析服务线程池
-        try:
-            from app.services.analysis_service import get_analysis_service
-
-            svc = get_analysis_service()
-            svc._shutdown_pool(wait=True)
-            logger.info("🛑 Analysis service thread pool stopped")
-        except Exception as e:
-            logger.warning(f"Analysis service thread pool shutdown error: {e}")
-
-        # 4.5 等待 task_registry 中所有 critical 后台任务完成（如操作日志 flush）
-        # 必须在 close_db 之前，否则 critical 任务写入会失败
-        try:
-            from app.core.task_registry import task_registry
-
-            await task_registry.shutdown(timeout=5.0)
-            stats = task_registry.get_stats()
-            logger.info(
-                f"🛑 TaskRegistry shutdown 完成: created={stats['total_created']} "
-                f"completed={stats['total_completed']} failed={stats['total_failed']}"
-            )
-        except Exception as e:
-            logger.warning(f"TaskRegistry shutdown 失败: {e}")
-
-        # 5. 关闭数据库连接
-        await close_db()
-        logger.info("TradingAgents FastAPI backend stopped")
+                yield
+            finally:
+                state.mark_stopping()
+    except BaseException:
+        state.mark_failed()
+        raise
+    finally:
+        if state.phase != "failed":
+            state.mark_stopped()
 
 
 # 创建FastAPI应用
@@ -727,6 +924,8 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(analysis.router)
 app.include_router(reports.router)
+app.include_router(jev_decisions.router)
+app.include_router(research_tracking.router)
 app.include_router(screening.router)
 app.include_router(favorites.router)
 app.include_router(stocks_router.router)
@@ -756,9 +955,15 @@ app.include_router(registry_router.router)
 
 # Skill 管理
 app.include_router(skills_router.router)
+app.include_router(knowledge.router)
 
 # 通知模块（REST）
 app.include_router(notifications_router.router)
+
+# 决策结算记分卡
+from app.routers import settlement as settlement_router  # noqa: E402
+
+app.include_router(settlement_router.router)
 
 # WebSocket 通知模块
 app.include_router(websocket_notifications_router.router)

@@ -1,0 +1,6 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:report-evidence-df25c8dd
+    pull_policy: never
+  frontend:
+    image: tradingagents-cn-hub-frontend:report-evidence-df25c8dd

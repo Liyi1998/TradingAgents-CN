@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:conditional-display-50f03f2c
+  frontend:
+    image: tradingagents-cn-hub-frontend:conditional-display-50f03f2c

@@ -59,7 +59,7 @@ async def fetch_intraday_quotes(
                 from app.data.sources.cn.akshare.api.adj_factors import _to_sina_symbol
                 wait_rate_limit()
                 return ak.stock_zh_a_minute(
-                    symbol=_to_sina_symbol(code), period=period
+                    symbol=_to_sina_symbol(code), period=period, adjust=""
                 )
 
         df = await asyncio.to_thread(_fetch)
@@ -78,5 +78,17 @@ async def fetch_intraday_quotes(
         logger.warning(f"AKShare 分钟线返回空: code={code}")
         raise DataNotFoundError("akshare", _DOMAIN, f"code={code} 无分钟线数据")
 
+    # Both APIs return a single requested security but omit its code and period.
+    # Carry the request identity into the adapter; otherwise it writes 000000 and
+    # different stocks overwrite each other's same-time bars.
+    df = df.copy()
+    df["code"] = str(code).split(".", 1)[0].zfill(6)
+    df["freq"] = f"{period}min"
+    df["ohlc_kind"] = "native_bar"
+    df["price_basis"] = "raw"
+    df["volume_unit"] = "share"
+    has_turnover = "成交额" in df.columns or "amount" in df.columns
+    df["amount_unit"] = "CNY" if has_turnover else None
+    df["unit_conversion"] = "native_share;native_CNY_turnover" if has_turnover else "native_share;turnover_not_reported"
     logger.debug(f"AKShare 分钟线: {code} freq={period} {len(df)} 条")
     return df

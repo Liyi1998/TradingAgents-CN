@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:manual-budget-93141add
+  frontend:
+    image: tradingagents-cn-hub-frontend:manual-budget-93141add

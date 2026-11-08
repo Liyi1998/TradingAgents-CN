@@ -36,14 +36,36 @@ tushare_us:
     backoff_base: 1.0
 
 akshare:
-  rate_per_minute: 120
-  polite_interval_ms: 500
+  # a-stock-data 的实测经验：东财系列批量请求应串行且间隔 >=1s。
+  rate_per_minute: 50
+  polite_interval_ms: 1100
   circuit_initial_cooldown: 60
   circuit_max_cooldown: 600
   requires_token: false
   retry:
     max_retries: 1
     backoff_base: 1.0
+
+duckdb:
+  rate_per_minute: 600
+  polite_interval_ms: 20
+  circuit_initial_cooldown: 10
+  circuit_max_cooldown: 120
+  requires_token: false
+
+tencent:
+  rate_per_minute: 120
+  polite_interval_ms: 500
+  circuit_initial_cooldown: 30
+  circuit_max_cooldown: 300
+  requires_token: false
+
+sina:
+  rate_per_minute: 120
+  polite_interval_ms: 500
+  circuit_initial_cooldown: 30
+  circuit_max_cooldown: 300
+  requires_token: false
 
 akshare_hk:
   rate_per_minute: 60

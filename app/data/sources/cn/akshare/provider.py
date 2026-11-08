@@ -86,16 +86,36 @@ class AKShareCNProvider(BaseProvider):
             return False
 
     async def get_stock_list(self, **kwargs) -> pd.DataFrame:
-        from .api.stock_basic import fetch_stock_list
+        from .api.stock_basic import fetch_stock_list, fetch_stock_basic_info
+
+        symbol = kwargs.get("symbol")
+        if symbol and symbol != "__all__":
+            info = await fetch_stock_basic_info(str(symbol).split(".")[0].zfill(6))
+            return pd.DataFrame([{
+                "symbol": str(symbol).split(".")[0].zfill(6),
+                "name": info.get("股票简称"),
+                "industry": info.get("行业"),
+                "list_date": info.get("上市时间"),
+            }])
 
         return await fetch_stock_list()
 
-    async def get_daily_quotes(
-        self, symbol: str, start_date: str, end_date: str, **kwargs
+    async def get_trade_calendar(
+        self, exchange: str, start_date: str, end_date: str, **kwargs
     ) -> pd.DataFrame:
-        from .api.daily_quotes import fetch_daily_quotes
+        from .api.trade_calendar import fetch_trade_calendar
 
-        return await fetch_daily_quotes(symbol, start_date, end_date)
+        return await fetch_trade_calendar(exchange, start_date, end_date)
+
+    async def get_daily_quotes(
+        self, symbol: str, start_date: str, end_date: str,
+        adjust: str = "", period: str = "daily", **kwargs
+    ) -> pd.DataFrame:
+        from .api.daily_quotes import fetch_daily_quotes, validate_daily_quote_options
+
+        validate_daily_quote_options(period, adjust)
+        return await fetch_daily_quotes(
+            symbol, start_date, end_date, period=period, adjust=adjust)
 
     async def get_daily_indicators(
         self, symbol: str, start_date: str, end_date: str, **kwargs
@@ -103,6 +123,13 @@ class AKShareCNProvider(BaseProvider):
         from .api.daily_indicators import fetch_daily_indicators_by_symbol
 
         return await fetch_daily_indicators_by_symbol(symbol, start_date, end_date)
+
+    async def get_daily_indicators_batch(
+        self, trade_date: str, **kwargs
+    ) -> pd.DataFrame:
+        from .api.daily_indicators import fetch_daily_indicators_batch
+
+        return await fetch_daily_indicators_batch(trade_date)
 
     async def get_adj_factors(
         self, symbol: str, start_date: str, end_date: str, **kwargs
@@ -138,16 +165,28 @@ class AKShareCNProvider(BaseProvider):
     ) -> pd.DataFrame:
         from .api.news import fetch_news
 
-        result = await fetch_news(symbol=symbol, limit=50)
+        result = await fetch_news(symbol=symbol, limit=50, end_date=end_date,
+                                  include_filings=kwargs.get("include_filings") is True)
         if result and isinstance(result, list):
             return pd.DataFrame(result)
         return None
 
     async def get_market_quotes(self, symbols=None, **kwargs) -> pd.DataFrame:
         from .api.quotes_batch import fetch_batch_quotes
+        from .api.stock_basic import fetch_stock_list
 
-        # 此前硬编码传空列表，导致任何调用都"所有策略链均无数据 (codes=0)"
-        return await fetch_batch_quotes(list(symbols) if symbols else [])
+        requested = [str(item) for item in (symbols or []) if str(item)]
+        if not requested or "__all__" in requested:
+            stocks = await fetch_stock_list()
+            code_col = "code" if "code" in stocks.columns else "symbol"
+            requested = stocks[code_col].astype(str).str.zfill(6).tolist()
+        result = await fetch_batch_quotes(requested)
+        if not result:
+            return pd.DataFrame()
+        frame = pd.DataFrame.from_dict(result, orient="index")
+        if "symbol" not in frame.columns:
+            frame["symbol"] = frame.index.astype(str).str.zfill(6)
+        return frame.reset_index(drop=True)
 
     async def get_intraday_quotes(
         self, symbol: str, start_date: str, end_date: str, **kwargs
@@ -180,9 +219,9 @@ class AKShareCNProvider(BaseProvider):
     async def get_margin_trading(
         self, symbol: str, start_date: str, end_date: str, **kwargs
     ) -> pd.DataFrame:
-        from .api.margin_trading import fetch_margin_trading
+        from app.data.sources.cn.shared.margin_series import fetch_margin_range
 
-        df = await fetch_margin_trading(symbol)
+        df = await fetch_margin_range(symbol, start_date, end_date)
         return _filter_by_date(
             df,
             start_date,
@@ -207,3 +246,10 @@ class AKShareCNProvider(BaseProvider):
         sd = start_date.replace("-", "")
         ed = end_date.replace("-", "")
         return await fetch_block_trade(sd, ed)
+
+    async def get_corporate_actions(
+        self, symbol: str, start_date: str, end_date: str, **kwargs
+    ) -> pd.DataFrame:
+        from .api.corporate_actions import fetch_corporate_actions
+
+        return await fetch_corporate_actions(symbol, start_date, end_date)

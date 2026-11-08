@@ -29,27 +29,49 @@ def _clear_memory_counters():
 
 @pytest.fixture
 async def real_mongo_db():
-    """连接真实 MongoDB（docker 容器），完成后关闭。
-
-    用于验证索引唯一约束、upsert 覆盖行为等模拟库无法验证的语义。
-    """
+    """真实 MongoDB；隔离验收模式按例清空测试记录，保留索引以避免大量库的内存开销。"""
+    import os
     import app.core.database as db_module
+    from app.core.config import settings
     from app.data.storage.mongo.client import reset_client
 
-    # 前序测试可能将 SimulatedMongoDB 泄漏进 _motor_db 缓存；
-    # 先重置，保证本 fixture 期间 get_motor_db() 绑定真实库与当前事件循环
+    isolated = os.getenv("TRADINGAGENTS_ISOLATED_TESTS") == "1"
+    database_name = settings.MONGODB_DATABASE
+    if isolated:
+        from tests.isolated_database import require_isolated_database
+        require_isolated_database()
+    db_module.close_mongo_db_sync()
     reset_client()
-    await db_module.db_manager.init_mongodb()
-    db_module.mongo_client = db_module.db_manager.mongo_client
-    db_module.mongo_db = db_module.db_manager.mongo_db
-    yield db_module.get_mongo_db()
-    await db_module.db_manager.close_connections()
-    db_module.mongo_client = None
-    db_module.mongo_db = None
-    # Motor 客户端绑定到当前测试的事件循环；pytest-asyncio 每个测试新开循环，
-    # 不重置会导致后续测试复用已关闭循环上的客户端（"Event loop is closed"）
-    from app.data.storage.mongo.client import reset_client
-    reset_client()
+
+    async def clear_owned_records():
+        # 只清显式隔离宿主/端口上的本次测试库，绝不枚举或修改其他数据库。
+        require_isolated_database()
+        assert settings.MONGODB_DATABASE == database_name
+        db = db_module.db_manager.mongo_db
+        assert db.name == database_name
+        for name in await db.list_collection_names():
+            if not name.startswith("system."):
+                await db[name].delete_many({})
+
+    try:
+        await db_module.db_manager.init_mongodb()
+        db_module.mongo_client = db_module.db_manager.mongo_client
+        db_module.mongo_db = db_module.db_manager.mongo_db
+        if isolated:
+            await clear_owned_records()
+        from app.data.core.interface import DataInterface
+        await DataInterface.get_instance().ensure_indexes()
+        yield db_module.get_mongo_db()
+    finally:
+        try:
+            if isolated and db_module.db_manager.mongo_db is not None:
+                await clear_owned_records()
+        finally:
+            db_module.close_mongo_db_sync()
+            await db_module.db_manager.close_connections()
+            db_module.mongo_client = None
+            db_module.mongo_db = None
+            reset_client()
 
 
 # ============================================================
@@ -236,6 +258,8 @@ async def _seed_factor_stocks(db, symbols_cfg: dict, dates: list):
             {"symbol": sym}, {"$set": {
                 "symbol": sym, "market": "CN", "name": cfg["name"],
                 "industry": cfg["industry"], "data_source": "test",
+                "industry_source": "test:dated_industry", "industry_classification": "test_taxonomy",
+                "industry_as_of": dates[0], "industry_contract": "vendor_industry_v1",
             }}, upsert=True)
         vol = cfg["volume"] if isinstance(cfg["volume"], list) \
             else [cfg["volume"]] * len(dates)
@@ -244,20 +268,28 @@ async def _seed_factor_stocks(db, symbols_cfg: dict, dates: list):
             "close": c, "volume": v, "amount": cfg["amount"],
             "turnover_rate": t, "pct_chg": 0.0,
             "data_source": "test",
-        } for d, c, v, t in zip(dates[-120:], cfg["close"][-120:],
-                                vol[-120:], cfg["turnover"][-120:])]
+            "price_basis": "qfq", "adjustment_contract": "cn_adjusted_quotes_v1",
+            "adjustment_as_of": dates[-1], "amount_unit": "CNY", "volume_unit": "share",
+        } for d, c, v, t in zip(dates, cfg["close"], vol, cfg["turnover"])]
         await q_coll.insert_many(q_docs)
         # indicators 覆盖全部唯一交易日（估值分位窗口数据驱动，不足 500 不影响）
         i_docs = [{
             "symbol": sym, "trade_date": d, "pe_ttm": cfg["pe"], "pb": cfg["pb"],
             "dividend_yield": cfg["dv"], "volume_ratio": cfg["vr"],
             "data_source": "test",
+            "field_provenance": {field: dict(data_source="test", as_of=d,
+                date_verified=True, method="test_declared_contract", basis=basis)
+                for field, basis in {"pe_ttm": "ttm", "pb": "vendor_pb",
+                    "dividend_yield": "annual", "volume_ratio": "reported"}.items()},
         } for d in dates]
         await i_coll.insert_many(i_docs)
         for d in dates[-5:]:
             await m_coll.insert_one({
                 "symbol": sym, "trade_date": d,
-                "main_net_inflow": cfg["inflow"], "data_source": "test",
+                "main_net_inflow": cfg["inflow"], "data_source": "akshare",
+                "flow_source": "eastmoney", "flow_basis": "eastmoney_order_size_v1",
+                "amount_unit": "CNY", "flow_date_verified": True,
+                "flow_date_basis": "source_row_date",
             })
         for rp, np_ in [("2025-06-30", cfg["np_prev"]), ("2026-06-30", cfg["np_cur"])]:
             await f_coll.update_one(
@@ -265,7 +297,9 @@ async def _seed_factor_stocks(db, symbols_cfg: dict, dates: list):
                 {"$set": {
                     "symbol": sym, "report_period": rp,
                     "statement_type": "indicator",
+                    "announce_date": f"{rp[:4]}-08-31",
                     "net_profit": np_, "roe": cfg["roe"],
+                    "net_profit_basis": "attributable",
                     "gross_margin": cfg["gm"], "debt_ratio": cfg["dr"],
                     "data_source": "test",
                 }}, upsert=True)
@@ -323,4 +357,3 @@ async def seed_factor_inputs(real_mongo_db):
         "cfg": _default_factor_seed_cfg(),
     }
     await _cleanup_factor_seeds(real_mongo_db, SEED_FACTOR_SYMBOLS)
-

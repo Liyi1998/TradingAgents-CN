@@ -108,7 +108,7 @@ async def get_quote(
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"获取{market}股票{code}行情失败: {e}")
+            logger.error(f"获取{market}股票{code}行情失败: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=safe_error_message(e, "获取行情失败")
@@ -118,7 +118,7 @@ async def get_quote(
     code6 = normalized_code
     service = UnifiedStockService()
 
-    data = await service.get_cn_quote_with_basic_info(code6)
+    data = await service.get_cn_quote_with_basic_info(code6, force_refresh=force_refresh)
     if not data:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到该股票的任何信息")
 
@@ -164,7 +164,7 @@ async def get_fundamentals(
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"获取{market}股票{code}基础信息失败: {e}")
+            logger.error(f"获取{market}股票{code}基础信息失败: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=safe_error_message(e, "获取基础信息失败")
@@ -251,14 +251,19 @@ async def get_kline(
                 if aggregated and isinstance(aggregated, list):
                     kline_data = aggregated
 
+            freshness = result.get("freshness", "unknown")
+            freshness_val = getattr(freshness, "value", freshness)
             return ok(data={
-                'code': normalized_code,
+                'symbol': normalized_code,
+                'code': normalized_code,  # 兼容键（已废弃，使用 symbol）
                 'period': period,
                 'items': kline_data,
-                'source': result.get("freshness", "unknown")
+                'freshness': freshness_val,
+                # 兼容键：历史上 freshness 被错标为 source，前端迁移后移除
+                'source': freshness_val,
             })
         except Exception as e:
-            logger.error(f"获取{market}股票{code}K线数据失败: {e}")
+            logger.error(f"获取{market}股票{code}K线数据失败: {e}", exc_info=True)
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=safe_error_message(e, "获取K线数据失败")
@@ -617,7 +622,7 @@ async def get_quotes_sync_status(
 ):
     """获取实时行情同步状态（替代原 /api/stock-data/sync-status/quotes）"""
     try:
-        from app.services.quotes_ingestion_service import QuotesIngestionService
+        from app.data.sync.quotes_ingestion_service import QuotesIngestionService
         service = QuotesIngestionService()
         status_data = await service.get_sync_status()
         return ok(data=status_data)

@@ -12,11 +12,10 @@ _BATCH_SIZE = 500
 
 
 async def batched_bulk_write(collection, ops: List[UpdateOne], batch_size: int = _BATCH_SIZE) -> int:
-    """分批执行 bulk_write，累计返回 upserted + modified 计数。
+    """Return confirmed upserted + matched records, not only changed documents.
 
-    H7 修复：中间批次失败时记录已成功计数并继续后续批次，而非直接上抛。
-    这样调用方即使在部分批次失败时也能拿到已写入的数量，便于补偿重试。
-    全部批次失败时上抛最后一个异常让调用方感知。
+    A duplicate successful refresh remains successful. Any failed batch raises;
+    callers must not advance a whole-range checkpoint after partial writes.
     """
     if not ops:
         return 0
@@ -32,7 +31,7 @@ async def batched_bulk_write(collection, ops: List[UpdateOne], batch_size: int =
         try:
             result: BulkWriteResult = await collection.bulk_write(batch, ordered=False)
             total_upserted += result.upserted_count
-            total_modified += result.modified_count
+            total_modified += result.matched_count
         except Exception as e:
             failed_batches += 1
             last_error = e
@@ -50,7 +49,7 @@ async def batched_bulk_write(collection, ops: List[UpdateOne], batch_size: int =
     elif len(ops) > batch_size:
         logger.debug(f"分批写入完成: {len(ops)} 条, {total_batches} 批")
 
-    if failed_batches == total_batches and last_error:
+    if failed_batches > 0 and last_error:
         raise last_error
 
     return total_upserted + total_modified

@@ -69,7 +69,8 @@ export const useAnalysisProcessStore = defineStore('analysisProcess', () => {
   const progressInfo = ref<ProgressInfo | null>(null)
   /** report_ready 产物（智能体实时报告），按到达序，report_key 去重 */
   const reports = ref<AgentReport[]>([])
-  const seenReportKeys = new Set<string>()
+  const reportSeq = new Map<string, number>()
+  const lifecycleSeq = new Map<string, number>()
 
   // ── 渲染窗口 state ──
   /** 渲染窗口大小：store.events 全量保存，每个 agent 各取最近 RENDER_WINDOW 条（per-agent 窗口，
@@ -205,11 +206,12 @@ export const useAnalysisProcessStore = defineStore('analysisProcess', () => {
     if (ev.event_type === 'progress') return
     ensureAgent(ev.agent_key)
     if (insert) insertEvent(ev)
-    if (ev.event_type === 'agent_end') {
-      agentStatus.value[ev.agent_key] = 'completed'
-    } else if (ev.event_type === 'agent_start') {
-      // 重连回放场景下 agent 可能重新开始
-      agentStatus.value[ev.agent_key] = 'running'
+    if (['agent_start', 'agent_end', 'report_reused'].includes(ev.event_type)) {
+      // Older replay pages must not overwrite a later recovery's lifecycle state.
+      if (ev.seq >= (lifecycleSeq.get(ev.agent_key) ?? -1)) {
+        lifecycleSeq.set(ev.agent_key, ev.seq)
+        agentStatus.value[ev.agent_key] = ev.event_type === 'agent_start' ? 'running' : 'completed'
+      }
       const name = (ev.payload as Record<string, unknown> | undefined)?.name
       if (typeof name === 'string' && name) agentLabels.value[ev.agent_key] = name
     } else if (ev.event_type === 'user_message_injected' && ev.seq >= 0) {
@@ -228,23 +230,19 @@ export const useAnalysisProcessStore = defineStore('analysisProcess', () => {
       const key = typeof p.report_key === 'string' && p.report_key
         ? p.report_key
         : `${ev.agent_key}:${ev.seq}`
-      const content = typeof p.content === 'string' ? p.content : ''
-      const submission =
-        p.submission === 'structured' || p.submission === 'fallback_text' ? p.submission : ''
-      if (seenReportKeys.has(key)) {
-        const existing = reports.value.find(r => r.key === key)
-        if (existing) {
-          existing.content = content
-          if (submission) existing.submission = submission
-        }
-      } else {
-        seenReportKeys.add(key)
-        reports.value.push({
+      if (ev.seq > (reportSeq.get(key) ?? -1)) {
+        reportSeq.set(key, ev.seq)
+        const report: { key: string; title: string; content: string; submission: '' | 'structured' | 'fallback_text' } = {
           key,
           title: typeof p.title === 'string' && p.title ? p.title : key,
-          content,
-          submission,
-        })
+          content: typeof p.content === 'string' ? p.content : '',
+          submission: p.submission === 'structured' || p.submission === 'fallback_text' ? p.submission : '',
+        }
+        const index = reports.value.findIndex(r => r.key === key)
+        // A successful recovery must replace the failed placeholder in the live panel.
+        if (index < 0) reports.value.push(report)
+        else reports.value[index] = report
+        if (!agentLabels.value[ev.agent_key]) agentLabels.value[ev.agent_key] = report.title
       }
     }
   }
@@ -569,7 +567,8 @@ export const useAnalysisProcessStore = defineStore('analysisProcess', () => {
     pendingMessages.value = []
     reports.value = []
     progressInfo.value = null
-    seenReportKeys.clear()
+    reportSeq.clear()
+    lifecycleSeq.clear()
     seenEventKeys.clear()
     pendingReceipts.clear()
   }

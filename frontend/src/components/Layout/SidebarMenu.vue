@@ -31,6 +31,7 @@
       </template>
       <el-menu-item index="/analysis/single">单股分析</el-menu-item>
       <el-menu-item index="/analysis/batch">批量分析</el-menu-item>
+      <el-menu-item index="/analysis/research">短线持续研究</el-menu-item>
       <el-menu-item index="/reports">分析报告</el-menu-item>
     </el-sub-menu>
 
@@ -40,10 +41,22 @@
       <template #title>任务中心</template>
     </el-menu-item>
 
+    <!-- 结算记分卡 -->
+    <el-menu-item index="/settlement">
+      <el-icon><Trophy /></el-icon>
+      <template #title>结算记分卡</template>
+    </el-menu-item>
+
     <!-- 学习中心 -->
     <el-menu-item index="/learning">
       <el-icon><Reading /></el-icon>
       <template #title>学习中心</template>
+    </el-menu-item>
+
+    <!-- 知识库 -->
+    <el-menu-item index="/knowledge">
+      <el-icon><Collection /></el-icon>
+      <template #title>知识库</template>
     </el-menu-item>
 
     <!-- 数据中心 (移出3级菜单，作为顶级菜单) -->
@@ -108,9 +121,11 @@ import {
   DataLine,
   TrendCharts,
   List,
+  Trophy,
   Reading,
   Setting,
-  InfoFilled
+  InfoFilled,
+  Collection
 } from '@element-plus/icons-vue'
 
 const route = useRoute()

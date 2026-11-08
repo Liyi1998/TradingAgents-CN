@@ -35,8 +35,16 @@ def get_rate_limiter():
         with _init_lock:
             if _rate_limiter is None:
                 try:
-                    from app.data.sources.cn.eastmoney.direct import ThreadSafeRateLimiter
-                    _rate_limiter = ThreadSafeRateLimiter(min_interval=0.3, burst=3)
+                    from app.data.sources.cn.eastmoney.direct import (
+                        ThreadSafeRateLimiter,
+                    )
+
+                    # 东财系接口对批量并发敏感；与路由层一致，
+                    # 进程内也严格串行，避免 AKShare 内部裸 requests
+                    # 绕过全局 polite interval。
+                    _rate_limiter = ThreadSafeRateLimiter(
+                        min_interval=1.0, burst=1
+                    )
                 except ImportError:
                     _rate_limiter = None
     return _rate_limiter

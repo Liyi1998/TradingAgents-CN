@@ -1,0 +1,15 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:knowledge-688843ac
+    environment:
+      KB_INDEX_ENABLED: "true"
+      KB_RETRIEVAL_ENABLED: "true"
+      SETTLEMENT_REFLECTION_ENABLED: "true"
+      KB_INDEX_INTERVAL_MINUTES: "5"
+      KB_INDEX_MAX_BATCHES: "10"
+      KB_EMBEDDING_BATCH_SIZE: "2"
+      KB_EMBEDDING_MAX_CHARS: "1200"
+      KB_EMBEDDING_TOP_K: "3"
+      KB_EMBEDDING_TIMEOUT_SECONDS: "8"
+      KB_CHROMA_DIR: "data/kb_chroma_20261106"
+      SETTLEMENT_MEMORY_DIR: "data/settlement_memory"
