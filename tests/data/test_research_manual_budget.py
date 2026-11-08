@@ -53,7 +53,7 @@ async def test_legacy_grants_no_longer_cap_usage_or_change_saved_settings(real_m
         budget = await service.budget_state(track, now)
         assert budget["used"] == budget["owner_used"] == 9
         assert budget["manual_extra_used"] == 0 and budget["remaining"] is None and budget["unlimited"]
-        assert track["settings"] == {"auto_enabled": True, "max_calls_per_day": 1, "intraday_enabled": True}
+        assert track["settings"] == {"auto_enabled": True, "max_calls_per_day": 1, "intraday_enabled": True, "structure_auxiliary_enabled": False}
         await service.finish(run, "completed", "仅预算验收，无模型调用")
         await service.release(run)
         queued_auto = await service.enqueue(track["_id"], owner, automatic=True)

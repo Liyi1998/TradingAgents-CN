@@ -270,6 +270,13 @@ class DataInterface:
         from app.data.query.intraday_research import collect
         return await collect(self, symbol, now)
 
+    async def structure_auxiliary_context(self, symbol: str, now) -> Dict:
+        """One symbol's free 30-minute context. Does not refresh the whole market."""
+        if len(symbol) != 6 or not symbol.isascii() or not symbol.isdigit():
+            raise ValueError("仅支持六位A股代码")
+        from app.data.query.structure_auxiliary import collect
+        return await collect(self, symbol, now)
+
     async def analysis_context(self, market: str, as_of: str, sessions: int = 5) -> Dict:
         from app.data.core.analysis_context import build_context
         from app.core.async_utils import await_on_main_loop

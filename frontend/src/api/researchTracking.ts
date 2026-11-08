@@ -78,7 +78,7 @@ export interface TrackingBoard {
   baseline?: TrackingBaseline & { levels: TrackingLevel[]; level_notice: string }
   baselines?: TrackingBaseline[]
   newer_report?: TrackingBaseline | null
-  track: null | { id: string; symbol: string; name: string; baseline_date: string; baseline_analysis_id: string; settings: { auto_enabled: boolean; max_calls_per_day: number; intraday_enabled?: boolean } }
+  track: null | { id: string; symbol: string; name: string; baseline_date: string; baseline_analysis_id: string; settings: { auto_enabled: boolean; max_calls_per_day: number; intraday_enabled?: boolean; structure_auxiliary_enabled?: boolean } }
   versions: { id: string; as_of: string; created_at: string; status: string }[]
   run: null | { id: string; status: string; message: string; model_calls: number; retry_after_at?: string }
   version: null | {
@@ -111,11 +111,12 @@ export interface IntradayCondition {
 }
 export const researchTrackingApi = {
   intraday: (id: string) => ApiClient.get<IntradayResearchValue>(`/api/research-tracking/${id}/intraday`),
+  structureAuxiliary: (id: string) => ApiClient.get<import('@/utils/structureAuxiliary').StructureAuxiliaryValue>(`/api/research-tracking/${id}/structure-auxiliary`),
   list: () => ApiClient.get<TrackingStock[]>('/api/research-tracking/tracks'),
   marketChart: (symbol: string, forceRefresh = false) => ApiClient.get<TrackingMarketChart>(`/api/research-tracking/stocks/${symbol}/market-chart`, { force_refresh: forceRefresh }),
   board: (symbol: string, version_id?: string, baseline_analysis_id?: string) => ApiClient.get<TrackingBoard>(`/api/research-tracking/stocks/${symbol}`, { version_id, baseline_analysis_id }),
   create: (symbol: string) => ApiClient.post(`/api/research-tracking/stocks/${symbol}`, {}),
-  settings: (id: string, value: { auto_enabled: boolean; max_calls_per_day: number; intraday_enabled?: boolean }) => ApiClient.put(`/api/research-tracking/${id}/settings`, value),
+  settings: (id: string, value: { auto_enabled: boolean; max_calls_per_day: number; intraday_enabled?: boolean; structure_auxiliary_enabled?: boolean }) => ApiClient.put(`/api/research-tracking/${id}/settings`, value),
   update: (id: string, retry_failed = false, manual_extra_calls = 0, expected_baseline_analysis_id?: string) => ApiClient.post(`/api/research-tracking/${id}/updates`, { retry_failed, manual_extra_calls, expected_baseline_analysis_id }),
   switchBaseline: (id: string, analysis_id: string, expected_baseline_analysis_id: string) => ApiClient.post(`/api/research-tracking/${id}/baseline`, { analysis_id, expected_baseline_analysis_id })
 }

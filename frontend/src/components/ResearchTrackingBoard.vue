@@ -90,6 +90,7 @@
         </section>
         <WyckoffResearch :value="board.wyckoff" v-model:visible="showWyckoff" :market-date="chartTarget" @view-reference="viewPhaseReference" />
         <IntradayResearch v-if="board?.track" :key="board.track.id" :track-id="board.track.id" :baseline-id="board.track.baseline_analysis_id" :enabled="board.track.settings.intraday_enabled !== false" :historical="intradayHistorical" :busy="busy" @toggle="toggleIntraday" @levels="intradayLevels = $event" />
+        <StructureAuxiliary v-if="board?.track" :key="`${board.track.id}-structure`" :track-id="board.track.id" :baseline-id="board.track.baseline_analysis_id" :enabled="board.track.settings.structure_auxiliary_enabled === true" :historical="intradayHistorical" :busy="busy" @toggle="toggleStructure" @levels="structureLevels = $event" />
       <ChanResearch :value="chan" v-model="chanLayers" :historical="chartMode === 'version'" />
         <el-checkbox v-model="showLevels">图上显示报告点位</el-checkbox>
         <div v-if="chartBars.length" ref="chartContainer" class="tracking-chart" :style="{ height: `${chartHeight}px` }"><v-chart v-if="chartWidth > 0" :option="chart" :update-options="{ replaceMerge: ['series'] }" :init-options="{ height: chartHeight }" autoresize /></div>
@@ -151,6 +152,7 @@ import { trackingAvailability, trackingPointSource } from '@/utils/trackingAvail
 import WyckoffResearch from '@/components/WyckoffResearch.vue'
 import ChanResearch from '@/components/ChanResearch.vue'
 import IntradayResearch from '@/components/IntradayResearch.vue'
+import StructureAuxiliary from '@/components/StructureAuxiliary.vue'
 import ExperienceUsage from '@/components/Settlement/ExperienceUsage.vue'
 
 use([CandlestickChart, BarChart, ScatterChart, LineChart, LabelLayout, GridComponent, TooltipComponent, DataZoomComponent, MarkLineComponent, MarkAreaComponent, CanvasRenderer])
@@ -168,8 +170,9 @@ const levelSource = ref<'review' | 'baseline'>('review')
 const showWyckoff = ref(true)
 const showLevels = ref(true)
 const intradayLevels = ref<TrackingLevel[]>([])
+const structureLevels = ref<TrackingLevel[]>([])
 const intradayHistorical = computed(() => historical.value || chartMode.value !== 'latest' || !!(version.value && board.value?.versions?.[0]?.id !== version.value.id))
-const chartLevels = computed(() => [...(showLevels.value ? displayLevels.value : []), ...(!intradayHistorical.value ? intradayLevels.value : [])])
+const chartLevels = computed(() => [...(showLevels.value ? displayLevels.value : []), ...(!intradayHistorical.value ? intradayLevels.value : []), ...(!intradayHistorical.value ? structureLevels.value : [])])
 const chanLayers = ref({ fractals: false, strokes: true, zones: true, candidates: true })
 const chan = computed(() => chartMode.value === 'latest' ? marketChart.value?.chan : version.value?.snapshot.chan)
 const pointSource = computed(() => trackingPointSource(board.value, levelSource.value))
@@ -270,6 +273,7 @@ async function update(retry: boolean) {
   await mutate(() => researchTrackingApi.update(track.id, retry, 0, track.baseline_analysis_id))
 }
 const toggleIntraday = (enabled: boolean) => mutate(() => researchTrackingApi.settings(board.value!.track!.id, { ...board.value!.track!.settings, intraday_enabled: enabled }))
+const toggleStructure = (enabled: boolean) => mutate(() => researchTrackingApi.settings(board.value!.track!.id, { ...board.value!.track!.settings, structure_auxiliary_enabled: enabled }))
 const toggleAuto = (value: string | number | boolean) => mutate(() => researchTrackingApi.settings(board.value!.track!.id, { ...board.value!.track!.settings, auto_enabled: Boolean(value) }))
 const selectVersion = (id: string) => { chartMode.value = 'version'; levelSource.value = 'review'; load(id, selectedBaseline.value) }
 function viewPhaseReference(value: WyckoffAnnotation) {
@@ -292,7 +296,7 @@ async function switchBaseline() {
   levelSource.value = 'review'; chartMode.value = 'latest'
   await mutate(() => researchTrackingApi.switchBaseline(track.id, next.analysis_id, track.baseline_analysis_id))
 }
-watch(() => props.symbol, () => { sequence++; marketSequence++; clearTimeout(marketTimer); marketChart.value = null; intradayLevels.value = []; marketLoading.value = false; marketError.value = ''; chartMode.value = 'latest'; levelSource.value = 'review'; pointBranch.value = 'held'; clearTimeout(timer); board.value = null; busy.value = false; error.value = ''; emit('tracking-state', false); load() }, { immediate: true })
+watch(() => props.symbol, () => { sequence++; marketSequence++; clearTimeout(marketTimer); marketChart.value = null; intradayLevels.value = []; structureLevels.value = []; marketLoading.value = false; marketError.value = ''; chartMode.value = 'latest'; levelSource.value = 'review'; pointBranch.value = 'held'; clearTimeout(timer); board.value = null; busy.value = false; error.value = ''; emit('tracking-state', false); load() }, { immediate: true })
 onBeforeUnmount(() => { alive = false; sequence++; marketSequence++; clearTimeout(timer); clearTimeout(marketTimer); document.removeEventListener('visibilitychange', visibilityChanged) })
 </script>
 

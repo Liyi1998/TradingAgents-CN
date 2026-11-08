@@ -55,7 +55,7 @@ async def test_switch_keeps_old_versions_quotes_and_baseline_binding(baseline_fl
     await service.switch_baseline(track['_id'], owner, new['analysis_id'], old['analysis_id'])
     current = await service.board('000503', owner)
     assert current['track']['baseline_analysis_id'] == new['analysis_id']
-    assert current['track']['settings'] == {'auto_enabled': True, 'max_calls_per_day': 6, 'intraday_enabled': True}
+    assert current['track']['settings'] == {'auto_enabled': True, 'max_calls_per_day': 6, 'intraday_enabled': True, 'structure_auxiliary_enabled': False}
     assert current['version'] is None and current['run'] is None and current['versions'] == []
     assert current['newer_report'] is None
     assert [b['analysis_id'] for b in current['baselines']] == [new['analysis_id'], old['analysis_id']]

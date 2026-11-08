@@ -73,6 +73,8 @@ class CreateTrack(BaseModel):
 
 class TrackSettings(BaseModel):
     intraday_enabled: StrictBool = True
+    # Separate from intraday tracking and from the paid 19:00 research update.
+    structure_auxiliary_enabled: StrictBool = False
     model_config = ConfigDict(extra="forbid")
     auto_enabled: bool = False
     max_calls_per_day: int = Field(default=6, ge=1, le=12)

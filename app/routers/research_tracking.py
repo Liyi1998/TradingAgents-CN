@@ -55,6 +55,13 @@ async def intraday(track_id: str, user: dict = Depends(get_current_user)):
     return await execute(IntradayResearchService().observe, track_id, str(user["id"]))
 
 
+@router.get("/{track_id}/structure-auxiliary")
+async def structure_auxiliary(track_id: str, user: dict = Depends(get_current_user)):
+    """Opt-in TPO/SMC sidecar. Does not change reports, actions, or Wyckoff."""
+    from app.services.structure_auxiliary import StructureAuxiliaryService
+    return await execute(StructureAuxiliaryService().observe, track_id, str(user["id"]))
+
+
 @router.post("/{track_id}/updates")
 async def update(track_id: str, value: UpdateRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     service = ResearchTrackingService()
