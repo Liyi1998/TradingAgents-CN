@@ -14,8 +14,9 @@
       </div>
       <el-alert v-if="error" :title="error" type="warning" :closable="false" />
       <template v-if="value">
-        <p class="meta">分钟截至 {{ value.as_of || '没有完整K线' }} · 来源 {{ value.source || '未取得' }} · 不复权 · 不调用模型</p>
-        <p class="meta">{{ value.tpo?.label }}。三者共享本标的价格身份，冲突保留，不投票。</p>
+        <el-alert v-if="value.synthetic" title="这是测试注入的合成行情，不是交易所回报，也不是收益或回测。" type="info" :closable="false" />
+        <p class="meta">观察状态 {{ statusLabel(value.status) }} · 分钟截至 {{ value.as_of || '没有完整K线' }} · 来源 {{ value.source || '未取得' }} · {{ originLabel(value.evidence_origin) }} · 不复权 · 不调用模型</p>
+        <p class="meta">{{ value.tpo?.label }}。三者共享本标的价格身份，冲突保留，不投票。日历或复权未核验时，当日原始轮廓可以留下，但不能跨日比较，整体也不标成已通过。</p>
         <div class="cards">
           <article>
             <h3>日线威科夫背景</h3>
@@ -26,18 +27,18 @@
           <article>
             <h3>30分钟接受区</h3>
             <p v-if="latestTpo">{{ latestTpo.date }} VAL {{ latestTpo.val }} · VAH {{ latestTpo.vah }}</p>
-            <p v-else>不可判断：{{ value.tpo?.days?.[0]?.reason || '没有完整交易日轮廓' }}</p>
-            <small>按交易日统计。未完成、午休、缺失和除权断点都不填平。</small>
+            <p v-else>不可判断：{{ unavailableTpo }}</p>
+            <small>按交易日统计。未完成、午休、缺失和除权断点都不填平。复权未核验时不把原始价连到另一天。</small>
           </article>
           <article>
             <h3>30分钟结构</h3>
             <p>状态 {{ value.smc?.state || 'undetermined' }}<template v-if="value.smc?.latest"> · {{ value.smc.latest.kind }} {{ value.smc.latest.status }}</template></p>
-            <p v-if="value.smc?.latest">事件 {{ value.smc.latest.event_time || '—' }}，首次可知 {{ value.smc.latest.first_knowable_time }}</p>
+            <p v-if="value.smc?.latest">事件时间 {{ value.smc.latest.event_time || '—' }}，首次可知 {{ value.smc.latest.first_knowable_time }}。两个时间不同就表示确认有延迟。</p>
             <small>{{ value.smc?.order_blocks?.reason }}</small>
           </article>
         </div>
         <div class="gates" aria-label="数据门槛">
-          <span v-for="gate in value.gates || []" :key="gate.name">{{ gate.name }}：{{ gate.status === 'ready' ? '可核验' : '不可判断' }}</span>
+          <span v-for="gate in value.gates || []" :key="gate.name"><strong>{{ gate.name }}：{{ gateLabel(gate.status) }}</strong><small>{{ gate.reason }}</small></span>
         </div>
         <el-alert v-for="note in value.issues || []" :key="note" :title="note" type="warning" :closable="false" />
         <section v-if="value.conflicts?.length" aria-label="保留的冲突">
@@ -69,7 +70,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { researchTrackingApi } from '@/api/researchTracking'
-import { structureLevels, type StructureAuxiliaryValue } from '@/utils/structureAuxiliary'
+import { structureGateLabel, structureLevels, type StructureAuxiliaryValue } from '@/utils/structureAuxiliary'
 import type { TrackingLevel } from '@/api/researchTracking'
 
 const props = defineProps<{ trackId: string; baselineId: string; enabled: boolean; historical: boolean; busy: boolean }>()
@@ -79,6 +80,10 @@ const error = ref('')
 const loading = ref(false)
 const showLayers = ref(false)
 const latestTpo = computed(() => [...(value.value?.tpo?.days || [])].reverse().find(item => item.status === 'ready'))
+const unavailableTpo = computed(() => value.value?.tpo?.days?.find(item => item.status !== 'ready')?.reason || '没有完整交易日轮廓')
+const gateLabel = structureGateLabel
+const statusLabel = (status?: string) => ({ ready: '门槛通过', partial: '部分可核验', cannot_judge: '不可判断' }[status || ''] || status || '未知')
+const originLabel = (origin?: string) => ({ live_free_single_symbol: '单股免费行情', live_fetch_empty: '免费行情未取得', synthetic_test: '合成测试', unspecified: '来源未标记' }[origin || ''] || '来源未标记')
 const reading = (valueText: string) => ({ bullish: '偏多', bearish: '偏空' }[valueText] || valueText)
 const leg = (item?: { status: string; reason: string }) => item ? (item.status === 'ready' ? '已对齐收盘变化，见限制' : `不可判断：${item.reason}`) : '不可判断'
 let generation = 0

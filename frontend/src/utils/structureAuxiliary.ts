@@ -27,6 +27,8 @@ export interface StructureAuxiliaryValue {
   decision_effect?: string
   report_mutated?: boolean
   status?: string
+  evidence_origin?: string
+  synthetic?: boolean
   as_of?: string | null
   source?: string | null
   trade_authorized?: boolean
@@ -48,6 +50,12 @@ export interface StructureAuxiliaryValue {
   }
   wyckoff_background?: { status: string; phase: string | null; trend: string | null; direction: string; as_of: string | null; reason: string; mutated: boolean }
   preserved?: { held_action: string | null; unheld_action: string | null; wyckoff_phase: string | null; report_mutated: boolean }
+}
+
+export function structureGateLabel(status: string) {
+  if (status === 'ready') return '可核验'
+  if (status === 'stale') return '陈旧'
+  return '不可判断'
 }
 
 export function structureLevels(value: StructureAuxiliaryValue | null, show: boolean): TrackingLevel[] {

@@ -264,6 +264,55 @@ def test_publication_delay_and_rejected_parameters():
         run(rows, parameters={"bin_multiple": 0})
 
 
+def test_missing_calendar_or_adjustment_limits_scope_without_erasing_or_freezing():
+    rows = flat(DAY) + flat(NEXT, low=10.2, high=10.22)
+    missing_calendar = analyze(SYMBOL, rows, at(NEXT, "15:01:00"), adjustments=factors((DAY, 1), (NEXT, 1)))
+    assert missing_calendar["tpo"]["days"][0]["status"] == "ready"
+    assert missing_calendar["calendar_status"] == "unverified"
+    assert missing_calendar["status"] == "partial"
+    assert all(item["status"] != "confirmed" for item in missing_calendar["overnight_gaps"])
+    assert next(gate["status"] for gate in missing_calendar["gates"] if gate["name"] == "交易日历") == "cannot_judge"
+    restored = analyze(
+        SYMBOL, rows, at(NEXT, "15:01:00"), calendar=calendar(DAY, NEXT), adjustments=factors((DAY, 1), (NEXT, 1))
+    )
+    assert any(item["status"] == "confirmed" for item in restored["overnight_gaps"])
+    missing_factor = analyze(SYMBOL, flat(DAY), at(DAY, "15:01:00"), calendar=calendar(DAY))
+    assert missing_factor["tpo"]["days"][0]["status"] == "ready"
+    assert missing_factor["adjustment"]["status"] == "unverified"
+    assert missing_factor["status"] == "partial"
+    assert next(gate["status"] for gate in missing_factor["gates"] if gate["name"] == "复权") == "cannot_judge"
+    later = analyze(SYMBOL, flat(DAY), at(DAY, "15:01:00"), calendar=calendar(DAY), adjustments=factors((DAY, 1)))
+    assert later["adjustment"]["status"] == "consistent"
+    assert later["status"] == "ready"
+
+
+def test_stale_bars_remain_visible_but_are_not_current():
+    stale = analyze(
+        SYMBOL, flat(DAY), at(NEXT, "15:01:00"), calendar=calendar(DAY, NEXT), adjustments=factors((DAY, 1), (NEXT, 1))
+    )
+    freshness = next(gate for gate in stale["gates"] if gate["name"] == "新鲜度")
+    assert freshness["status"] == "stale"
+    assert stale["tpo"]["days"][0]["status"] == "ready"
+    assert stale["status"] == "partial"
+    current = run(flat(DAY))
+    assert next(gate["status"] for gate in current["gates"] if gate["name"] == "新鲜度") == "ready"
+
+
+def test_sweep_is_not_confirmed_on_the_piercing_bar():
+    prices = [(10, 10.2, 9.8, 10), (10, 11, 10, 10.4), (10.2, 10.6, 10.1, 10.3), (10.6, 11.3, 10.5, 10.9)]
+    prices += [(10.8, 10.9, 10.7, 10.8)] * 4
+    hidden = run(session(DAY, prices), "11:31:00", parameters={"swing_left": 1, "swing_right": 1})
+    sweeps = [event for event in hidden["smc"]["events"] if event["kind"] == "sweep"]
+    assert sweeps and all(event["status"] == "candidate" for event in sweeps)
+    assert all(event["confirmed_time"] is None for event in sweeps)
+    later = run(session(DAY, prices), "13:31:00", parameters={"swing_left": 1, "swing_right": 1})
+    confirmed = [
+        event for event in later["smc"]["events"] if event["kind"] == "sweep" and event["status"] == "confirmed"
+    ]
+    assert confirmed and confirmed[0]["confirmed_time"] == f"{DAY} 13:30:00"
+    assert confirmed[0]["event_time"] == f"{DAY} 11:30:00"
+
+
 def test_settings_default_leaves_existing_switches_unchanged():
     pytest.importorskip("pydantic")
     pytest.importorskip("bson")

@@ -1,3 +1,4 @@
+/* eslint-env node */
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { readFile } from 'node:fs/promises'
@@ -6,7 +7,7 @@ import ts from 'typescript'
 const source = await readFile(new URL('../src/utils/structureAuxiliary.ts', import.meta.url), 'utf8')
 const { outputText } = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } })
 const module = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
-const { structureLevels } = module
+const { structureLevels, structureGateLabel } = module
 
 const day = { date: '2026-11-05', status: 'ready', val: 10, vah: 10.4, reason: '测试用合成轮廓，不是行情' }
 const value = {
@@ -29,6 +30,12 @@ test('layers stay off until requested and never become orders', () => {
   assert.match(levels[0].label, /TPO接受区近似/)
   assert.equal(levels[0].valid_until, '2026-11-05')
   assert.ok(!levels.some(level => ['entry', 'target'].includes(level.kind)))
+})
+
+test('stale and unverified gates are not labelled ready', () => {
+  assert.equal(structureGateLabel('ready'), '可核验')
+  assert.equal(structureGateLabel('stale'), '陈旧')
+  assert.equal(structureGateLabel('cannot_judge'), '不可判断')
 })
 
 test('incomplete profiles produce no acceptance band', () => {

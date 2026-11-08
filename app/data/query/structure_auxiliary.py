@@ -49,4 +49,5 @@ async def collect(di, symbol: str, now):
         "index_rows": index_rows,
         "index_symbol": "000300.SH",
         "issues": issues,
+        "evidence_origin": "live_free_single_symbol" if rows else "live_fetch_empty",
     }

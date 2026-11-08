@@ -35,3 +35,53 @@ TPO、SMC 和威科夫背景放在同一只股票的同一次观察里，用来�
 - 不部署，不合并，不改动本机 Docker。
 
 参数版本是 `structure-auxiliary-v1` / `bar-tpo-m30-v1` / `smc-m30-v1`。观察记录如果写入成功，只进旁路集合 `research_structure_auxiliary`，30 天后过期。
+
+## 数据门槛（复核后）
+
+缺交易日历或复权因子**不会永久封存**这一次观察。下次请求如果带上同一窗口内一致的日历和因子，会重新计算。缺证据的这一次里：
+
+- 单个完整交易日的原始 30 分钟轮廓仍可算出 TPO。页面必须同时显示「复权不可判断」或「日历不可判断」，整体状态是 `partial`，不能写成已通过。
+- 跨日 SMC、隔夜价差是否相邻，在日历未证明时保持不可判断，不把缺日当成假期或停牌。
+- 复权因子缺失、冲突或除权断点时，不把两侧原始价格连成同一结构，也不把缺失因子当成 1。
+- 新鲜度单独记。最后一根 K 线对不齐当前应完成的时段时标成陈旧；陈旧不删除更早的完整日轮廓，但也不能把它当成当前盘口。
+- 这些门槛没有为了让页面出现价位而放宽。
+
+## 合成测试和真实免费行情
+
+合成 K 线只存在测试进程里，`evidence_origin=synthetic_test`。它们用来检查确认延迟、冲突和门槛，不代表收益。
+
+真实免费行情是腾讯公开 30 分钟接口的单股响应。2026-11-09 07:36（北京时间）对 `000001` 取到 160 根，最后一根是 `2026-11-06 15:00:00`。没有提供日历和复权因子时，整体状态是 `partial`：20 个完整日可以留下当日 TPO，19 条隔夜价差全部是不可判断，SMC 状态是 `undetermined`，新鲜度是陈旧。这不是交易结论，也没有写入数据库。
+
+## 云端验收
+
+已通过：
+
+```bash
+python3 -m pytest tests/engine/test_structure_auxiliary.py \
+  tests/services/test_structure_auxiliary_isolation.py \
+  tests/engine/test_intraday_research.py -q --tb=line --noconftest
+# 54 passed
+
+cd frontend && npx eslint src/components/StructureAuxiliary.vue \
+  src/utils/structureAuxiliary.ts src/components/ResearchTrackingBoard.vue \
+  src/api/researchTracking.ts tests/structureAuxiliary.test.mjs
+# 0 errors
+
+cd frontend && node --test tests/structureAuxiliary.test.mjs tests/intradayResearch.test.mjs
+# 6 passed
+
+cd frontend && npm run build
+# vue-tsc && vite build，exit 0
+```
+
+隔离集成使用内存 `SimulatedMongoDB` 和 FastAPI `TestClient`，不连接用户数据库。覆盖了默认关闭不取数、打开后的合成完整日、来源冲突、确认延迟、陈旧门槛，以及原 HOLD 和威科夫字典不被改写。既有 `tests/engine/test_intraday_research.py` 同时通过，没有改盘中条件算法。
+
+没有跑全量 pytest。项目 `conftest` 和 `app.main` 仍会继续碰到未安装的 `chromadb`，这台机器也没有 `mongod`、`redis-server` 或 Docker。因此没有把历史夹具失败算成这次功能的回归。
+
+## 部署前检查
+
+1. 不要合并这个 PR，也不要把它当成已部署版本。
+2. 用自己重新填写的环境变量和隔离数据库。快照里没有 `.env`，不要从审计排除文件里找回。
+3. 结构辅助默认关闭。打开前确认只想看这一只股票，并且接受「不可判断」。
+4. `runtime/services` 里的 Compose 不是启用清单。
+5. 本云端环境没有启动完整界面，所以没有页面截图。要在本机看到页面，至少需要：按 `pyproject.toml` 装齐依赖（当前卡在 `chromadb`）、本机 MongoDB 与 Redis、可登录账号，以及一条已经建档的短线研究。这些都还没在云端跑通，因此**现在不具备试部署条件**。

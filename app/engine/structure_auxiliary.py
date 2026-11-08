@@ -248,6 +248,68 @@ def _expected_minutes(day: str, now) -> list[int]:
     return ready
 
 
+def _due_end(day: str, now, delay: int):
+    local = now.astimezone(CN)
+    due = None
+    for minute in SESSION_ENDS:
+        end = datetime.strptime(f"{day} {minute // 60:02d}:{minute % 60:02d}:00", "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=CN
+        )
+        if local >= end + timedelta(seconds=delay):
+            due = end
+    return due
+
+
+def _freshness(bars, now, calendar_status: str, open_days: dict[str, bool], delay: int) -> dict:
+    """Clock alignment only. A stale cutoff does not delete an older complete profile."""
+    if not bars:
+        return {"name": "新鲜度", "status": "cannot_judge", "as_of": None, "reason": "没有可用的完整K线"}
+    last = datetime.strptime(bars[-1]["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN)
+    local = now.astimezone(CN)
+    age = int((local - last).total_seconds())
+    as_of = bars[-1]["datetime"]
+    gate = {"name": "新鲜度", "as_of": as_of, "age_seconds": age}
+    if age < 0:
+        return {**gate, "status": "cannot_judge", "reason": "K线时间晚于观察时钟，不能使用"}
+    today = local.date().isoformat()
+    if calendar_status == "verified" and today not in open_days:
+        return {**gate, "status": "cannot_judge", "reason": "观察日不在已读取的交易日历覆盖范围内，不能判断是否陈旧"}
+    if calendar_status != "verified":
+        if last.date().isoformat() == today and age <= 30 * 60 + delay:
+            return {
+                **gate,
+                "status": "cannot_judge",
+                "reason": "最后一根K线离观察时钟不远，但交易日历未证明，新鲜度不能标成已核验",
+            }
+        return {
+            **gate,
+            "status": "stale",
+            "reason": "交易日历未证明，且最后一根K线不是当前附近的完整K线；按陈旧处理，不补缺失会话",
+        }
+    if open_days.get(today) is True:
+        due = _due_end(today, now, delay)
+        if due is None:
+            prior = [day for day, opened in open_days.items() if opened and day < today]
+            if not prior:
+                return {**gate, "status": "cannot_judge", "reason": "尚未到首根K线，也没有更早的已证明交易日"}
+            previous = max(prior)
+            close = datetime.strptime(f"{previous} 15:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN)
+            if last == close:
+                return {**gate, "status": "ready", "reason": f"开盘前已对齐最近交易日 {previous} 的收盘K线"}
+            return {**gate, "status": "stale", "reason": f"开盘前缺少 {previous} 15:00 的K线，实际只到 {as_of}"}
+        if last == due:
+            return {**gate, "status": "ready", "reason": "已对齐当前应完成的最后一根K线，不是逐笔成交价"}
+        return {**gate, "status": "stale", "reason": f"当前应有截至 {due.strftime('%H:%M')} 的K线，实际只到 {as_of}"}
+    prior = [day for day, opened in open_days.items() if opened and day <= today]
+    if not prior:
+        return {**gate, "status": "cannot_judge", "reason": "日历没有已证明的交易日，不能判断分钟线是否陈旧"}
+    previous = max(prior)
+    close = datetime.strptime(f"{previous} 15:00:00", "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN)
+    if last == close:
+        return {**gate, "status": "ready", "reason": f"最近已证明交易日 {previous} 的收盘K线已到"}
+    return {**gate, "status": "stale", "reason": f"最近已证明交易日是 {previous}，分钟线只到 {as_of}"}
+
+
 def _sessions(bars, conflicts, now, calendar_status, open_days, delay: int):
     local = now.astimezone(CN)
     by_day = defaultdict(list)
@@ -1006,12 +1068,7 @@ def analyze(
             if any(session["status"] == "complete" for session in sessions)
             else "没有完整的30分钟交易日，不能判断接受区",
         },
-        {
-            "name": "新鲜度",
-            "status": "ready" if as_of else "cannot_judge",
-            "as_of": as_of,
-            "reason": "截至最后一根已过发布等待期的完整K线，不是当前成交价" if as_of else "没有可用的完整K线",
-        },
+        _freshness(bars, now, calendar_status, open_days, params["publication_delay_seconds"]),
         {
             "name": "交易日历",
             "status": "ready" if calendar_status == "verified" else "cannot_judge",
@@ -1077,10 +1134,12 @@ def analyze(
     ready_parts = any(day["status"] == "ready" for day in tpo_days) or any(
         event["kind"] in {"bos", "choch", "fvg", "swing_high", "swing_low"} for event in smc_events
     )
+    freshness = next(gate for gate in gates if gate["name"] == "新鲜度")
     blocking = (
         calendar_status != "verified"
         or adjustment_status != "consistent"
         or bool(breakpoints)
+        or freshness["status"] != "ready"
         or any(session["status"] in {"incomplete", "conflict"} for session in sessions)
     )
     status = (

@@ -23,23 +23,10 @@ class StructureAuxiliaryService:
         await self.db[OBSERVATIONS].create_index("expires_at", expireAfterSeconds=0)
         await self.db[OBSERVATIONS].create_index([("track_id", 1), ("user_id", 1), ("created_at", -1)])
 
-    async def observe(self, track_id, user_id, *, now=None):
-        now = now or datetime.now(timezone.utc)
-        track = await ResearchTrackingService(self.db).owned(track_id, user_id)
-        if (track.get("settings") or {}).get("structure_auxiliary_enabled") is not True:
-            return {"enabled": False, "model_called": False, "decision_effect": "none", "report_mutated": False}
-        version = await self.db[VERSIONS].find_one(
-            {
-                "_id": track.get("latest_version_id"),
-                "track_id": track_id,
-                "user_id": user_id,
-                "baseline_analysis_id": track["baseline_analysis_id"],
-            }
-        )
-        technical = ((version or {}).get("modules") or {}).get("technical") or {}
-        review = (version or {}).get("review") or {}
+    async def load_context(self, symbol, now):
+        """Live single-symbol read. Tests replace this method; the algorithm stays real."""
         try:
-            packet = await DataInterface.get_instance().structure_auxiliary_context(track["symbol"], now)
+            packet = await DataInterface.get_instance().structure_auxiliary_context(symbol, now)
         except Exception as exc:
             logger.warning("Structure auxiliary context unavailable: %s", type(exc).__name__)
             packet = {
@@ -50,7 +37,36 @@ class StructureAuxiliaryService:
                 "index_rows": [],
                 "index_symbol": "000300.SH",
                 "issues": ["结构辅助取数失败，原研究保持不变"],
+                "evidence_origin": "live_fetch_empty",
             }
+        packet.setdefault("evidence_origin", "live_free_single_symbol" if packet.get("rows") else "live_fetch_empty")
+        return packet
+
+    async def observe(self, track_id, user_id, *, now=None):
+        now = now or datetime.now(timezone.utc)
+        track = await ResearchTrackingService(self.db).owned(track_id, user_id)
+        if (track.get("settings") or {}).get("structure_auxiliary_enabled") is not True:
+            return {
+                "enabled": False,
+                "model_called": False,
+                "decision_effect": "none",
+                "report_mutated": False,
+                "synthetic": False,
+            }
+        version = await self.db[VERSIONS].find_one(
+            {
+                "_id": track.get("latest_version_id"),
+                "track_id": track_id,
+                "user_id": user_id,
+                "baseline_analysis_id": track["baseline_analysis_id"],
+            }
+        )
+        technical = ((version or {}).get("modules") or {}).get("technical") or {}
+        review = (version or {}).get("review") or {}
+        packet = await self.load_context(track["symbol"], now)
+        origin = packet.get("evidence_origin")
+        if origin not in {"live_free_single_symbol", "live_fetch_empty", "synthetic_test"}:
+            origin = "unspecified"
         result = analyze(
             track["symbol"],
             packet["rows"],
@@ -69,6 +85,8 @@ class StructureAuxiliaryService:
         result.update(
             enabled=True,
             model_called=False,
+            synthetic=origin == "synthetic_test",
+            evidence_origin=origin,
             track_id=track_id,
             baseline_analysis_id=track["baseline_analysis_id"],
             source_revision=(version or {}).get("_id"),
