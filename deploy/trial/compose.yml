@@ -1,6 +1,5 @@
 # Isolated trial stack. Project name must stay tradingagents-smc-tpo-trial.
-# No container_name: Compose prefixes service containers with the project name.
-# MongoDB and Redis stay on the trial network and are not published to the host.
+# Service containers use the Compose project prefix. MongoDB and Redis are not published.
 
 name: tradingagents-smc-tpo-trial
 

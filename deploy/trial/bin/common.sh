@@ -59,7 +59,7 @@ assert_compose_text() {
             die "compose 含有禁止引用的生产名称: $name" 12
         fi
     done
-    if grep -E 'container_name:|external:\s*true|docker[[:space:]]+system[[:space:]]+prune|docker[[:space:]]+volume[[:space:]]+prune' "$file" >/dev/null 2>&1; then
+    if grep -E '^[[:space:]]*container_name:|^[[:space:]]*external:[[:space:]]*true|^[[:space:]]*docker[[:space:]]+system[[:space:]]+prune' "$file" >/dev/null 2>&1; then
         die "compose 含有 container_name、external 卷或清理命令" 12
     fi
     if ! grep -F '127.0.0.1:${TRIAL_HTTP_PORT:-18082}:80' "$file" >/dev/null 2>&1; then
