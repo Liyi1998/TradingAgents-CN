@@ -11,13 +11,21 @@ assert_compose_text "$root"
 port="${TRIAL_HTTP_PORT:-$TRIAL_HTTP_PORT_DEFAULT}"
 assert_port "$port"
 
+if ! command -v docker >/dev/null 2>&1; then
+    die "未找到 docker，拒绝构建和启动" 13
+fi
 disk_kib=$(disk_free_kib)
 disk_gib=$(awk -v k="$disk_kib" 'BEGIN {printf "%.1f", k/1024/1024}')
 swap_mib=$(swap_used_mib)
 swap_mib=${swap_mib:-0}
-mem_total=$(docker_mem_total_mib || printf '0')
-mem_used=$(docker_used_mib || printf '0')
+mem_total=$(docker_mem_total_mib || true)
+mem_used=$(docker_used_mib || true)
+mem_total=${mem_total:-0}
+mem_used=${mem_used:-0}
 mem_avail=$((mem_total - mem_used))
+if [ "$mem_total" -eq 0 ]; then
+    die "读不到 Docker 内存总量，拒绝构建和启动" 10
+fi
 arch=$(uname -m)
 docker_arch=$(docker info --format '{{.Architecture}}' 2>/dev/null || printf 'unknown')
 
