@@ -82,13 +82,15 @@ async def register_jobs(scheduler: AsyncIOScheduler, basics_sync_service, run_ba
             await run_basics_sync_func(force=False, preferred_sources=preferred_sources)
 
     # 启动期同步任务走 task_registry（critical=False：shutdown 时统一 cancel，
-    # 与 task_registry 文档注释的 _startup_sync 设计一致），完成后回调记录结果
+    # 与 task_registry 文档注释的 _startup_sync 设计一致），完成后回调记录结果。
+    # 关闭 SYNC_STOCK_BASICS_ENABLED 时连启动补同步一起停，避免隔离环境打到外部源。
     from app.core.task_registry import task_registry
 
-    _sync_task = task_registry.register(
-        _run_startup_sync(), name="basics_startup_sync", critical=False
-    )
-    _sync_task.add_done_callback(_handle_basics_sync_task_result)
+    if settings.SYNC_STOCK_BASICS_ENABLED:
+        _sync_task = task_registry.register(
+            _run_startup_sync(), name="basics_startup_sync", critical=False
+        )
+        _sync_task.add_done_callback(_handle_basics_sync_task_result)
 
     if settings.SYNC_STOCK_BASICS_ENABLED:
         sync_kwargs = {"force": False, "preferred_sources": preferred_sources}

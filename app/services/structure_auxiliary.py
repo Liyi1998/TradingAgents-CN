@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import logging
+from pathlib import Path
 
+from app.core.config import settings
 from app.core.database import get_mongo_db
 from app.data.core.interface import DataInterface
 from app.engine.structure_auxiliary import analyze
@@ -13,6 +16,33 @@ from app.services.research_tracking import VERSIONS, ResearchTrackingService, aw
 
 logger = logging.getLogger(__name__)
 OBSERVATIONS = "research_structure_auxiliary"
+
+
+def synthetic_fixture_packet(symbol: str, root: str) -> dict | None:
+    """Return a synthetic packet when an isolated fixture directory is configured.
+
+    An empty directory setting keeps the live single-symbol path. A configured
+    directory never falls through to an external quote request.
+    """
+    if not str(root or "").strip():
+        return None
+    path = Path(root) / f"{symbol}.json"
+    empty = {
+        "rows": [],
+        "calendar": [],
+        "adjustments": [],
+        "daily": [],
+        "index_rows": [],
+        "index_symbol": "000300.SH",
+        "issues": ["隔离合成目录已启用，但没有该代码的合成文件，因此不请求外部行情"],
+        "evidence_origin": "synthetic_test",
+    }
+    if not path.is_file():
+        return empty
+    packet = json.loads(path.read_text(encoding="utf-8"))
+    packet["evidence_origin"] = "synthetic_test"
+    packet["issues"] = ["合成测试行情，不是交易所回报", *list(packet.get("issues") or [])]
+    return packet
 
 
 class StructureAuxiliaryService:
@@ -25,6 +55,9 @@ class StructureAuxiliaryService:
 
     async def load_context(self, symbol, now):
         """Live single-symbol read. Tests replace this method; the algorithm stays real."""
+        fixture = synthetic_fixture_packet(symbol, settings.STRUCTURE_AUXILIARY_SYNTHETIC_DIR)
+        if fixture is not None:
+            return fixture
         try:
             packet = await DataInterface.get_instance().structure_auxiliary_context(symbol, now)
         except Exception as exc:

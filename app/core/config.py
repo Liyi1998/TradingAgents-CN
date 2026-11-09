@@ -265,6 +265,9 @@ class Settings(BaseSettings):
     # 时区（默认值，实际运行时会从运行时配置获取）
     TIMEZONE: str = Field(default="Asia/Shanghai")
 
+    # 隔离验收才设置。空值保持真实单股行情；设置后只读该目录里的合成文件，不请求外部分钟源。
+    STRUCTURE_AUXILIARY_SYNTHETIC_DIR: str = Field(default="")
+
     # 实时行情入库任务
     QUOTES_INGEST_ENABLED: bool = Field(default=True)
     QUOTES_INGEST_INTERVAL_SECONDS: int = Field(

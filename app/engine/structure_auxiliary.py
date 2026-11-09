@@ -1087,8 +1087,10 @@ def analyze(
         },
         {
             "name": "来源",
-            "status": "ready" if len(sources) == 1 else "cannot_judge",
-            "reason": sources[0]
+            "status": "cannot_judge" if conflicts or len(sources) != 1 else "ready",
+            "reason": "同一时点存在不一致的OHLC，冲突日已整日隔离"
+            if conflicts
+            else sources[0]
             if len(sources) == 1
             else "没有唯一分钟来源"
             if not sources
