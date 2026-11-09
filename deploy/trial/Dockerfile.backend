@@ -1,0 +1,41 @@
+# Isolated trial backend. Native amd64/arm64 via the official Python image.
+# No Node, wkhtmltopdf, pandoc, or model download. PDF export and MCP node
+# servers are unavailable in this trial image; the research UI does not need them.
+FROM python:3.12-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    MALLOC_ARENA_MAX=2 \
+    TZ=Asia/Shanghai \
+    DOCKER_CONTAINER=true
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone
+
+COPY pyproject.toml README.md ./
+RUN pip install --upgrade pip --retries 5 --timeout 180 \
+    && pip install --prefer-binary --only-binary=:all: --retries 5 --timeout 180 --no-cache-dir .
+
+COPY app ./app
+COPY config ./config
+COPY tests/fixtures/structure_auxiliary /opt/trial-fixtures
+COPY deploy/trial/seed_synthetic.py /opt/trial-seed/seed_synthetic.py
+COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh \
+    && useradd -r -m -s /bin/false appuser \
+    && mkdir -p /app/runtime /app/config \
+    && chown -R appuser:appuser /app /opt/trial-seed
+
+EXPOSE 8000
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

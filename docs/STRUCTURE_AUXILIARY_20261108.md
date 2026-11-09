@@ -82,7 +82,7 @@ cd frontend && npm run build
 
 2026-11-09 在这台云端 VM 上用公开发行的依赖装好了项目，并用 Ubuntu 软件源的 Redis 与 MongoDB 官方 8.0 社区版在 `127.0.0.1:6380` / `127.0.0.1:27018` 起了空库 `tradingagents_validation`。没有 Docker。应用以 `uvicorn app.main:app` 启动，前端用已经通过的 `npm run build` 产物经 `vite preview` 提供。登录、建档和结构接口都走真实路由。
 
-测试账号和口令只留在本机权限 `600` 的文件里，不写入仓库或 PR。研究档是合成的 `900001`–`900006`，名称都带「合成」。`STRUCTURE_AUXILIARY_SYNTHETIC_DIR` 只在这次隔离进程里设置；目录为空时仍走真实单股行情。行情入库、冷启动补数、股票基础信息启动同步和 Tushare 都关掉了。调度器里的 cron 仍会注册，但没有立即打外部全市场同步。
+测试账号和口令只留在本机权限 `600` 的文件里，不写入仓库或 PR。研究档是合成的 `900001`–`900006`，名称都带「合成」。`STRUCTURE_AUXILIARY_SYNTHETIC_DIR` 只在这次隔离进程里设置；目录为空时仍走真实单股行情。行情入库、冷启动补数、股票基础信息启动同步和 Tushare 都关掉了。隔离 Compose 把 `BACKGROUND_JOBS_ENABLED` 设为 false，后台调度不会注册。
 
 页面确认：默认关闭；打开后完整日显示合成 TPO（VAL 10.42、VAH 11.39）和 SMC sweep，并标明合成测试行情；来源冲突、缺日历、缺复权、缺失 K 线和陈旧都给出不可判断或陈旧，没有为了显示价位而放宽门槛。原「继续持有研究」和威科夫「下跌 / markdown」在开关之后仍是原值。窄屏下证据卡排成一列。
 
@@ -92,4 +92,4 @@ cd frontend && npm run build
 2. 本机试运行需要自己的环境变量、自己的 MongoDB/Redis，以及一个非生产库。不要复用这次云端口令，也不要从审计排除文件里找回 `.env`。
 3. 结构辅助默认关闭。`STRUCTURE_AUXILIARY_SYNTHETIC_DIR` 留空才会读取真实分钟源。
 4. `runtime/services` 里的 Compose 不是启用清单。
-5. 云端已经跑通隔离全页，所以下一步可以在本机用独立库试运行；仍不要自动合并或部署。
+5. Mac 试运行包在 `deploy/trial/`，复制用的压缩包和检查单在交付物里。按当前 swap 和 Docker 剩余内存，预检会拒绝在这台 Mac 上构建镜像。不要为了试运行停止生产或执行 prune。

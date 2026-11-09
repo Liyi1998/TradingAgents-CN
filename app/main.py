@@ -334,6 +334,11 @@ async def _apply_dynamic_settings(logger):
 
 async def _init_scheduler(logger):
     """初始化 APScheduler 定时任务"""
+    if not settings.BACKGROUND_JOBS_ENABLED:
+        logger.info(
+            "BACKGROUND_JOBS_ENABLED=false，跳过后台调度、行情入库、全市场同步、研究定时和结算任务"
+        )
+        return None
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
     apscheduler = AsyncIOScheduler(timezone=settings.TIMEZONE)

@@ -258,6 +258,8 @@ class Settings(BaseSettings):
 
     # 基础信息同步任务配置（可配置调度）
     SYNC_STOCK_BASICS_ENABLED: bool = Field(default=True)
+    # 隔离试运行设为 false。默认 true，不改变现有部署的调度行为。
+    BACKGROUND_JOBS_ENABLED: bool = Field(default=True)
     # 优先使用 CRON 表达式，例如 "30 6 * * *" 表示每日 06:30
     SYNC_STOCK_BASICS_CRON: str = Field(default="")
     # 若未提供 CRON，则使用简单时间字符串 "HH:MM"（24小时制）
