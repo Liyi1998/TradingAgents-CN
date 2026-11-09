@@ -92,4 +92,4 @@ cd frontend && npm run build
 2. 本机试运行需要自己的环境变量、自己的 MongoDB/Redis，以及一个非生产库。不要复用这次云端口令，也不要从审计排除文件里找回 `.env`。
 3. 结构辅助默认关闭。`STRUCTURE_AUXILIARY_SYNTHETIC_DIR` 留空才会读取真实分钟源。
 4. `runtime/services` 里的 Compose 不是启用清单。
-5. Mac 试运行包在 `deploy/trial/`，复制用的压缩包和检查单在交付物里。按当前 swap 和 Docker 剩余内存，预检会拒绝在这台 Mac 上构建镜像。不要为了试运行停止生产或执行 prune。
+5. Mac 试运行包在 `deploy/trial/`。构建预检的门槛没有降低，按当前 swap 和 Docker 剩余内存仍会拒绝在 Mac 上构建。云端随后用官方 Docker 和 QEMU 打了固定提交的 linux/arm64 镜像包，加载峰值和单独的运行门槛写在 `deploy/trial/CHECKLIST.md`。那条路径要等审查同意才在 Mac 上执行。不要为了试运行停止生产或执行 prune。

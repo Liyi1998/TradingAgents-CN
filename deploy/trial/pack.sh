@@ -4,6 +4,11 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 commit=$(git -C "$root" rev-parse HEAD)
 short=$(git -C "$root" rev-parse --short=12 HEAD)
+if [ -f "$root/deploy/trial/IMAGE_TAG" ]; then
+    image_tag=$(tr -d '[:space:]' < "$root/deploy/trial/IMAGE_TAG")
+else
+    image_tag=$commit
+fi
 stage=$(mktemp -d)
 dest="$stage/tradingagents-smc-tpo-trial"
 mkdir -p "$dest"
@@ -14,7 +19,7 @@ if [ ! -f "$root/frontend/dist/index.html" ]; then
 fi
 mkdir -p "$dest/frontend/dist"
 cp -a "$root/frontend/dist/." "$dest/frontend/dist/"
-printf '%s\n' "$commit" > "$dest/deploy/trial/IMAGE_TAG"
+printf '%s\n' "$image_tag" > "$dest/deploy/trial/IMAGE_TAG"
 printf '%s\n' "$commit" > "$dest/SOURCE_COMMIT"
 find "$dest" -name .env -o -name '.env.*' -o -name trial.env | while read -r path; do
     rm -f "$path"

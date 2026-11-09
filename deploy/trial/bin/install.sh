@@ -39,4 +39,4 @@ EOF
     printf '已生成本机口令文件（权限 600），内容不在此显示: %s\n' "$secret"
 fi
 printf '下一步: bin/preflight.sh\n'
-printf '预检拒绝构建时不要加内存、不要停止生产容器。\n'
+printf '预检拒绝构建时不要加内存、不要停止生产容器。预构建镜像走 bin/preflight-load.sh，不替代构建门槛。\n'

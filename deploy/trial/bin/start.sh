@@ -1,5 +1,5 @@
 #!/bin/sh
-# Start only this project, without building. Refuses a tight memory margin.
+# Start only this project from images that are already loaded.
 set -eu
 . "$(dirname "$0")/common.sh"
 
@@ -12,35 +12,16 @@ set -a
 . "$secret"
 set +a
 
-# preflight exits 10 when build is blocked but start may still be allowed.
-set +e
-"$(dirname "$0")/preflight.sh"
-code=$?
-set -e
-if [ "$code" -eq 11 ] || [ "$code" -eq 12 ]; then
-    exit "$code"
+"$(dirname "$0")/preflight-runtime.sh"
+if [ "${TRIAL_RUNTIME_APPROVED:-}" != "1" ]; then
+    die "启动预检通过也不等于可以启动。审查资源数字后才设置 TRIAL_RUNTIME_APPROVED=1。这个开关不改变门槛，也不会去构建。" 12
 fi
-if [ "$code" -eq 10 ]; then
-    mem_total=$(docker_mem_total_mib || printf '0')
-    mem_used=$(docker_used_mib || printf '0')
-    mem_avail=$((mem_total - mem_used))
-    if [ "$mem_avail" -lt 2600 ]; then
-        die "剩余内存不足以启动。不要停止生产容器。" 10
-    fi
-    printf '构建仍被拒绝。若镜像已在本机，则只启动、不构建。\n'
-fi
-
-tag="${TRIAL_IMAGE_TAG:-unknown}"
-docker image inspect "tradingagents-smc-tpo-trial-backend:${tag}" >/dev/null 2>&1 \
-    || die "后端镜像不存在。资源预检拒绝构建时，不能在这台机器上现编镜像。" 10
-docker image inspect "tradingagents-smc-tpo-trial-frontend:${tag}" >/dev/null 2>&1 \
-    || die "前端镜像不存在。资源预检拒绝构建时，不能在这台机器上现编镜像。" 10
 
 cd "$root"
 docker compose \
     --project-name "$TRIAL_PROJECT" \
     --env-file "$secret" \
     -f deploy/trial/compose.yml \
-    up -d --no-build
+    up -d --no-build --pull never
 printf '已启动 %s。入口 http://127.0.0.1:%s\n' "$TRIAL_PROJECT" "${TRIAL_HTTP_PORT:-18082}"
 printf '口令文件: %s\n' "$secret"
