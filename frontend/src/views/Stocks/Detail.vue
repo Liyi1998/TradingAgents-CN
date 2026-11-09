@@ -35,6 +35,9 @@
             <span>{{ fmtPercent(quote.changePercent) }}</span>
           </div>
           <el-tag type="info" size="small">{{ refreshText }}</el-tag>
+          <el-tag v-if="quoteDelayed" type="warning" size="small">行情延迟，保留原快照时间</el-tag>
+          <el-tag v-if="quote.kind === 'historical_daily'" type="warning" size="small">历史日线收盘 · {{ quote.tradeDate }} · 非实时报价</el-tag>
+          <el-tag v-else-if="quote.kind === 'unavailable'" type="warning" size="small">报价暂未核验</el-tag>
           <el-button text size="small" @click="refreshQuote" :icon="Refresh">刷新</el-button>
         </div>
         <div class="stats">
@@ -84,30 +87,37 @@
           <el-icon><Clock /></el-icon>
           <span class="sync-info">
             <!-- 🔥 优先显示股票自己的更新时间 -->
-            <template v-if="quote.updatedAt">
-              数据更新: {{ formatQuoteUpdateTime(quote.updatedAt) }}
+            <template v-if="quote.observedAt">
+              行情快照: {{ formatQuoteUpdateTime(quote.observedAt) }}
+            </template>
+            <template v-else-if="quote.tradeDate">
+              行情日期: {{ quote.tradeDate }}
+            </template>
+            <template v-else-if="quote.updatedAt">
+              缓存写入: {{ formatQuoteUpdateTime(quote.updatedAt) }}（非行情时间）
             </template>
             <template v-else-if="syncStatus">
               后端同步: {{ formatSyncTime(syncStatus.last_sync_time) }}
               <span v-if="syncStatus.interval_seconds">{{ formatSyncInterval(syncStatus.interval_seconds) }}</span>
             </template>
             <el-tag
-              v-if="syncStatus?.data_source"
+              v-if="quote.source"
               size="small"
               type="success"
               style="margin-left: 4px"
             >
-              {{ syncStatus.data_source }}
+              {{ quote.source }}
             </el-tag>
           </span>
         </div>
       </div>
     </el-card>
 
+    <ResearchTrackingBoard ref="trackingBoard" v-if="market !== 'HK' && market !== 'US'" :symbol="symbol" @tracking-state="hasTracking = $event" @quote-update="handleMarketQuote" />
     <el-row :gutter="16" class="body">
       <el-col :span="18">
         <!-- K线蜡烛图 -->
-        <el-card shadow="hover">
+        <el-card v-if="!hasTracking" shadow="hover">
           <template #header>
             <div class="card-hd">
               <div>价格K线</div>
@@ -136,13 +146,14 @@
           <div v-else class="detail">
             <!-- 分析时间和信心度 -->
             <div class="analysis-meta">
+              <el-tag type="info" effect="plain">{{ analysisHorizonLabel(lastTaskInfo || lastAnalysis) }}</el-tag>
               <span class="analysis-time">
                 <el-icon><Clock /></el-icon>
-                分析时间：{{ formatAnalysisTime(lastTaskInfo?.end_time) }}
+                分析时间：{{ formatAnalysisTime(analysisCompletedAt(lastTaskInfo, lastAnalysis)) }}
               </span>
               <span class="confidence">
                 <el-icon><TrendCharts /></el-icon>
-                信心度：{{ fmtConf(lastAnalysis?.confidence_score ?? lastAnalysis?.overall_score) }}
+                模型置信度：{{ reportConfidence(lastAnalysis) }}
               </span>
             </div>
 
@@ -266,9 +277,10 @@
               </b>
             </div>
             <div class="fact"><span>PS(TTM)</span><b>{{ Number.isFinite(basics.ps) ? basics.ps.toFixed(2) : '-' }}</b></div>
-            <div class="fact"><span>ROE</span><b>{{ fmtPercent(basics.roe) }}</b></div>
+            <div class="fact"><span>ROE</span><b>{{ Number.isFinite(basics.roe) ? fmtPercent(basics.roe) : '暂无已核验值' }}</b></div>
             <div class="fact"><span>负债率</span><b>{{ fmtPercent(basics.debtRatio) }}</b></div>
           </div>
+          <p v-if="!Number.isFinite(basics.roe)" class="hint">{{ basics.roeStatus === 'unproven_disclosure' ? 'ROE 缺少字段级披露日期证据，暂未纳入快照。' : '当前快照未取得可用 ROE；不会用其他财务比率代替。' }}</p>
         </el-card>
 
 
@@ -359,6 +371,7 @@
 </template>
 
 <script setup lang="ts">
+import { stockQuoteView } from '@/utils/stockQuote'
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -378,6 +391,9 @@ import type { EChartsOption } from 'echarts'
 import { favoritesApi } from '@/api/favorites'
 import { useFavoritesStore } from '@/stores/favorites'
 import { loadAgentDisplayNames } from '@/utils/agentDisplayNames'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
+import ResearchTrackingBoard from '@/components/ResearchTrackingBoard.vue'
+import { analysisCompletedAt, reportConfidence } from '@/utils/reportMetadata'
 
 
 echartsUse([CandlestickChart, GridComponent, TooltipComponent, DataZoomComponent, LegendComponent, TitleComponent, CanvasRenderer])
@@ -392,6 +408,7 @@ const analysisProgress = ref(0)
 const analysisMessage = ref('')
 const lastAnalysis = ref<any | null>(null)
 const lastTaskInfo = ref<any | null>(null) // 保存任务信息（包含 end_time 等）
+const hasTracking = ref(false)
 
 // 报告对话框
 const showReportsDialog = ref(false)
@@ -454,31 +471,18 @@ const lastKClose = ref<number | null>(null)
 const klineDataLoaded = ref(false)
 
 // 报价（初始化）
-const quote = reactive({
-  price: NaN,
-  changePercent: NaN,
-  open: NaN,
-  high: NaN,
-  low: NaN,
-  prevClose: NaN,
-  volume: NaN,
-  amount: NaN,
-  turnover: NaN,
-  amplitude: NaN,  // 振幅（替代量比）
-  tradeDate: null as string | null,  // 交易日期（用于成交量、成交额）
-  turnoverDate: null as string | null,  // 换手率数据日期
-  amplitudeDate: null as string | null,  // 振幅数据日期
-  updatedAt: null as string | null  // 🔥 数据更新时间
-})
+const quote = reactive(stockQuoteView())
+const trackingBoard = ref<InstanceType<typeof ResearchTrackingBoard> | null>(null)
+const quoteDelayed = ref(false)
 
 const lastRefreshAt = ref<Date | null>(null)
-const refreshText = computed(() => lastRefreshAt.value ? `已刷新 ${lastRefreshAt.value.toLocaleTimeString()}` : '未刷新')
+const refreshText = computed(() => lastRefreshAt.value ? `页面获取 ${lastRefreshAt.value.toLocaleTimeString()}` : '未获取')
 const changeClass = computed(() => quote.changePercent > 0 ? 'up' : quote.changePercent < 0 ? 'down' : '')
 
 // 🔥 日期判断和格式化函数
 function isToday(dateStr: string | null): boolean {
   if (!dateStr) return false
-  const today = new Date().toISOString().split('T')[0].replace(/-/g, '')
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()).replace(/-/g, '')
   const targetDate = dateStr.replace(/-/g, '')
   return today === targetDate
 }
@@ -608,7 +612,8 @@ async function handleSync() {
 }
 
 async function refreshQuote() {
-  await fetchQuote()
+  if (hasTracking.value && trackingBoard.value) await trackingBoard.value.refreshMarket()
+  else await fetchQuote(true)
 }
 
 // 清除缓存
@@ -648,7 +653,19 @@ async function clearCache() {
 }
 
 let quoteSeq = 0
-async function fetchQuote() {
+function handleMarketQuote(value: { quote?: Record<string, any>; delayed: boolean }) {
+  const d = value.quote
+  if (d && d.symbol !== symbol.value) return
+  quoteSeq++ // discard an older independent quote request still in flight
+  quoteDelayed.value = value.delayed
+  if (!d || (value.delayed && d.quote_kind !== 'spot_snapshot' && Number.isFinite(quote.price))) return
+  Object.assign(quote, stockQuoteView(d))
+  if (d.name) stockName.value = d.name
+  if (d.market) market.value = d.market
+  if (!value.delayed) lastRefreshAt.value = new Date()
+}
+async function fetchQuote(forceRefresh = false) {
+  if (hasTracking.value && trackingBoard.value) return trackingBoard.value.refreshMarket()
   // 🔥 参数验证：确保股票代码不为空
   if (!symbol.value) {
     console.warn('股票代码为空，跳过获取报价')
@@ -657,26 +674,11 @@ async function fetchQuote() {
 
   const seq = ++quoteSeq
   try {
-    const res = await stocksApi.getQuote(symbol.value)
+    const res = await stocksApi.getQuote(symbol.value, forceRefresh)
     if (seq !== quoteSeq) return  // 已被新请求覆盖，丢弃旧响应
     const d: any = (res as any)?.data || {}
-    // 后端为 snake_case，前端状态为 camelCase，这里进行映射
-    quote.price = Number(d.price ?? d.close ?? quote.price)
-    quote.changePercent = Number(d.change_percent ?? quote.changePercent)
-    quote.open = Number(d.open ?? quote.open)
-    quote.high = Number(d.high ?? quote.high)
-    quote.low = Number(d.low ?? quote.low)
-    quote.prevClose = Number(d.prev_close ?? quote.prevClose)
-    quote.volume = Number.isFinite(d.volume) ? Number(d.volume) : quote.volume
-    quote.amount = Number.isFinite(d.amount) ? Number(d.amount) : quote.amount
-    quote.turnover = Number.isFinite(d.turnover_rate) ? Number(d.turnover_rate) : quote.turnover
-    quote.amplitude = Number.isFinite(d.amplitude) ? Number(d.amplitude) : quote.amplitude
-
-    // 🔥 获取数据日期（用于标注非当天数据）
-    quote.tradeDate = d.trade_date || null  // 交易日期（用于成交量、成交额）
-    quote.turnoverDate = d.turnover_rate_date || d.trade_date || null
-    quote.amplitudeDate = d.amplitude_date || d.trade_date || null
-    quote.updatedAt = d.updated_at || null  // 🔥 数据更新时间
+    Object.assign(quote, stockQuoteView(d))
+    quoteDelayed.value = false
 
     if (d.name) stockName.value = d.name
     if (d.market) market.value = d.market
@@ -684,6 +686,7 @@ async function fetchQuote() {
   } catch (e) {
     if (seq !== quoteSeq) return
     console.error('获取报价失败', e)
+    Object.assign(quote, stockQuoteView({ quote_kind: 'unavailable' }))
   }
 }
 
@@ -710,6 +713,7 @@ async function fetchFundamentals() {
     basics.ps = Number.isFinite(f.ps_ttm) ? Number(f.ps_ttm) : (Number.isFinite(f.ps) ? Number(f.ps) : basics.ps)
     // ROE 和负债率
     basics.roe = Number.isFinite(f.roe) ? Number(f.roe) : basics.roe
+    basics.roeStatus = f.roe_status || 'unavailable'
     const ff: any = f
     basics.debtRatio = Number.isFinite(ff.debt_ratio) ? Number(ff.debt_ratio) : basics.debtRatio
 
@@ -758,7 +762,7 @@ onMounted(async () => {
     fetchSyncStatus()  // 获取同步状态
   ])
   // 每30秒刷新一次报价
-  timer = setInterval(fetchQuote, 30000)
+  timer = setInterval(() => { if (!hasTracking.value && !document.hidden) void fetchQuote() }, 30000)
 })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 
@@ -793,7 +797,7 @@ async function fetchKline() {
     const res = await stocksApi.getKline(symbol.value, param as any, 200, 'none')
     if (seq !== klineSeq) return  // 已被新请求覆盖，丢弃旧响应
     const d: any = (res as any)?.data || {}
-    klineSource.value = d.source
+    klineSource.value = d.freshness ?? d.source  // 兼容旧键 source（历史上是 freshness 的错标）
     const items: any[] = Array.isArray(d.items) ? d.items : []
 
     const category: string[] = []
@@ -889,6 +893,7 @@ const basics = reactive({
   pb: NaN,              // 🔥 新增：市净率
   ps: NaN,              // 🔥 新增：市销率
   roe: NaN,
+  roeStatus: 'unavailable',
   debtRatio: NaN,
   peIsRealtime: false,  // PE是否为实时数据
   peSource: '',         // PE数据来源
@@ -955,30 +960,12 @@ async function fetchLatestAnalysis() {
     if (tasks && tasks.length > 0) {
       const latestTask = tasks[0]
       console.log('✅ [fetchLatestAnalysis] 找到任务:', latestTask)
-      console.log('🔍 [fetchLatestAnalysis] latestTask.result_data:', latestTask.result_data)
-      console.log('🔍 [fetchLatestAnalysis] latestTask.result:', latestTask.result)
-      console.log('🔍 [fetchLatestAnalysis] latestTask.task_id:', latestTask.task_id)
-      console.log('🔍 [fetchLatestAnalysis] latestTask.end_time:', latestTask.end_time)
 
       // 保存任务信息（包含 end_time 等）
       lastTaskInfo.value = latestTask
 
-      // 优先使用 result_data 字段（后端实际返回的字段名）
-      if (latestTask.result_data) {
-        lastAnalysis.value = latestTask.result_data
-        analysisStatus.value = 'completed'
-        console.log('✅ 加载历史分析报告成功 (result_data):', latestTask.result_data)
-        console.log('🔍 [fetchLatestAnalysis] lastAnalysis.value.reports:', lastAnalysis.value?.reports)
-      }
-      // 兼容旧的 result 字段
-      else if (latestTask.result) {
-        lastAnalysis.value = latestTask.result
-        analysisStatus.value = 'completed'
-        console.log('✅ 加载历史分析报告成功 (result):', latestTask.result)
-        console.log('🔍 [fetchLatestAnalysis] lastAnalysis.value.reports:', lastAnalysis.value?.reports)
-      }
-      // 否则尝试通过 task_id 获取结果
-      else if (latestTask.task_id) {
+      // 列表接口已瘦身（列表项不含 result/result_data），统一经 getTaskResult 拉全量报告
+      if (latestTask.task_id) {
         console.log('🔍 [fetchLatestAnalysis] 通过task_id获取结果:', latestTask.task_id)
         try {
           const resultResp: any = await analysisApi.getTaskResult(latestTask.task_id)
@@ -1068,13 +1055,6 @@ function formatSyncInterval(seconds: number): string {
     return `(每${hours}小时)`
   }
 }
-function fmtConf(v: any) {
-  const n = Number(v)
-  if (!Number.isFinite(n)) return '-'
-  const pct = n <= 1 ? n * 100 : n
-  return `${Math.round(pct)}%`
-}
-
 import { formatDateTimeWithRelative, formatDateTime } from '@/utils/datetime'
 
 // 格式化分析时间（处理UTC时间转换为中国本地时间）
@@ -1160,8 +1140,9 @@ function exportReport() {
   let fullReport = `# ${code.value} 股票分析报告\n\n`
 
   // 格式化分析时间用于报告
-  const reportTime = lastTaskInfo.value?.end_time
-    ? new Date(lastTaskInfo.value.end_time).toLocaleString('zh-CN', {
+  const completedAt = analysisCompletedAt(lastTaskInfo.value, lastAnalysis.value)
+  const reportTime = completedAt
+    ? new Date(completedAt).toLocaleString('zh-CN', {
         timeZone: 'Asia/Shanghai',
         year: 'numeric',
         month: '2-digit',
@@ -1173,8 +1154,9 @@ function exportReport() {
     : lastAnalysis.value?.analysis_date
 
   fullReport += `**分析时间**: ${reportTime}\n`
+  fullReport += `**分析周期**: ${analysisHorizonLabel(lastTaskInfo.value || lastAnalysis.value)}\n`
   fullReport += `**分析参考**: ${lastAnalysis.value.recommendation}\n`
-  fullReport += `**信心度**: ${fmtConf(lastAnalysis.value.confidence_score)}\n\n`
+  fullReport += `**模型置信度**: ${reportConfidence(lastAnalysis.value)}\n\n`
   fullReport += `---\n\n`
 
   for (const [key, content] of Object.entries(lastAnalysis.value.reports)) {
@@ -1191,7 +1173,7 @@ function exportReport() {
 
   // 使用分析日期作为文件名（简化格式）
   const fileDate = lastAnalysis.value.analysis_date || new Date().toISOString().slice(0, 10)
-  link.download = `${code.value}_分析报告_${fileDate}.md`
+  link.download = `${code.value}_${analysisHorizonLabel(lastTaskInfo.value || lastAnalysis.value, true)}分析报告_${fileDate}.md`
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
@@ -1408,6 +1390,7 @@ function exportReport() {
 /* 分析时间元信息 */
 .analysis-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 24px;
   padding: 8px 12px;

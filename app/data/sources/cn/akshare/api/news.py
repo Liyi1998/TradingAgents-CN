@@ -1,16 +1,17 @@
 """
 AKShare 新闻 API（个股定向获取）
 
-策略链（按优先级）：
+并行通道（失败有界降级）：
 1. 东方财富个股公告 → 精确匹配 symbol
-2. 东方财富搜索（按股票名称）→ 相关新闻
-3. 新浪财经搜索（按股票名称）→ 兜底
+2. 东方财富搜索（按股票代码）→ 相关性候选摘要
+3. 新浪财经个股资讯 → 公司标题锚定、有限正文摘录
 """
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
 from app.data.sources.base.exceptions import DataNotFoundError
+from app.data.sources.cn.shared.official_notices import fetch_official_notices
 
 from app.data.sources.cn.stock_name_utils import get_stock_name, get_stock_name_sync
 # 直连通道实现收拢在 cn/shared，本模块只做策略编排
@@ -25,6 +26,14 @@ logger = logging.getLogger(__name__)
 _DOMAIN = "news"
 
 
+async def _bounded_channel(awaitable, timeout):
+    try:
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+    except Exception as exc:
+        logger.debug("免费新闻通道暂不可用: %s", exc)
+        return []
+
+
 def _get_stock_name_sync(symbol: str) -> Optional[str]:
     """兼容层 — 委托给共享工具函数。"""
     return get_stock_name_sync(symbol)
@@ -37,14 +46,15 @@ async def _get_stock_name(symbol: str) -> Optional[str]:
 
 
 async def fetch_news(
-    symbol: str = None, limit: int = 10
+    symbol: str = None, limit: int = 10, end_date: str = None,
+    *, include_filings: bool = False,
 ) -> List[Dict[str, Any]]:
     """获取个股新闻（优先获取与指定股票直接相关的新闻和公告）
 
-    策略链:
+    有界并行通道:
     1. 东方财富个股公告（精确匹配 symbol）
-    2. 东方财富搜索（按股票名称搜索相关新闻）
-    3. 新浪财经搜索（兜底）
+    2. 东方财富搜索（按股票代码，仍需核验相关性）
+    3. 新浪财经个股资讯（公司标题锚定和有限正文摘录）
 
     Raises:
         DataNotFoundError: 所有策略均无数据，或 symbol 为空（不可重试）
@@ -56,29 +66,42 @@ async def fetch_news(
     all_news: List[Dict[str, Any]] = []
     seen_titles: set = set()
 
-    # 策略 1: 个股公告
-    notices = await _fetch_em_notices(symbol, limit=limit)
-    for item in notices:
-        if item["title"] not in seen_titles:
-            seen_titles.add(item["title"])
-            all_news.append(item)
-
-    # 策略 2: 按名称搜索新闻
-    stock_name = await _get_stock_name(symbol)
-    if stock_name:
-        news = await _fetch_em_search(stock_name, symbol, limit=limit)
-        for item in news:
-            if item["title"] not in seen_titles:
-                seen_titles.add(item["title"])
-                all_news.append(item)
-
-    # 策略 3: 新浪兜底
-    if len(all_news) < limit and stock_name:
-        sina_news = await _fetch_sina_news(stock_name, symbol, limit=limit)
-        for item in sina_news:
-            if item["title"] not in seen_titles:
-                seen_titles.add(item["title"])
-                all_news.append(item)
+    # Fast news must not wait behind PDF discovery/extraction. Filing excerpts
+    # are an explicit companion request, not a prerequisite for every headline.
+    from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT
+    context = ACTIVE_ANALYSIS_CONTEXT.get() or {}
+    cutoff = end_date[:10] if end_date else context.get("as_of")
+    if cutoff and context.get("as_of"):
+        cutoff = min(cutoff, context["as_of"])
+    try:
+        stock_name = await asyncio.wait_for(_get_stock_name(symbol), timeout=2)
+    except Exception:
+        stock_name = None
+    # Exact-code channels remain available even if a name lookup times out.
+    channels = [
+        _bounded_channel(_fetch_em_notices(symbol, limit=limit), 8),
+        _bounded_channel(_fetch_em_search(stock_name or "", symbol, limit=limit, end_date=cutoff), 8),
+        _bounded_channel(_fetch_sina_news(stock_name or "", symbol, limit=limit, end_date=cutoff), 8),
+    ]
+    if include_filings:
+        channels.append(_bounded_channel(
+            fetch_official_notices(symbol, limit=limit, end_date=cutoff), 28))
+    for population in await asyncio.gather(*channels):
+        for item in population:
+            title = str(item.get("title") or "").strip()
+            date = str(item.get("publish_time") or "")[:10]
+            if not title or (cutoff and date and date > cutoff):
+                continue
+            # Prefer a body excerpt over a title-only duplicate, regardless of
+            # which concurrent channel completed first.
+            if title in seen_titles:
+                previous = next(row for row in all_news if row["title"] == title)
+                if len(str(item.get("content") or "")) > len(str(previous.get("content") or "")):
+                    previous.update(item)
+                continue
+            seen_titles.add(title)
+            all_news.append({**item, "title": title})
+    all_news.sort(key=lambda row: str(row.get("publish_time") or ""), reverse=True)
 
     if not all_news:
         # 所有策略链均无结果 → 业务空数据
@@ -133,5 +156,3 @@ async def fetch_market_news(limit: int = 100) -> List[Dict[str, Any]]:
 
     logger.debug(f"AKShare 市场级新闻: 共 {len(results)} 条")
     return results
-
-

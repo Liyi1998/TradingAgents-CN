@@ -12,6 +12,7 @@ from .auth_db import get_current_user
 from ..services.reports_service import get_reports_service
 from ..utils.timezone import now_config_tz, format_date_short
 from ..core.response import safe_error_message
+from ..core.analysis_horizon import get_horizon_profile
 import logging
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,17 @@ async def get_reports_list(
         }
 
     except Exception as e:
-        logger.error(f"获取报告列表失败: {e}")
+        logger.error(f"获取报告列表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "操作失败"))
+
+@router.get("/{analysis_id}/condition-check")
+async def get_condition_check(analysis_id: str, user: dict = Depends(get_current_user)):
+    """Read only: independent shadow record, never part of the authoritative report."""
+    result = await get_reports_service().get_condition_check(analysis_id, str(user["id"]))
+    if result is None:
+        raise HTTPException(status_code=404, detail="没有可访问的条件核验记录（未启用或尚未记录）")
+    return {"success": True, "data": result}
+
 
 @router.get("/{report_id}/detail")
 async def get_report_detail(
@@ -87,7 +97,7 @@ async def get_report_detail(
         logger.info(f"获取报告详情: {report_id}")
 
         service = get_reports_service()
-        report = await service.get_report(report_id)
+        report = await service.get_report(report_id, user_id=user["id"])
 
         if not report:
             raise HTTPException(status_code=404, detail="报告不存在")
@@ -105,7 +115,7 @@ async def get_report_detail(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"获取报告详情失败: {e}")
+        logger.error(f"获取报告详情失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "操作失败"))
 
 @router.delete("/{report_id}")
@@ -133,7 +143,7 @@ async def delete_report(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"删除报告失败: {e}")
+        logger.error(f"删除报告失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "操作失败"))
 
 @router.get("/{report_id}/download")
@@ -154,7 +164,7 @@ async def download_report(
         logger.info(f"下载报告: {report_id}, 格式: {format}")
 
         service = get_reports_service()
-        doc = await service.download_report(report_id)
+        doc = await service.download_report(report_id, user_id=user["id"])
 
         if not doc:
             raise HTTPException(status_code=404, detail="报告不存在")
@@ -165,11 +175,12 @@ async def download_report(
 
         stock_symbol = doc.get("stock_symbol", "unknown")
         analysis_date = doc.get("analysis_date", format_date_short(now_config_tz()))
+        horizon = get_horizon_profile(doc.get("analysis_horizon"))
 
         if format == "json":
             # JSON格式下载
             content = json.dumps(doc, ensure_ascii=False, indent=2, default=str)
-            filename = f"{stock_symbol}_{analysis_date}_report.json"
+            filename = f"{stock_symbol}_{analysis_date}_{horizon.key}_report.json"
             media_type = "application/json"
 
             # 返回文件流
@@ -190,6 +201,7 @@ async def download_report(
             # 添加标题
             content_parts.append(f"# {stock_symbol} 分析报告")
             content_parts.append(f"**分析日期**: {analysis_date}")
+            content_parts.append(f"**分析周期**: {horizon.label}（{horizon.holding_period}）")
             content_parts.append(f"**分析师**: {', '.join(doc.get('analysts', []))}")
             content_parts.append("")
 
@@ -197,6 +209,12 @@ async def download_report(
             if doc.get("summary"):
                 content_parts.append("## 执行摘要")
                 content_parts.append(doc["summary"])
+                content_parts.append("")
+
+            # 历史报告原文保持不变；下载时在前面追加读取时生成的分账户兼容摘要。
+            if doc.get("decision") and doc.get("recommendation"):
+                content_parts.append("## 分账户裁决（结构化兼容摘要）")
+                content_parts.append(doc["recommendation"])
                 content_parts.append("")
 
             # 添加各模块内容
@@ -207,7 +225,7 @@ async def download_report(
                     content_parts.append("")
 
             content = "\n".join(content_parts)
-            filename = f"{stock_symbol}_{analysis_date}_report.md"
+            filename = f"{stock_symbol}_{analysis_date}_{horizon.key}_report.md"
             media_type = "text/markdown"
 
             # 返回文件流
@@ -245,7 +263,7 @@ async def download_report(
                     headers={"Content-Disposition": f"attachment; filename={filename}"}
                 )
             except Exception as e:
-                logger.error(f"Word 文档生成失败: {e}")
+                logger.error(f"Word 文档生成失败: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=safe_error_message(e, "Word 文档生成失败"))
 
         elif format == "pdf":
@@ -273,7 +291,7 @@ async def download_report(
                     headers={"Content-Disposition": f"attachment; filename={filename}"}
                 )
             except Exception as e:
-                logger.error(f"PDF 文档生成失败: {e}")
+                logger.error(f"PDF 文档生成失败: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=safe_error_message(e, "PDF 文档生成失败"))
 
         else:
@@ -282,5 +300,5 @@ async def download_report(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"下载报告失败: {e}")
+        logger.error(f"下载报告失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "操作失败"))

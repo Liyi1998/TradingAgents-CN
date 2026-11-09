@@ -4,6 +4,7 @@
  */
 
 import { request, type ApiResponse } from './request'
+import type { AnalysisHorizon } from '@/types/analysis'
 
 // 后端期望的请求格式
 export interface SingleAnalysisRequest {
@@ -14,15 +15,19 @@ export interface SingleAnalysisRequest {
   parameters?: {
     market_type?: string
     analysis_date?: string
+    analysis_horizon?: AnalysisHorizon
     selected_analysts?: string[]
     /** 工作流通用化：选中节点（优先于 selected_analysts） */
     selected_nodes?: string[]
     /** 工作流通用化：optional 阶段开关/轮次（优先于 phaseN_* 旧映射） */
     stage_overrides?: Record<string, { enabled?: boolean; rounds?: number }>
+    /** 投资期限（short/mid/long 为兼容别名；研究周期以 analysis_horizon 为准） */
+    horizon?: 'short' | 'mid' | 'long'
     custom_prompt?: string
     include_sentiment?: boolean
     include_risk?: boolean
     language?: string
+    account_position?: 'UNKNOWN' | 'NONE' | 'HELD'
     analyst_model?: string
     debate_model?: string
     mcp_tools?: string[]
@@ -43,6 +48,7 @@ export interface AnalysisStep {
 
 export interface AnalysisResult {
   analysis_id: string
+  analysis_horizon?: AnalysisHorizon
   symbol?: string  // 主字段：6位股票代码
   stock_symbol: string  // 兼容字段
   stock_code?: string  // 兼容字段（已废弃）
@@ -117,6 +123,7 @@ export interface AgentEvent {
 export interface TaskOverview {
   task: {
     task_id: string
+    analysis_horizon?: AnalysisHorizon
     status: string
     symbol?: string
     market_type?: string
@@ -124,6 +131,7 @@ export interface TaskOverview {
     created_at?: string
     started_at?: string
     completed_at?: string
+    error_message?: string
   }
   stock_info: {
     symbol: string
@@ -137,6 +145,7 @@ export interface TaskOverview {
 /** 任务列表中的单个任务项（精简，仅前端消费字段） */
 export interface AnalysisTask {
   task_id: string
+  analysis_horizon?: AnalysisHorizon
   status: string
   symbol?: string
   stock_symbol?: string
@@ -167,9 +176,19 @@ export const analysisApi = {
     return request.post('/api/analysis/single', analysisRequest)
   },
 
+  retryTask(taskId: string): Promise<ApiResponse<{
+    task_id: string
+    existing: boolean
+    reused_report_keys: string[]
+  }>> {
+    return request.post(`/api/analysis/tasks/${taskId}/retry`)
+  },
+
   // 获取任务状态
   getTaskStatus(taskId: string): Promise<ApiResponse<{
     status: string
+    analysis_horizon?: AnalysisHorizon
+    parameters?: Record<string, unknown>
     progress?: number
     progress_percentage?: number
     current_step_name?: string

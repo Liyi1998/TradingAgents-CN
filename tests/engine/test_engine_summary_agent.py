@@ -143,6 +143,41 @@ class TestSummaryNodePromptConstruction:
         assert result["structured_summary"]["model_confidence"] == 60
 
     @pytest.mark.asyncio
+    async def test_report_presence_does_not_prove_news_field_completeness(self):
+        llm = RecordingLLM(json.dumps({
+            "key_indicators": {}, "model_confidence": 60,
+            "risk_assessment": {
+                "level": "Medium", "score": 5.0,
+                "description": "新闻与情绪报告为空，结论有限",
+            },
+            "analysis_summary": "新闻和情绪数据缺失，但建议持有",
+            "investment_recommendation": "持有",
+            "analysis_reference": [], "final_signal": "Hold",
+        }, ensure_ascii=False))
+        node = create_summary_agent(llm)
+        state = {
+            "company_of_interest": "600332",
+            "market_report": "技术报告" * 100,
+            "news_report": "新闻报告正文" * 100,
+            "sentiment_report": "情绪报告正文" * 100,
+            "fundamentals_report": "基本面正文" * 100,
+            "trader_investment_plan": "持有",
+            "final_trade_decision": "持有",
+        }
+
+        state["_stage_inputs"] = {"analyst_reports": {k: v for k, v in state.items() if k.endswith("_report")}, "trader_plan": "持有", "final_decision": "持有"}
+        result = await node(state)
+        structured = result["structured_summary"]
+
+        assert "数据缺失" in structured["analysis_summary"]
+        assert structured["report_presence"]["news"] is True
+        assert structured["report_presence"]["sentiment"] is True
+        assert structured["risk_assessment"]["description"] == "新闻与情绪报告为空，结论有限"
+        prompt_content = llm.calls[0]["messages"][0].content
+        assert '"news": true' in prompt_content
+        assert '"sentiment": true' in prompt_content
+
+    @pytest.mark.asyncio
     async def test_prompt_injection_in_reports_does_not_leak_into_system(self):
         """H4 关键安全契约：上游 LLM 输出包含恶意 prompt 注入时，
         绝不能污染 system 参数（必须仅出现在 USER 消息的 XML 边界符内）。"""
@@ -259,7 +294,7 @@ class TestInputHealthCheck:
         assert len(llm.calls) == 0
         structured = result["structured_summary"]
         assert structured["analysis_summary"] == "数据获取失败，无法生成报告"
-        assert structured["model_confidence"] == 0
+        assert structured["model_confidence"] is None
         assert structured["risk_assessment"]["description"] == "数据获取失败，无法生成报告"
 
 

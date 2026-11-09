@@ -81,6 +81,7 @@
               </el-link>
               <div class="report-subtitle">
                 {{ row.stock_code }} - {{ row.stock_name }}
+                <el-tag size="small" type="info" effect="plain">{{ analysisHorizonLabel(row, true) }}</el-tag>
               </div>
             </div>
           </template>
@@ -195,6 +196,7 @@ import {
   ArrowDown
 } from '@element-plus/icons-vue'
 import { reportsApi, type ReportItem } from '@/api/reports'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
 
 // 使用路由
 const router = useRouter()
@@ -297,7 +299,7 @@ const downloadReport = async (report: any, format: string = 'markdown') => {
 
     // 根据格式设置文件扩展名
     const ext = getFileExtension(format)
-    a.download = `${report.stock_code}_分析报告_${report.analysis_date}.${ext}`
+    a.download = `${report.stock_code}_${analysisHorizonLabel(report, true)}分析报告_${report.analysis_date}.${ext}`
 
     document.body.appendChild(a)
     a.click()
@@ -472,6 +474,10 @@ onMounted(() => {
   .reports-list-card {
     .report-title {
       .report-subtitle {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 6px;
         font-size: 12px;
         color: var(--el-text-color-placeholder);
         margin-top: 2px;

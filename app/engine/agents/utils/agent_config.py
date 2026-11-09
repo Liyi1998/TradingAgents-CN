@@ -23,14 +23,15 @@ async def resolve_company_name(ticker: str, market_info: dict) -> str:
     try:
         if market_info["is_china"]:
             try:
+                from app.core.async_utils import await_on_main_loop
                 from app.data.core.interface import DataInterface
                 _di = DataInterface.get_instance()
-                _r = await _di.read("CN", "basic_info", symbol=ticker)
+                _r = await await_on_main_loop(
+                    _di.read("CN", "basic_info", symbol=ticker)
+                )
                 data = _r.get("data")
-                if data and isinstance(data, dict) and data.get("name"):
+                if data and data.get("name"):
                     return data["name"]
-                if data and isinstance(data, list) and data and data[0].get("name"):
-                    return data[0]["name"]
             except Exception as e:
                 logger.debug(f"获取A股公司名称失败: {e}")
                 pass
@@ -38,19 +39,15 @@ async def resolve_company_name(ticker: str, market_info: dict) -> str:
 
         if market_info["is_hk"]:
             try:
+                from app.core.async_utils import await_on_main_loop
                 from app.data.core.interface import DataInterface
-                clean_ticker = ticker.replace(".HK", "").replace(".hk", "").zfill(5)
                 di = DataInterface.get_instance()
-                result = await di.read("HK", "basic_info", symbol=clean_ticker)
+                result = await await_on_main_loop(
+                    di.read("HK", "basic_info", symbol=ticker)
+                )
                 data = result.get("data")
-                if data:
-                    name = data.get("name_zh") or data.get("name_en") if isinstance(data, dict) else None
-                    if name:
-                        return name
-                    if isinstance(data, list) and data:
-                        name = data[0].get("name_zh") or data[0].get("name_en")
-                        if name:
-                            return name
+                if data and data.get("name"):
+                    return data["name"]
             except Exception as e:
                 logger.debug(f"获取港股公司名称失败: {e}")
             clean_ticker = ticker.replace(".HK", "").replace(".hk", "")
@@ -58,22 +55,22 @@ async def resolve_company_name(ticker: str, market_info: dict) -> str:
 
         if market_info["is_us"]:
             try:
+                from app.core.async_utils import await_on_main_loop
                 from app.data.core.interface import DataInterface
                 di = DataInterface.get_instance()
-                result = await di.read("US", "basic_info", symbol=ticker.upper())
+                result = await await_on_main_loop(
+                    di.read("US", "basic_info", symbol=ticker.upper())
+                )
                 data = result.get("data")
-                if data:
-                    doc = data[0] if isinstance(data, list) and data else data
-                    company_name = doc.get("name") or doc.get("shortName") or doc.get("longName")
-                    if company_name:
-                        return company_name
+                if data and data.get("name"):
+                    return data["name"]
             except Exception as e:
                 logger.debug(f"获取美股公司名称失败: {e}")
             return StockUtils.US_STOCK_NAMES.get(ticker.upper(), f"美股{ticker}")
 
         return f"股票{ticker}"
     except Exception as exc:
-        logger.error(f"❌ 获取公司名称失败: {exc}")
+        logger.error(f"❌ 获取公司名称失败: {exc}", exc_info=True)
         return f"股票{ticker}"
 
 
@@ -95,6 +92,10 @@ def _find_agent_entry(slug: str) -> Optional[dict]:
 
 def load_agent_config(slug: str) -> str:
     """从 YAML 配置加载智能体角色定义"""
+    from app.engine.orchestrator.workflow.research import role_for
+    role = role_for(slug)
+    if role is not None:
+        return role.prompt
     try:
         entry = _find_agent_entry(slug)
         if entry is None:
@@ -102,7 +103,7 @@ def load_agent_config(slug: str) -> str:
             return ""
         return entry.get("roleDefinition", "")
     except Exception as e:
-        logger.error(f"加载配置文件失败: {e}")
+        logger.error(f"加载配置文件失败: {e}", exc_info=True)
         return ""
 
 
@@ -114,5 +115,5 @@ def load_agent_display_name(slug: str) -> str:
             return ""
         return str(entry.get("name", "") or "")
     except Exception as e:
-        logger.error(f"加载智能体显示名失败: {e}")
+        logger.error(f"加载智能体显示名失败: {e}", exc_info=True)
         return ""

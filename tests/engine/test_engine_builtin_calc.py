@@ -110,6 +110,16 @@ class TestExpression:
         result = calc_expression("(1291.5 - 1250) / 1250 * 100")
         assert "= 3.3200" in result
 
+    def test_calc_batch_preserves_order_and_isolates_errors(self):
+        result = calc_batch(["2 * 3 * 3", "1 / 0", "(6 - 3) / 2"])
+        lines = result.splitlines()
+        assert lines[0] == "1. 2 * 3 * 3 = 18.0000"
+        assert lines[1].startswith("2. 错误：ZeroDivisionError")
+        assert lines[2] == "3. (6 - 3) / 2 = 1.5000"
+
+    def test_calc_batch_rejects_oversized_batch(self):
+        assert "最多" in calc_batch(["1 + 1"] * 51)
+
 
 # ──────────────────────────────────────────────────────────────
 # 金融函数（已知答案）

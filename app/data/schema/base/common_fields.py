@@ -38,6 +38,11 @@ class CommonFields:
     market: str  # CN / HK / US
     data_source: str  # tushare / akshare / baostock / ...
     updated_at: Optional[str] = None  # ISO 8601 UTC
+    asset_type: Optional[str] = None
+    exchange: Optional[str] = None
+    volume_unit: Optional[str] = None
+    amount_unit: Optional[str] = None
+    unit_conversion: Optional[str] = None
 
     def to_db_doc(self) -> Dict[str, Any]:
         """转为 MongoDB 文档，过滤 None 与 NaN/Inf 值。

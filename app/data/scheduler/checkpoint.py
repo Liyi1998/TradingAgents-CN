@@ -17,7 +17,7 @@ class CheckpointManager:
     async def get_checkpoint(self, market: str, domain: str, source: str) -> Optional[str]:
         """获取检查点日期。"""
         cp = await self._repo.get_checkpoint(market, domain, source)
-        return cp.get("last_sync_date") if cp else None
+        return cp.get("last_sync_date") if cp and cp.get("status", "success") in {"success", "no_events"} and (cp.get("record_count", 0) > 0 or domain in {"dragon_tiger", "block_trade"}) else None
 
     async def get_checkpoint_doc(self, market: str, domain: str, source: str) -> Optional[dict]:
         """获取完整检查点文档（含 last_sync_time/last_sync_date/status 等）。

@@ -96,6 +96,7 @@ class SchedulerMonitor:
                 "domain": domain,
                 "started_at": time.time(),
                 "started_at_iso": datetime.now(timezone.utc).isoformat(),
+                "timeout_recorded": False,
             }
 
     def on_task_complete(
@@ -233,23 +234,24 @@ class SchedulerMonitor:
                 if self._loop_count % self._stale_check_interval == 0:
                     self.check_stale_tasks()
             except Exception as e:
-                logger.error(f"监控循环异常: {e}")
+                logger.error(f"监控循环异常: {e}", exc_info=True)
 
     def _check_timeouts(self) -> None:
-        """检查超时任务。"""
+        """检查超时任务；每次执行只记录一次，真正取消由调度引擎负责。"""
         now = time.time()
         with self._dict_lock:
-            snapshot = list(self._running_tasks.items())
-        for task_id, info in snapshot:
-            elapsed = now - info["started_at"]
-            if elapsed > self._timeout_threshold_seconds:
-                # 节流：同一任务 10 分钟内只告警一次，避免监控循环刷屏
-                last_warn = self._timeout_warned_at.get(task_id, 0.0)
-                if now - last_warn >= 600:
-                    self._timeout_warned_at[task_id] = now
-                    logger.warning(f"任务超时: {task_id}, 已运行 {int(elapsed / 60)} 分钟")
-                # 记录到 sync_events
-                self._record_timeout_event(info, elapsed)
+            timed_out = []
+            for task_id, info in self._running_tasks.items():
+                elapsed = now - info["started_at"]
+                if (
+                    elapsed > self._timeout_threshold_seconds
+                    and not info.get("timeout_recorded", False)
+                ):
+                    info["timeout_recorded"] = True
+                    timed_out.append((task_id, dict(info), elapsed))
+        for task_id, info, elapsed in timed_out:
+            logger.warning(f"任务超时: {task_id}, 已运行 {int(elapsed / 60)} 分钟")
+            self._record_timeout_event(info, elapsed)
 
     def _record_timeout_event(self, info: Dict, elapsed: float) -> None:
         """记录超时事件到 sync_events。

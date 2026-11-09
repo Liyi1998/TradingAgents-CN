@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 import time
 from importlib.metadata import version as _pkg_version, PackageNotFoundError
 
@@ -72,24 +73,40 @@ def _health_response():
 
 @router.get("/health")
 @router.get("/api/health")
-async def health():
+async def health(request: Request):
     """健康检查接口 - 前端使用 /health 或 /api/health"""
-    return _health_response()
+    from app.services.readiness_service import check_readiness
+
+    readiness = await check_readiness(getattr(request.app.state, "service_lifecycle", None))
+    body = _health_response()
+    body["data"]["readiness"] = readiness
+    if not readiness["ready"]:
+        body["success"] = False
+        body["data"]["status"] = "not_ready"
+        body["message"] = "服务尚未就绪"
+    return JSONResponse(body, status_code=200 if readiness["ready"] else 503)
 
 
 @router.get("/healthz")
 @router.get("/api/healthz")
-async def healthz():
+async def healthz(request: Request):
     """纯内存 liveness 探针（零磁盘 I/O）。
 
-    Docker healthcheck 与前端连通性探测统一走本端点，与含版本信息的
-    /health、/api/health（informative）分离，探针延迟永不耦合到存储。
+    只反映进程生命周期，不宣称数据库可用。业务就绪检查使用
+    /readyz 或 /health；本端点不执行资源探测。
     /api/healthz 别名供前端使用（vite dev 代理只转发 /api 前缀）。
     """
-    return {"status": "ok"}
+    state = getattr(request.app.state, "service_lifecycle", None)
+    running = state is not None and state.phase in ("starting", "ready")
+    return JSONResponse({"status": "ok" if running else "not_running"},
+                        status_code=200 if running else 503)
 
 
 @router.get("/readyz")
-async def readyz():
+@router.get("/api/readyz")
+async def readyz(request: Request):
     """Kubernetes就绪检查"""
-    return {"ready": True}
+    from app.services.readiness_service import check_readiness
+
+    result = await check_readiness(getattr(request.app.state, "service_lifecycle", None))
+    return JSONResponse(result, status_code=200 if result["ready"] else 503)

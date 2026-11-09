@@ -1,0 +1,3 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:jev-shadow-52d316aa

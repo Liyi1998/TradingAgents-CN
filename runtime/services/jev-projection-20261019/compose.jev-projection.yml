@@ -1,0 +1,3 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:jev-projection-fa0ee4dd

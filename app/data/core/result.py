@@ -49,16 +49,19 @@ class RefreshResult:
             return self.status
 
         all_fresh = all(s == "fresh" for s in non_skipped)
-        all_success = all(s in ("fresh", "refreshed") for s in non_skipped)
-        any_failed = "failed" in non_skipped
+        all_success = all(s in ("fresh", "refreshed", "no_events") for s in non_skipped)
+        any_failed = any(s in ("failed", "empty") for s in non_skipped)
+        any_partial = "partial" in non_skipped
         any_timeout = "timeout" in non_skipped
 
         if all_fresh:
             self.status = RefreshStatus.FRESH
         elif all_success:
             self.status = RefreshStatus.REFRESHED
+        elif any_partial:
+            self.status = RefreshStatus.PARTIAL
         elif any_failed or any_timeout:
-            if any(s in ("fresh", "refreshed") for s in non_skipped):
+            if any(s in ("fresh", "refreshed", "no_events") for s in non_skipped):
                 self.status = RefreshStatus.PARTIAL
             else:
                 self.status = RefreshStatus.FAILED

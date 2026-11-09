@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:baseline-switch-8f454bdb
+  frontend:
+    image: tradingagents-cn-hub-frontend:baseline-switch-8f454bdb

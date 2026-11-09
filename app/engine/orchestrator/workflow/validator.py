@@ -41,7 +41,7 @@ def _phase1_slugs() -> set:
     """phase1 分析师 slug 全集（registry 动态段）"""
     from app.engine.orchestrator import registry
 
-    return {i.slug for i in registry._load_identities() if i.is_analyst}
+    return {i.slug for i in registry.load_identities() if i.is_analyst}
 
 
 def _phase1_report_keys() -> Set[str]:
@@ -49,7 +49,7 @@ def _phase1_report_keys() -> Set[str]:
     from app.engine.orchestrator import registry
 
     keys: Set[str] = set()
-    for identity in registry._load_identities():
+    for identity in registry.load_identities():
         if identity.is_analyst:
             keys.update(identity.report_keys)
     return keys
@@ -75,7 +75,7 @@ def stage_output_keys(spec: WorkflowSpec, stage) -> Tuple[Set[str], Set[str]]:
                 # phase1 分析师 ref：经 registry 动态段取报告键
                 from app.engine.orchestrator import registry
 
-                for identity in registry._load_identities():
+                for identity in registry.load_identities():
                     if identity.slug == ref.ref:
                         report_keys.update(identity.report_keys)
     elif isinstance(stage, DebateStage):
@@ -273,6 +273,23 @@ def validate(spec: WorkflowSpec) -> List[str]:
     # ── 输入连线（P3）──
     errors.extend(validate_inputs(spec))
 
+    if spec.research_profile is not None:
+        profile = spec.research_profile
+        for slug in (*profile.required_analysts, *(n.slug for n in spec.nodes)):
+            if slug not in profile.roles:
+                errors.append(f"research_profile.roles: 缺少周期角色 {slug}")
+        for slug in profile.required_analysts:
+            if slug not in phase1:
+                errors.append(f"research_profile.required_analysts: 分析师不存在或已删除 {slug}")
+        from app.engine.tools.datasources.registry import get_spec_by_id
+        for slug, role in profile.roles.items():
+            for tool_id in role.data_tools or ():
+                if get_spec_by_id(tool_id) is None:
+                    errors.append(f"research_profile.roles.{slug}: 未注册数据工具 {tool_id}")
+        contracts = {slug: [slot.model_dump() for slot in role.template_inputs]
+                     for slug, role in profile.roles.items()}
+        errors.extend(validate_inputs_coverage(spec, contracts))
+
     return errors
 
 
@@ -285,7 +302,7 @@ def validate_registry_anchor(spec: WorkflowSpec) -> List[str]:
     from app.engine.orchestrator import registry
 
     errors: List[str] = []
-    static_identities = [i for i in registry._load_identities() if not i.is_analyst]
+    static_identities = [i for i in registry.load_identities() if not i.is_analyst]
     by_slug = {i.slug: i for i in static_identities}
 
     seed_builtins = [n for n in spec.nodes if n.builtin]

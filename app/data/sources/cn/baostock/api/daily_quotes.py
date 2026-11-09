@@ -29,6 +29,11 @@ def _to_baostock_code(symbol: str) -> str:
     BaoStock 不支持北交所（4xx/8xx/92x 开头），抛 DataNotFoundError。
     domain 参数由调用方上下文决定。
     """
+    text = str(symbol).upper()
+    if "." in text:
+        code, suffix = text.rsplit(".", 1)
+        if suffix in {"SH", "SZ"} and code.isdigit():
+            return f"{suffix.lower()}.{code.zfill(6)}"
     code = str(symbol).zfill(6)
     if code.startswith(("4", "8", "92")):
         logger.warning(f"北交所股票 {code} 不被 BaoStock 支持")
@@ -57,9 +62,9 @@ def _check_rs_error(rs, source: str, domain: str, hint: str) -> None:
 
 
 async def fetch_daily_quotes(
-    code: str, start_date: str, end_date: str
+    code: str, start_date: str, end_date: str, adjust: str = ""
 ) -> Optional[pd.DataFrame]:
-    """获取日线行情（前复权）
+    """获取日线行情（默认不复权；显式请求可取前/后复权）
 
     异常分类：
     - asyncio.TimeoutError / ConnectionError / TimeoutError → NetworkError
@@ -68,6 +73,9 @@ async def fetch_daily_quotes(
     - DataFrame 组装异常 → DataFormatError
     - 其他 → DataSourceUnavailableError
     """
+    flags = {"": "3", "raw": "3", "qfq": "2", "hfq": "1"}
+    if not isinstance(adjust, str) or adjust not in flags:
+        raise ValueError(f"unsupported BaoStock price adjustment: {adjust}")
     bs_code = _to_baostock_code(code)
     # BaoStock 要求 yyyy-mm-dd（带连字符），传 yyyyMMdd 会报“日期格式不正确”
     start, end = start_date, end_date
@@ -80,7 +88,7 @@ async def fetch_daily_quotes(
             start_date=start,
             end_date=end,
             frequency="d",
-            adjustflag="2",
+            adjustflag=flags[adjust],
         )
         _check_rs_error(rs, "baostock", _DOMAIN_DAILY, hint)
         rows = []
@@ -103,6 +111,11 @@ async def fetch_daily_quotes(
             logger.warning(f"BaoStock {_DOMAIN_DAILY} 返回空: {hint}")
             raise DataNotFoundError("baostock", _DOMAIN_DAILY, f"{hint} 无数据")
 
+        from app.utils.timezone import now_tz
+        df = df.copy()
+        df["price_basis"] = "raw" if flags[adjust] == "3" else adjust
+        if flags[adjust] != "3":
+            df["adjustment_as_of"] = now_tz().date().isoformat()
         logger.info(f"BaoStock 行情: {code} {len(df)} 条")
         return df
 
@@ -128,8 +141,11 @@ async def fetch_adj_factors(
     异常分类同 fetch_daily_quotes。
     """
     bs_code = _to_baostock_code(code)
-    # BaoStock 要求 yyyy-mm-dd（带连字符），传 yyyyMMdd 会报“日期格式不正确”
-    start, end = start_date, end_date
+    # An event before the requested quote window is its initial anchor. Query
+    # the source's complete CN event history, then bound the normalized result;
+    # requesting only [start_date,end_date] silently loses that anchor.
+    from app.utils.timezone import now_tz
+    start, end = "1990-01-01", end_date or now_tz().date().isoformat()
     hint = f"code={code}"
 
     def _fetch():
@@ -159,8 +175,19 @@ async def fetch_adj_factors(
             logger.warning(f"BaoStock {_DOMAIN_ADJ} 返回空: {hint}")
             raise DataNotFoundError("baostock", _DOMAIN_ADJ, f"{hint} 无数据")
 
-        logger.info(f"BaoStock 复权因子: {code} {len(df)} 条")
-        return df
+        from app.data.processor.adjustment_contract import normalize_adjustment_events
+
+        try:
+            normalized = normalize_adjustment_events(
+                df, source="baostock", symbol=bs_code.split(".")[-1],
+                start_date=start_date, end_date=end,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DataFormatError("baostock", _DOMAIN_ADJ, f"{hint}: {exc}") from exc
+        if normalized.empty:
+            raise DataNotFoundError("baostock", _DOMAIN_ADJ, f"{hint} 无有效复权事件")
+        logger.info(f"BaoStock 复权因子: {code} {len(normalized)} 条")
+        return normalized
 
     except (
         NetworkError,

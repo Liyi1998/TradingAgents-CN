@@ -17,3 +17,14 @@ class IntradayQuotesSchema(CommonFields):
     volume: Optional[float] = None       # 成交量（股）
     amount: Optional[float] = None       # 成交额（元）
     pct_chg: Optional[float] = None      # 涨跌幅 %
+    ohlc_kind: Optional[str] = None     # native_bar, not sampled last prices
+    price_basis: Optional[str] = None
+
+    def to_db_doc(self):
+        doc = super().to_db_doc()
+        if self.ohlc_kind == "native_bar":
+            # Replacing a different provider's same-time bar must not retain its
+            # old turnover under the new provider identity.
+            doc["amount"] = self.amount
+            doc["amount_unit"] = self.amount_unit
+        return doc

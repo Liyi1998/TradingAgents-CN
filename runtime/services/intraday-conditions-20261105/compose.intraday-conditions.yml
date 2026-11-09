@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:intraday-conditions-06035221
+  frontend:
+    image: tradingagents-cn-hub-frontend:intraday-conditions-06035221

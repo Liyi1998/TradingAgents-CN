@@ -20,14 +20,26 @@ daily_quotes:
   timezone: "Asia/Shanghai"
   mode: incremental
   description: "每交易日 16:15 增量同步日线行情"
+  # 金策智算 DuckDB 是历史行情真相来源；MongoDB 仅缓存近期窗口。
+  source: "duckdb"
   depends_on:
     - basic_info
+
+index_quotes:
+  cron: "25 16 * * 1-5"
+  timezone: "Asia/Shanghai"
+  mode: incremental
+  description: "每交易日 16:25 增量同步指数日线（基准宇宙，4 只）"
+  depends_on:
+    - daily_quotes
 
 daily_indicators:
   cron: "45 16 * * 1-5"
   timezone: "Asia/Shanghai"
   mode: incremental
   description: "每交易日 16:45 增量同步每日指标"
+  # 腾讯行情响应自带 PE/PB/市值/换手率；AKShare 仅作回退。
+  source: "tencent"
   depends_on:
     - daily_quotes
 
@@ -54,6 +66,8 @@ money_flow:
     - daily_quotes
 
 margin_trading:
+  # 上游能力保留；逐股请求全市场表的放大风险验收后再启用。
+  enabled: false
   cron: "30 17 * * 1-5"
   timezone: "Asia/Shanghai"
   mode: incremental
@@ -65,6 +79,7 @@ dragon_tiger:
   cron: "0 18 * * 1-5"
   timezone: "Asia/Shanghai"
   mode: incremental
+  source: "akshare"
   description: "每交易日 18:00 同步龙虎榜（当日上榜全量）"
   depends_on:
     - daily_quotes
@@ -73,6 +88,7 @@ block_trade:
   cron: "30 18 * * 1-5"
   timezone: "Asia/Shanghai"
   mode: incremental
+  source: "akshare"
   description: "每交易日 18:30 同步大宗交易（当日全量）"
   depends_on:
     - daily_quotes
@@ -91,6 +107,8 @@ market_quotes:
   timezone: "Asia/Shanghai"
   mode: full
   description: "每交易日 15:05 全量市场快照"
+  # 腾讯公开接口分批拉取全市场快照，AKShare 仅作为回退。
+  source: "tencent"
 
 news:
   cron: "0 */2 * * *"

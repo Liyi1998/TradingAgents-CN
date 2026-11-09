@@ -4,7 +4,3 @@ from .adapter import YFinanceHKAdapter
 from .provider import YFinanceHKProvider
 
 __all__ = ["YFinanceHKAdapter", "YFinanceHKProvider"]
-
-
-def get_yfinance_hk_adapter():
-    return YFinanceHKAdapter()

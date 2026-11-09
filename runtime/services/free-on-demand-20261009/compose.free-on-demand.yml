@@ -1,0 +1,4 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:on-demand-4c5d528c
+    pull_policy: never

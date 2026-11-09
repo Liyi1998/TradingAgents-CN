@@ -9,10 +9,15 @@
 import pytest
 
 from app.engine.orchestrator.pipeline import (
+    AnalysisQualityError,
     MAX_ROUNDS,
     PipelineDeps,
     _format_analyst_node,
+    _is_invalid_report_content,
     _merge_state_update,
+    _require_valid_debate_rounds,
+    _require_valid_reports,
+    _require_valid_summary,
 )
 from app.engine.orchestrator.state import create_initial_state
 
@@ -28,6 +33,11 @@ class TestNodeNaming:
 
 
 class TestInitialStateShape:
+    @pytest.mark.parametrize("symbol", [None, "", "  ", "None", "null", "undefined"])
+    def test_missing_symbol_is_rejected_before_agent_execution(self, symbol):
+        with pytest.raises(ValueError, match="股票代码缺失"):
+            create_initial_state(symbol, "2026-09-22")
+
     def test_core_fields(self):
         state = create_initial_state("000001", "2024-12-31")
         assert state["company_of_interest"] == "000001"
@@ -70,6 +80,122 @@ class TestPipelineDeps:
         deps = PipelineDeps(analyst_client=None, debate_client=None, toolkit=None)
         assert deps.bull_memory is None
         assert deps.config == {}
+
+
+class TestReportQualityGate:
+    def test_long_target_failure_template_is_invalid(self):
+        report = (
+            "# 财经新闻分析报告.md\n\n## 结论\n"
+            "**数据获取失败：无法对目标股票进行有效分析。**\n"
+            "用户提供的股票代码和公司名称均为 `None`，无法唯一识别目标证券。\n"
+            + "## 数据缺失说明\n暂不能形成结论。\n" * 100
+        )
+        assert len(report) > 500
+        assert _is_invalid_report_content(report)
+
+    def test_failure_placeholder_is_invalid(self):
+        assert _is_invalid_report_content("❌ 分析失败：Connection error.")
+        assert _is_invalid_report_content("⚠️ 交易员未能生成有效投资计划（LLM 返回空响应）。")
+
+    def test_long_report_with_local_data_gap_is_valid(self):
+        report = (
+            "# 完整分析报告\n\n"
+            + "行情、估值、风险与关键价格区间均已完成核验。" * 45
+            + "\n某个次要数据源数据获取失败，已明确披露，不影响其余章节。"
+        )
+        assert len(report) > 500
+        assert not _is_invalid_report_content(report)
+
+    def test_missing_selected_report_aborts_pipeline(self):
+        with pytest.raises(AnalysisQualityError, match="market_report"):
+            _require_valid_reports(
+                {"financial_news_report": "# 财经新闻\n" + "有效内容" * 200},
+                ["market_report", "financial_news_report"],
+                "基础分析阶段",
+            )
+
+    def test_default_failure_summary_is_rejected(self):
+        with pytest.raises(AnalysisQualityError, match="失败兜底"):
+            _require_valid_summary({"analysis_summary": "系统错误：无法生成分析摘要"})
+
+    def test_substantive_summary_is_accepted(self):
+        _require_valid_summary({"analysis_summary": "已根据行情、基本面和风险因素完成综合判断。"})
+
+    def test_one_failed_debate_round_cannot_be_hidden_by_long_valid_round(self):
+        state = {
+            "rounds": [
+                {"bull": "完整看涨论证" * 200, "bear": "完整看跌论证" * 200},
+                {"bull": "完整反驳" * 200, "bear": "⚠️ 看跌研究员本轮未能生成有效内容"},
+            ]
+        }
+        with pytest.raises(AnalysisQualityError, match=r"bear\[2\]"):
+            _require_valid_debate_rounds(
+                state, ["bull", "bear"], expected_rounds=2, stage="多空辩论阶段"
+            )
+
+    def test_round_barrier_only_requires_rounds_already_run(self):
+        state = {"rounds": [{"bull": "完整看涨论证", "bear": "完整看跌论证"}]}
+        _require_valid_debate_rounds(
+            state, ["bull", "bear"], expected_rounds=1, stage="多空辩论阶段"
+        )
+
+    def test_quota_cause_survives_round_merge_without_raw_gateway_body(self):
+        from app.engine.orchestrator.pipeline import _merge_debate_updates
+        from app.engine.orchestrator.state import append_round
+        from app.llm.failures import describe_failure
+
+        state = {"risk_debate_state": {"rounds": [], "count": 0}, "reports": {}}
+        updates = []
+        for side in ("risky", "safe", "neutral"):
+            failure = describe_failure(
+                "Error code: 429 usage_limit_reached private-upstream-body"
+            )
+            content = f"⚠️ 节点执行异常。原因：{failure['message']}"
+            debate = {"rounds": [], "count": 0}
+            append_round(debate, side, content, 3)
+            updates.append({"risk_debate_state": debate})
+        _merge_debate_updates(
+            state, updates, state_key="risk_debate_state",
+            side_keys=["risky", "safe", "neutral"],
+        )
+        with pytest.raises(AnalysisQualityError) as caught:
+            _require_valid_debate_rounds(
+                state["risk_debate_state"], ["risky", "safe", "neutral"],
+                expected_rounds=1, stage="风险辩论阶段",
+            )
+        message = str(caught.value)
+        assert "risky[1], safe[1], neutral[1]" in message
+        assert message.count("quota_exhausted") == 1
+        assert "不再执行后续轮次" in message
+        assert "private-upstream-body" not in message
+
+    @pytest.mark.parametrize("stage_key", ["investment_debate_state", "risk_debate_state"])
+    def test_each_debate_loop_checks_quality_before_next_iteration(self, stage_key):
+        import ast
+        import inspect
+
+        from app.engine.orchestrator.workflow.executor import run_compiled
+
+        from app.engine.orchestrator.workflow.seeds import load_workflow_seeds
+        stages = [stage for spec in load_workflow_seeds() for stage in spec["stages"]]
+        assert any(stage.get("state_key") == stage_key for stage in stages)
+        tree = ast.parse(inspect.getsource(run_compiled))
+        loops = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name) and node.target.id == "_round"
+            and "stage.rounds" in ast.unparse(node.iter)
+        ]
+        assert len(loops) == 1
+        # The check is outside the parallel/serial branch but inside the round loop.
+        calls = [
+            node.value for node in loops[0].body
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_require_valid_debate_rounds"
+        ]
+        assert len(calls) == 1
+        assert ast.unparse(calls[0].args[2]) == "_round + 1"
 
 
 @pytest.mark.ai

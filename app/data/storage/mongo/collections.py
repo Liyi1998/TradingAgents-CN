@@ -11,6 +11,7 @@ _BUSINESS_COLLECTIONS: Dict[str, str] = {
     "basic_info": "stock_basic_info",
     "trade_calendar": "trade_calendar",
     "daily_quotes": "stock_daily_quotes",
+    "index_quotes": "index_daily_quotes",
     "daily_indicators": "stock_daily_indicators",
     "adj_factors": "stock_adj_factors",
     "corporate_actions": "stock_corporate_actions",
@@ -39,6 +40,9 @@ _METADATA_COLLECTIONS: Dict[str, str] = {
     "system_configs": "system_configs",
     # 系统级安全密钥（JWT/CSRF）— 多 worker 首启时通过 unique index 强制收敛到单条
     "system_secrets": "system_secrets",
+    # 知识库（stock_news 向量检索）：索引状态与引用校验计数
+    "kb_index_state": "kb_index_state",
+    "kb_citation_stats": "kb_citation_stats",
 }
 
 # 市场后缀：CN 不加后缀（基础名），HK/US 加市场后缀
@@ -68,7 +72,12 @@ def get_collection_name(domain: str, market: str) -> str:
         base = _BUSINESS_COLLECTIONS[domain]
         if market == "CN":
             return base
-        suffix = _MARKET_SUFFIX.get(market, "")
+        suffix = _MARKET_SUFFIX.get(market)
+        if suffix is None:
+            # 显式报错：小写 "hk"/"us" 等错误值曾静默回退为 CN 无后缀集合（跨市场读写风险）
+            raise ValueError(
+                f"未知市场类型: {market!r}（支持 CN/HK/US，入口请先归一化大小写）"
+            )
         return f"{base}{suffix}"
 
     raise KeyError(f"未知的 domain: {domain}")
@@ -77,19 +86,9 @@ def get_collection_name(domain: str, market: str) -> str:
 def get_all_collections(market: str) -> Dict[str, str]:
     """返回指定市场的所有集合名映射 {domain: collection_name}。"""
     result = {}
-    suffix = "" if market == "CN" else _MARKET_SUFFIX.get(market, "")
+    suffix = "" if market == "CN" else _MARKET_SUFFIX[market]
     for domain, base in _BUSINESS_COLLECTIONS.items():
         result[domain] = f"{base}{suffix}"
     for domain, name in _METADATA_COLLECTIONS.items():
         result[domain] = name
     return result
-
-
-def is_metadata_collection(domain: str) -> bool:
-    """判断是否为元数据集合。"""
-    return domain in _METADATA_COLLECTIONS
-
-
-def get_all_domains() -> list:
-    """返回全部业务 domain 列表（供消费方枚举标准域，禁止引用 _BUSINESS_COLLECTIONS 私有常量）。"""
-    return list(_BUSINESS_COLLECTIONS.keys())

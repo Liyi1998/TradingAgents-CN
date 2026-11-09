@@ -92,6 +92,10 @@ class ReportExporter:
         content_parts.append(f"# {stock_symbol} 股票分析报告")
         content_parts.append("")
         content_parts.append(f"**分析日期**: {analysis_date}")
+        from app.core.analysis_horizon import get_horizon_profile
+        from app.services.analysis_horizon import horizon_from_snapshot
+        horizon = get_horizon_profile(horizon_from_snapshot(report_doc))
+        content_parts.append(f"**分析周期**: {horizon.label}（{horizon.holding_period}）")
         if analysts:
             content_parts.append(f"**分析师**: {', '.join(analysts)}")
         content_parts.append("")
@@ -648,7 +652,7 @@ pre, code {
             if PDFKIT_ERROR:
                 error_msg += f"\n错误详情: {PDFKIT_ERROR}"
 
-            logger.error(f"❌ {error_msg}")
+            logger.warning(f"❌ {error_msg}")
             raise Exception(error_msg)
 
         # 生成 Markdown 内容
@@ -660,7 +664,7 @@ pre, code {
             return self._generate_pdf_with_pdfkit(html_content)
         except Exception as e:
             error_msg = f"PDF 生成失败: {e}"
-            logger.error(f"❌ {error_msg}")
+            logger.error(f"❌ {error_msg}", exc_info=True)
             raise Exception(error_msg)
 
 

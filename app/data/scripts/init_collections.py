@@ -29,7 +29,7 @@ async def init_collections(market: str = "CN") -> None:
         from app.core.database import get_mongo_db
         db = get_mongo_db()
     except Exception as e:
-        logger.error("无法连接 MongoDB: %s", e)
+        logger.error("无法连接 MongoDB: %s", e, exc_info=True)
         return
 
     collection_map = get_all_collections(market)
@@ -38,6 +38,66 @@ async def init_collections(market: str = "CN") -> None:
 
     for data_type, collection_name in collection_map.items():
         collection = db[collection_name]
+
+        if data_type == "dragon_tiger":
+            try:
+                migrated = await collection.update_many(
+                    {
+                        "direction": {"$exists": True, "$nin": [None, ""]},
+                        "$or": [
+                            {"reason": {"$exists": False}},
+                            {"reason": None},
+                            {"reason": ""},
+                        ],
+                    },
+                    [{"$set": {"reason": "$direction"}}],
+                )
+                if migrated.modified_count:
+                    logger.info(
+                        "  已迁移 %s 条 %s.direction 到 reason",
+                        migrated.modified_count,
+                        collection_name,
+                    )
+            except Exception as e:
+                logger.warning("  迁移 %s 龙虎榜 reason 字段失败: %s", collection_name, e)
+        elif data_type == "margin_trading":
+            try:
+                migrated = await collection.update_many(
+                    {
+                        "$or": [
+                            {"rzye": {"$exists": True}},
+                            {"rqye": {"$exists": True}},
+                            {"rz_buy": {"$exists": True}},
+                            {"rq_sell": {"$exists": True}},
+                            {"rzrqye": {"$exists": True}},
+                            {"rqyl": {"$exists": True}},
+                        ]
+                    },
+                    [
+                        {
+                            "$set": {
+                                "margin_balance": {"$ifNull": ["$margin_balance", "$rzye"]},
+                                "short_balance": {"$ifNull": ["$short_balance", "$rqye"]},
+                                "margin_buy_amount": {
+                                    "$ifNull": ["$margin_buy_amount", "$rz_buy"]
+                                },
+                                "short_sell_volume": {
+                                    "$ifNull": ["$short_sell_volume", "$rq_sell"]
+                                },
+                                "total_balance": {"$ifNull": ["$total_balance", "$rzrqye"]},
+                                "short_volume": {"$ifNull": ["$short_volume", "$rqyl"]},
+                            }
+                        }
+                    ],
+                )
+                if migrated.modified_count:
+                    logger.info(
+                        "  已迁移 %s 条 %s 两融字段到中立命名",
+                        migrated.modified_count,
+                        collection_name,
+                    )
+            except Exception as e:
+                logger.warning("  迁移 %s 两融字段失败: %s", collection_name, e)
 
         # 清理废弃的含 data_source 唯一索引（与新的单版本覆盖语义冲突）
         for idx_name in legacy_index_names.get(data_type, []):

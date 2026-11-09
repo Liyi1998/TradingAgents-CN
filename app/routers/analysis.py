@@ -12,6 +12,7 @@ import asyncio
 from app.routers.auth_db import get_current_user
 from app.services.queue_service import get_queue_service, QueueService
 from app.services.websocket_manager import get_websocket_manager
+from app.services.analysis_horizon import horizon_from_snapshot, task_report_directory
 from app.models.analysis import SingleAnalysisRequest, BatchAnalysisRequest
 from app.core.config import settings
 from app.core.response import safe_error_message
@@ -36,7 +37,7 @@ async def submit_single_analysis(
         logger.info(f"🎯 收到单股分析请求, 用户: {user.get('username', 'unknown')}")
 
         # 延迟导入，避免循环引用
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
 
         # 立即创建任务记录并返回，不等待执行完成
         analysis_service = get_analysis_service()
@@ -57,7 +58,7 @@ async def submit_single_analysis(
                 # 重新获取服务实例，确保在正确的上下文中
                 logger.info("🔧 [BackgroundTask] 正在获取服务实例...")
                 # 延迟导入，避免循环引用
-                from app.services.analysis_service import get_analysis_service
+                from app.services.analysis import get_analysis_service
                 service = get_analysis_service()
                 logger.info(f"✅ [BackgroundTask] 服务实例获取成功: {id(service)}")
 
@@ -82,8 +83,32 @@ async def submit_single_analysis(
             "message": "分析任务已在后台启动"
         }
     except Exception as e:
-        logger.error(f"❌ 提交单股分析任务失败: {e}")
+        logger.error(f"❌ 提交单股分析任务失败: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=safe_error_message(e, "提交分析任务失败"))
+
+
+@router.post("/tasks/{task_id}/retry", response_model=Dict[str, Any])
+async def retry_failed_analysis(
+    task_id: str, background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+):
+    """Create one linked retry; reuse only owned, complete, same-day analyst reports."""
+    from app.services.analysis_retry import create_retry_task
+    from app.services.analysis_service import get_analysis_service
+
+    service = get_analysis_service()
+    try:
+        result, request = await create_retry_task(service, task_id, user["id"])
+        if request is not None:
+            background_tasks.add_task(service.execute_analysis_background, result["task_id"], user["id"], request)
+        return {"success": True, "data": result, "message": "已打开重试任务；有效报告沿用原数据时点"}
+    except PermissionError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("创建恢复任务失败 task=%s", task_id, exc_info=True)
+        raise HTTPException(status_code=500, detail="恢复任务创建失败，请查看后台日志") from exc
 
 
 @router.get("/tasks/{task_id}/status", response_model=Dict[str, Any])
@@ -94,7 +119,7 @@ async def get_task_status_new(
     """获取分析任务状态（新版异步实现）"""
     try:
         # 延迟导入，避免循环引用
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         analysis_service = get_analysis_service()
 
         # 管理员不限制所有权；普通用户仅能查自己的任务状态
@@ -120,7 +145,7 @@ async def get_task_status_new(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 获取任务状态失败: {e}")
+        logger.error(f"❌ 获取任务状态失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "获取任务状态失败"))
 
 @router.get("/tasks/{task_id}/result", response_model=Dict[str, Any])
@@ -133,7 +158,7 @@ async def get_task_result(
         logger.info(f"🔍 [RESULT] 获取任务结果: {task_id}")
 
         # 延迟导入，避免循环引用
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         analysis_service = get_analysis_service()
 
         # 管理员不限制所有权；普通用户仅能读取自己的任务结果
@@ -165,10 +190,15 @@ async def get_task_result(
 
                 candidate_dirs = []
                 if stock_symbol and analysis_date:
-                    candidate_dirs.append(base_path / stock_symbol / analysis_date / 'reports')
-                    candidate_dirs.append(
-                        get_analysis_results_dir(runtime_base) / 'detailed' / stock_symbol / analysis_date / 'reports'
-                    )
+                    horizon = horizon_from_snapshot(result_data)
+                    candidate_dirs.append(task_report_directory(base_path, stock_symbol, analysis_date, horizon, task_id))
+                    # Legacy flat archives were exclusively short-term. New tasks
+                    # never borrow another run's stock/date-only report directory.
+                    if horizon == "short" and not result_data.get("report_archive_version"):
+                        candidate_dirs.append(base_path / stock_symbol / analysis_date / 'reports')
+                        candidate_dirs.append(
+                            get_analysis_results_dir(runtime_base) / 'detailed' / stock_symbol / analysis_date / 'reports'
+                        )
 
                 for d in candidate_dirs:
                     if d.exists() and d.is_dir():
@@ -291,6 +321,30 @@ async def get_task_result(
             else:
                 logger.warning(f"⚠️ [RESULT] reports字段不是字典类型: {type(reports)}")
                 result_data['reports'] = {}
+
+        # 旧报告读取时确定性补齐分账户裁决；只改响应，不回写历史文档/文件。
+        try:
+            from app.engine.decision_semantics import (
+                collect_decision_source,
+                format_decision_recommendation,
+                merge_decision_key_points,
+                normalize_decision,
+            )
+
+            if result_data.get("decision") or result_data.get("reports"):
+                normalized_decision = normalize_decision(
+                    result_data.get("decision"),
+                    collect_decision_source(result_data),
+                )
+                result_data["decision"] = normalized_decision
+                result_data["recommendation"] = format_decision_recommendation(
+                    normalized_decision
+                )
+                result_data["key_points"] = merge_decision_key_points(
+                    result_data.get("key_points", []), normalized_decision
+                )
+        except Exception as semantics_err:
+            logger.warning(f"⚠️ [RESULT] 分账户裁决兼容解析失败: {semantics_err}")
 
         # 补全关键字段：recommendation/summary/key_points
         try:
@@ -453,6 +507,7 @@ async def get_task_result(
         # 构建严格验证的结果数据
         final_result_data = {
             "analysis_id": safe_string(result_data.get("analysis_id"), "unknown"),
+            "analysis_horizon": horizon_from_snapshot(result_data),
             "stock_symbol": safe_string(result_data.get("stock_symbol"), "UNKNOWN"),
             "stock_code": safe_string(result_data.get("stock_code"), "UNKNOWN"),
             "analysis_date": safe_string(result_data.get("analysis_date"), "2025-08-20"),
@@ -520,7 +575,7 @@ async def get_task_result(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ [RESULT] 获取任务结果失败: {e}")
+        logger.error(f"❌ [RESULT] 获取任务结果失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "获取分析结果时发生内部错误"))
 
 @router.get("/tasks", response_model=Dict[str, Any])
@@ -532,7 +587,7 @@ async def list_user_tasks(
 ):
     """获取用户的任务列表"""
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         logger.info(f"📋 查询用户任务列表: {user['id']}")
 
         tasks = await get_analysis_service().list_user_tasks(
@@ -554,7 +609,7 @@ async def list_user_tasks(
         }
 
     except Exception as e:
-        logger.error(f"❌ 获取任务列表失败: {e}")
+        logger.error(f"❌ 获取任务列表失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "获取任务列表失败"))
 
 @router.post("/batch", response_model=Dict[str, Any])
@@ -571,7 +626,7 @@ async def submit_batch_analysis(
         logger.info(f"🎯 [批量分析] 收到批量分析请求: title={request.title}")
 
         # 延迟导入，避免循环引用
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         simple_service = get_analysis_service()
         
         batch_id = str(uuid.uuid4())
@@ -619,7 +674,7 @@ async def submit_batch_analysis(
             """并发执行所有分析任务"""
             # 延迟导入，避免循环引用
             try:
-                from app.services.analysis_service import get_analysis_service
+                from app.services.analysis import get_analysis_service
                 simple_service = get_analysis_service()
             except Exception as svc_err:
                 logger.error(f"❌ [批量分析] 获取分析服务失败，{len(task_ids)} 个任务无法执行: {svc_err}", exc_info=True)
@@ -677,6 +732,7 @@ async def submit_batch_analysis(
             "success": True,
             "data": {
                 "batch_id": batch_id,
+                "analysis_horizon": request.parameters.analysis_horizon if request.parameters else "short",
                 "total_tasks": len(task_ids),
                 "task_ids": task_ids,
                 "mapping": mapping,
@@ -706,13 +762,15 @@ async def cancel_task(
         # 验证任务所有权：队列(Redis qa:task:*) → analysis_tasks(Mongo) 逐级回退。
         # 运行中任务被 worker 领取后 Redis 键即删除，仅查队列会恒 404（取消功能失效）。
         task = await svc.get_task(task_id)
-        if not task:
-            from app.services.analysis_service import get_analysis_service
-            task = await get_analysis_service().get_task_with_status_fallback(
-                task_id, user_id=user["id"]
+        if task:
+            owned = (task.get("user") or task.get("user_id")) == user["id"]
+        else:
+            from app.services.analysis import get_analysis_service
+            # 历史状态查询允许无主旧记录，不能用作取消这类写操作的授权。
+            owned = await get_analysis_service().validate_task_ownership(
+                task_id, user["id"]
             )
-        owner = (task or {}).get("user") or (task or {}).get("user_id")
-        if not task or (owner is not None and owner != user["id"]):
+        if not owned:
             raise HTTPException(status_code=404, detail="任务不存在")
 
         success = await svc.cancel_task(task_id)
@@ -739,7 +797,7 @@ async def get_user_analysis_history(
 ):
     """获取用户分析历史（支持基础筛选与分页）"""
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         query_symbol = symbol or stock_code
 
         # 使用新的 query_user_tasks 方法，支持数据库层面的筛选和分页
@@ -760,7 +818,7 @@ async def get_user_analysis_history(
             "message": "历史查询成功"
         }
     except Exception as e:
-        logger.error(f"❌ 获取用户分析历史失败: {e}")
+        logger.error(f"❌ 获取用户分析历史失败: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=safe_error_message(e, "获取分析历史失败"))
 
 # WebSocket 端点
@@ -864,7 +922,7 @@ async def websocket_task_progress(websocket: WebSocket, task_id: str):
     logger.info(f"🔌 [WS] 认证成功: user={user_id}, admin={is_admin}, task_id={task_id}")
 
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         analysis_service = get_analysis_service()
         # 管理员不限制所有权；普通用户仅能查自己的任务状态（与 HTTP 路径一致）
         effective_user_id = None if is_admin else user_id
@@ -930,7 +988,7 @@ async def websocket_task_progress(websocket: WebSocket, task_id: str):
     except WebSocketDisconnect:
         logger.info(f"🔌 WebSocket 客户端断开连接: task_id={task_id}")
     except Exception as e:
-        logger.error(f"❌ WebSocket 连接错误: {e}")
+        logger.error(f"❌ WebSocket 连接错误: {e}", exc_info=True)
     finally:
         await websocket_manager.disconnect(websocket, task_id)
 
@@ -953,7 +1011,7 @@ async def get_task_events(
     管理员可查任意任务；普通用户仅能查自己的。
     """
     from app.services.analysis_events import load_events
-    from app.services.analysis_service import get_analysis_service
+    from app.services.analysis import get_analysis_service
 
     if order not in ("asc", "desc"):
         raise HTTPException(status_code=400, detail="order 仅支持 asc/desc")
@@ -992,7 +1050,7 @@ async def get_task_overview(
     股票信息统一走 DataInterface（basic_info + daily_quotes 最新收盘价），
     读取失败或无数据时 stock_info=null，不影响任务信息返回。
     """
-    from app.services.analysis_service import get_analysis_service
+    from app.services.analysis import get_analysis_service
 
     try:
         user_id = None if user.get("is_admin") else user["id"]
@@ -1060,7 +1118,7 @@ async def get_task_details(
         return t
 
     # 回退 MongoDB：队列数据过期后仍可查历史任务详情
-    from app.services.analysis_service import get_analysis_service
+    from app.services.analysis import get_analysis_service
     analysis_service = get_analysis_service()
     user_id = None if user.get("is_admin") else user["id"]
     fallback = await analysis_service.get_task_with_status_fallback(task_id, user_id)
@@ -1083,7 +1141,7 @@ async def mark_task_as_failed(
     try:
         # 验证任务所有权：先查 Redis，未找到则回退 MongoDB
         task = await svc.get_task(task_id)
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         analysis_svc = get_analysis_service()
         if not task or task.get("user") != user["id"]:
             if not await analysis_svc.validate_task_ownership(task_id, user["id"]):
@@ -1106,7 +1164,7 @@ async def mark_task_as_failed(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 标记任务失败: {e}")
+        logger.error(f"❌ 标记任务失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "标记任务失败"))
 
 
@@ -1121,7 +1179,7 @@ async def delete_task(
     所有权验证支持 Redis → MongoDB 双源回退，兼容已过期的失败/完成任务。
     """
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         analysis_svc = get_analysis_service()
 
         deleted = await analysis_svc.delete_task_by_id(task_id, user_id=user["id"])
@@ -1137,7 +1195,7 @@ async def delete_task(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ 删除任务失败: {e}")
+        logger.error(f"❌ 删除任务失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "删除任务失败"))
 
 
@@ -1152,7 +1210,7 @@ async def get_analysis_stats(
 ):
     """获取分析统计信息"""
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         svc = get_analysis_service()
 
         stats = await svc.get_analysis_stats(
@@ -1167,7 +1225,7 @@ async def get_analysis_stats(
             "message": "统计获取成功"
         }
     except Exception as e:
-        logger.error(f"❌ 获取分析统计失败: {e}")
+        logger.error(f"❌ 获取分析统计失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "获取分析统计失败"))
 
 
@@ -1180,12 +1238,12 @@ async def search_stocks(
 ):
     """搜索股票"""
     try:
-        from app.services.analysis_service import get_analysis_service
+        from app.services.analysis import get_analysis_service
         svc = get_analysis_service()
 
         results = await svc.search_stock_basic_info(query, market, limit)
 
         return {"success": True, "data": results, "message": f"搜索完成，共 {len(results)} 条"}
     except Exception as e:
-        logger.error(f"❌ 搜索股票失败: {e}")
+        logger.error(f"❌ 搜索股票失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=safe_error_message(e, "搜索股票失败"))

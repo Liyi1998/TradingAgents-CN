@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 from contextlib import nullcontext
 from enum import Enum
@@ -24,6 +25,46 @@ except ImportError:  # pragma: no cover - 兼容 pydantic v1
     PYDANTIC_V2 = False
 
 logger = logging.getLogger(__name__)
+
+_ENV_PLACEHOLDER = re.compile(
+    r"^\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?::-(?P<default>.*))?\}$"
+)
+
+
+def _expand_env_value(value: Any) -> Any:
+    """递归展开 MCP 配置中的 ``${ENV}``/``${ENV:-default}``。
+
+    密钥因此可以只保存在未跟踪的 ``.env`` 中，而不是写入 mcp.json。
+    仅展开完整占位符，避免对普通文本做意外替换。
+    """
+    if isinstance(value, str):
+        match = _ENV_PLACEHOLDER.fullmatch(value.strip())
+        if not match:
+            return value
+        default = match.group("default") or ""
+        return str(get_env(match.group("name"), default) or "")
+    if isinstance(value, dict):
+        return {key: _expand_env_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_value(item) for item in value]
+    return value
+
+
+def _prepare_server_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """展开环境变量；密钥缺失时自动禁用对应 HTTP MCP。"""
+    prepared = _expand_env_value(raw)
+    raw_headers = raw.get("headers") if isinstance(raw, dict) else None
+    if isinstance(raw_headers, dict):
+        for key, raw_value in raw_headers.items():
+            if (
+                isinstance(raw_value, str)
+                and _ENV_PLACEHOLDER.fullmatch(raw_value.strip())
+                and not prepared.get("headers", {}).get(key)
+            ):
+                prepared["_enabled"] = False
+                logger.info("[MCP] 环境变量密钥未配置，服务器保持禁用")
+                break
+    return prepared
 
 
 class MCPServerType(str, Enum):
@@ -401,7 +442,7 @@ def validate_servers_map(
     validated: Dict[str, Dict[str, Any]] = {}
     for name, raw in servers.items():
         try:
-            model = MCPServerConfig(**raw)
+            model = MCPServerConfig(**_prepare_server_config(raw))
             validated[name] = model.sanitized()
         except Exception as exc:
             logger.warning("[MCP] 无效配置已跳过 (%s): %s", name, exc)
@@ -422,7 +463,7 @@ def load_mcp_config(config_file: Optional[Path] = None, *, strict: bool = False)
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as exc:  # pragma: no cover - 保护 IO/解析异常
-        logger.error("[MCP] 读取配置失败: %s", exc)
+        logger.error("[MCP] 读取配置失败: %s", exc, exc_info=True)
         return {"mcpServers": {}}
 
     servers = data.get("mcpServers", {}) or {}

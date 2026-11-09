@@ -33,10 +33,18 @@ def _annotation_to_schema(ann: Any) -> dict:
         ann = args[0]
         if len(args) > 1 and isinstance(args[1], str):
             desc = args[1]
-    type_name = getattr(ann, "__name__", None) or (
-        get_origin(ann) and getattr(get_origin(ann), "__name__", None)
-    )
-    schema: dict = {"type": _TYPE_MAP.get(type_name, "string")}
+
+    origin = get_origin(ann)
+    if origin is list:
+        item_args = get_args(ann)
+        schema = {"type": "array"}
+        if item_args:
+            schema["items"] = _annotation_to_schema(item_args[0])
+    elif origin is dict:
+        schema = {"type": "object"}
+    else:
+        type_name = getattr(origin, "__name__", None) or getattr(ann, "__name__", None)
+        schema = {"type": _TYPE_MAP.get(type_name, "string")}
     if desc:
         schema["description"] = desc
     return schema

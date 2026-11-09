@@ -114,7 +114,10 @@ hk_stock_cache.json
 # ==================== 配置文件（运行时生成） ====================
 # config/ 根目录下的 JSON 由运行时动态生成或包含用户密钥，不提交
 config/*.json
+config/jev_conditions.lock
+config/.jev-conditions-*.tmp
 !config/pricing.json
+!config/jev_conditions.example.json
 !config/agents/
 !config/skills/
 !config/defaults/
@@ -154,3 +157,6 @@ config/skills/.cache/
 config/agents/*.yaml.lock
 # MCP 配置写入锁（运行时产物）
 config/mcp.json.lock
+
+# 本地克隆的参考项目（第三方代码，仅本地研究用）
+/references/

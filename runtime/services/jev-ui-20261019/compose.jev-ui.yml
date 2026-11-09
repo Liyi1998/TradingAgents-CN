@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:jev-ui-74966b6f
+  frontend:
+    image: tradingagents-cn-hub-frontend:jev-ui-74966b6f

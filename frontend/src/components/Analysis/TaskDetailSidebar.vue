@@ -37,6 +37,9 @@
               </div>
             </div>
             <el-descriptions :column="1" size="small" border class="config-desc">
+              <el-descriptions-item label="分析周期">
+                {{ analysisHorizonLabel(overview?.task) }}
+              </el-descriptions-item>
               <el-descriptions-item label="工作流">
                 {{ workflowLabel }}
               </el-descriptions-item>
@@ -137,6 +140,7 @@ import type { TaskOverview } from '@/api/analysis'
 import { workflowApi, type WorkflowSpecDto } from '@/api/workflows'
 import { agentConfigApi } from '@/api/agentConfigs'
 import { loadAgentDisplayNames } from '@/utils/agentDisplayNames'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
 
 const props = defineProps<{
   overview: TaskOverview | null

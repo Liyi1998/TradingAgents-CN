@@ -1,5 +1,7 @@
 """融资融券仓储。"""
 
+from app.data.storage.mongo.repositories.base import MongoBaseRepo
+
 from typing import Dict, List, Optional
 
 from pymongo import UpdateOne
@@ -10,7 +12,10 @@ from app.data.storage.mongo.bulk_utils import batched_bulk_write
 from app.data.storage.mongo.repositories.key_spec import build_filter
 
 
-class MarginTradingRepo:
+class MarginTradingRepo(MongoBaseRepo):
+    domain = "margin_trading"
+    range_sort_direction = -1
+
     """stock_margin_trading 集合仓储。"""
 
     async def upsert_many(self, records: List[Dict], market: str) -> int:
@@ -24,9 +29,21 @@ class MarginTradingRepo:
                 filter_doc = build_filter("margin_trading", rec)
             except KeyError:
                 continue  # 缺少唯一键字段的记录跳过
+            snapshot = dict(rec)
+            if market == "CN":
+                # Unit/date proof belongs to THIS amount snapshot. A sparse
+                # legacy refresh must not borrow a previous row's certificate
+                # or repayment estimate to make its new values look verified.
+                for key in (
+                    "margin_balance", "short_balance", "margin_buy_amount", "margin_repay_amount", "total_balance",
+                    "margin_repay_amount_derived", "margin_repay_derivation_status", "margin_repay_derivation",
+                    "amount_unit", "monetary_unit", "unit_conversion", "unit_evidence", "exchange",
+                    "source_response_date", "date_evidence_status",
+                ):
+                    snapshot.setdefault(key, None)
             ops.append(UpdateOne(
                 filter_doc,
-                {"$set": rec},
+                {"$set": snapshot},
                 upsert=True,
             ))
         if not ops:

@@ -231,8 +231,6 @@ def fetch_em_spot_direct() -> Optional[Any]:
             logger.warning(f"东方财富快照直接 API 失败（尝试 {attempt + 1}/3）: {e}")
 
     return None
-
-
 def fetch_tencent_spot_batch(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     """
     通过腾讯行情 API 批量获取实时行情。
@@ -382,5 +380,3 @@ def fetch_em_board_direct() -> Optional[Any]:
             logger.warning(f"东方财富板块直接 API 失败（尝试 {attempt + 1}/2）: {e}")
 
     return None
-
-

@@ -64,7 +64,7 @@ class UserService:
         """创建用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             users_collection = self.db.users
@@ -120,16 +120,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 创建用户失败: {e}")
+                logger.error(f"系统级错误 - 创建用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 创建用户失败: {e}")
+            logger.error(f"❌ 创建用户失败: {e}", exc_info=True)
             return None
 
     async def authenticate_user(self, username: str, password: str) -> Optional[User]:
         """用户认证"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             users_collection = self.db.users
@@ -166,16 +166,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 用户认证失败: {e}")
+                logger.error(f"系统级错误 - 用户认证失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 用户认证失败: {e}")
+            logger.error(f"❌ 用户认证失败: {e}", exc_info=True)
             return None
 
     async def get_user_by_username(self, username: str) -> Optional[User]:
         """根据用户名获取用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             user_doc = await self.db.users.find_one({"username": username})
@@ -184,16 +184,16 @@ class UserService:
             return None
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 获取用户失败: {e}")
+                logger.error(f"系统级错误 - 获取用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 获取用户失败: {e}")
+            logger.error(f"❌ 获取用户失败: {e}", exc_info=True)
             return None
 
     async def get_user_by_id(self, user_id: str) -> Optional[User]:
         """根据用户ID获取用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             if not ObjectId.is_valid(user_id):
@@ -205,16 +205,16 @@ class UserService:
             return None
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 获取用户失败: {e}")
+                logger.error(f"系统级错误 - 获取用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 获取用户失败: {e}")
+            logger.error(f"❌ 获取用户失败: {e}", exc_info=True)
             return None
 
     async def update_user(self, username: str, user_data: UserUpdate) -> Optional[User]:
         """更新用户信息"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             users_collection = self.db.users
@@ -253,9 +253,9 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 更新用户信息失败: {e}")
+                logger.error(f"系统级错误 - 更新用户信息失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 更新用户信息失败: {e}")
+            logger.error(f"❌ 更新用户信息失败: {e}", exc_info=True)
             return None
 
     async def change_password(self, username: str, old_password: str, new_password: str) -> bool:
@@ -267,7 +267,7 @@ class UserService:
                 return False
 
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return False
 
             new_hashed_password = self.hash_password(new_password)
@@ -285,21 +285,21 @@ class UserService:
                 logger.info(f"✅ 密码修改成功: {username}")
                 return True
             else:
-                logger.error(f"❌ 密码修改失败: {username}")
+                logger.warning(f"❌ 密码修改失败: {username}")
                 return False
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 修改密码失败: {e}")
+                logger.error(f"系统级错误 - 修改密码失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 修改密码失败: {e}")
+            logger.error(f"❌ 修改密码失败: {e}", exc_info=True)
             return False
 
     async def reset_password(self, username: str, new_password: str) -> bool:
         """重置密码（管理员操作）"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return False
 
             new_hashed_password = self.hash_password(new_password)
@@ -317,14 +317,14 @@ class UserService:
                 logger.info(f"✅ 密码重置成功: {username}")
                 return True
             else:
-                logger.error(f"❌ 密码重置失败: {username}")
+                logger.warning(f"❌ 密码重置失败: {username}")
                 return False
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 重置密码失败: {e}")
+                logger.error(f"系统级错误 - 重置密码失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 重置密码失败: {e}")
+            logger.error(f"❌ 重置密码失败: {e}", exc_info=True)
             return False
 
     async def create_admin_user(
@@ -336,11 +336,11 @@ class UserService:
         """创建管理员用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return None
 
             if not password:
-                logger.error("创建管理员用户失败: 未提供管理员密码")
+                logger.warning("创建管理员用户失败: 未提供管理员密码")
                 return None
 
             users_collection = self.db.users
@@ -385,16 +385,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 创建管理员用户失败: {e}")
+                logger.error(f"系统级错误 - 创建管理员用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 创建管理员用户失败: {e}")
+            logger.error(f"❌ 创建管理员用户失败: {e}", exc_info=True)
             return None
 
     async def list_users(self, skip: int = 0, limit: int = 100) -> List[UserResponse]:
         """获取用户列表"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return []
 
             cursor = self.db.users.find().skip(skip).limit(limit)
@@ -422,16 +422,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 获取用户列表失败: {e}")
+                logger.error(f"系统级错误 - 获取用户列表失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 获取用户列表失败: {e}")
+            logger.error(f"❌ 获取用户列表失败: {e}", exc_info=True)
             return []
 
     async def deactivate_user(self, username: str) -> bool:
         """禁用用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return False
 
             result = await self.db.users.update_one(
@@ -453,16 +453,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 禁用用户失败: {e}")
+                logger.error(f"系统级错误 - 禁用用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 禁用用户失败: {e}")
+            logger.error(f"❌ 禁用用户失败: {e}", exc_info=True)
             return False
 
     async def activate_user(self, username: str) -> bool:
         """激活用户"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return False
 
             result = await self.db.users.update_one(
@@ -484,16 +484,16 @@ class UserService:
 
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 激活用户失败: {e}")
+                logger.error(f"系统级错误 - 激活用户失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 激活用户失败: {e}")
+            logger.error(f"❌ 激活用户失败: {e}", exc_info=True)
             return False
 
     async def set_admin_status(self, username: str, is_admin: bool) -> bool:
         """设置用户管理员状态。"""
         try:
             if self.db is None:
-                logger.error("数据库未初始化")
+                logger.warning("数据库未初始化")
                 return False
 
             result = await self.db.users.update_one(
@@ -514,9 +514,9 @@ class UserService:
             return True
         except Exception as e:
             if _is_system_error(e):
-                logger.error(f"系统级错误 - 更新用户管理员状态失败: {e}")
+                logger.error(f"系统级错误 - 更新用户管理员状态失败: {e}", exc_info=True)
                 raise
-            logger.error(f"❌ 更新用户管理员状态失败: {e}")
+            logger.error(f"❌ 更新用户管理员状态失败: {e}", exc_info=True)
             return False
 
 

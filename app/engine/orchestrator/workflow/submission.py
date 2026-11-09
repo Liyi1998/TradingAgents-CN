@@ -20,6 +20,7 @@ API 级强制。
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -33,7 +34,7 @@ SUBMISSION_FALLBACK = "fallback_text"
 TOOL_NAME = "submit_report"
 
 # trader/terminal 的 action 规范值（SignalProcessor 消费的中文枚举为 canonical）
-_ACTION_CANONICAL = ("买入", "持有", "卖出")
+_ACTION_CANONICAL = ("买入", "持有", "卖出", "观望", "减仓")
 _ACTION_ALIASES = {
     "buy": "买入",
     "sell": "卖出",
@@ -43,7 +44,10 @@ _ACTION_ALIASES = {
     "持有": "持有",
     "购买": "买入",
     "出售": "卖出",
-    "观望": "持有",
+    "观望": "观望",
+    "watch": "观望",
+    "reduce": "减仓",
+    "减仓": "减仓",
     "维持": "持有",
     "清仓": "卖出",
     "加仓": "买入",
@@ -51,14 +55,18 @@ _ACTION_ALIASES = {
 }
 
 # summarizer 的 final_signal 规范值（structured_summary 契约为英文枚举）
-_SIGNAL_CANONICAL = ("Buy", "Hold", "Sell")
+_SIGNAL_CANONICAL = ("Buy", "Hold", "Sell", "Watch", "Reduce")
 _SIGNAL_ALIASES = {
     "buy": "Buy",
     "hold": "Hold",
     "sell": "Sell",
+    "watch": "Watch",
+    "reduce": "Reduce",
     "买入": "Buy",
     "持有": "Hold",
     "卖出": "Sell",
+    "观望": "Watch",
+    "减仓": "Reduce",
 }
 
 # 支持 schema 构建的节点类型（未知类型在工厂入口拒绝）
@@ -105,7 +113,10 @@ def _coerce_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or value is None:
         raise SubmissionError(f"参数 {label} 必须是数字（收到: {value!r}）")
     try:
-        return float(value)
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("non-finite numeric value")
+        return result
     except (TypeError, ValueError):
         raise SubmissionError(f"参数 {label} 必须是数字（收到: {value!r}）") from None
 
@@ -122,22 +133,41 @@ _CONTENT_PROP: Dict[str, Any] = {
     "description": "完整报告 markdown 正文（人类可读的最终交付内容，先写正文再提交）",
 }
 
+_SEMANTICS_PROP: Dict[str, Any] = {
+    "type": "object",
+    "description": "分账户决策：观望不等于持有，减仓不等于全部卖出；账户状态必须服从系统输入",
+    "properties": {
+        "account_position": {"type": "string", "enum": ["UNKNOWN", "NONE", "HELD"]},
+        "research_view": {"type": "string", "enum": ["BULLISH", "NEUTRAL", "BEARISH", "UNCERTAIN"]},
+        "unheld_action": {"type": "string", "enum": ["BUY", "WATCH"]},
+        "held_action": {"type": "string", "enum": ["HOLD", "REDUCE", "SELL"]},
+        "position_limit_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "total_position_limit_pct": {"type": ["number", "null"], "description": "当前已批准的总仓位上限，未知为null；不得使用新增额度或未来条件额度"},
+        "current_entry_limit_pct": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+        "conditional_strategy": {"type": "array", "items": {"type": "object"}, "description": "未来条件策略及审批条件，非当前额度"},
+        "exit_conditions": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 _DECISION_PROPS: Dict[str, Any] = {
+    "decision_semantics": _SEMANTICS_PROP,
+    "risk_level": {"type": "string", "enum": ["High", "Medium", "Low", "Unknown"], "description": "综合定性风险，注明判断依据；局部缺项不自动变为整体未知"},
+    "confidence_label": {"type": "string", "description": "明确的定性研究置信度及范围，如中低；不自动映射为数字胜率"},
     "action": {
         "type": "string",
         "enum": list(_ACTION_CANONICAL),
-        "description": "投资动作（买入/持有/卖出，必填）",
+        "description": "投资动作（买入/持有/卖出/观望/减仓，必填）",
     },
     "target_price": {
-        "type": "number",
+        "type": ["number", "null"],
         "description": "目标价（本币计价的具体数值；报告中未给出则省略）",
     },
     "confidence": {
-        "type": "number",
+        "type": ["number", "null"],
         "description": "决策信心 0-1（未明确提及可省略）",
     },
     "risk_score": {
-        "type": "number",
+        "type": ["number", "null"],
         "description": "风险评分 0-1（未明确提及可省略）",
     },
     "reasoning": {
@@ -148,13 +178,15 @@ _DECISION_PROPS: Dict[str, Any] = {
 
 # summarizer：structured_summary 的 7 个结构化字段（+ content 共 8 参数）
 _SUMMARIZER_PROPS: Dict[str, Any] = {
+    "decision_semantics": _SEMANTICS_PROP,
+    "confidence_label": {"type": "string", "description": "定性研究置信度；没有数字时保留上游明确判断及范围"},
     "key_indicators": {
         "type": "object",
         "description": "关键点位（entry_price/target_price/stop_loss/support_level/resistance_level，值为字符串）",
     },
     "model_confidence": {
-        "type": "number",
-        "description": "模型信心 0-100",
+        "type": ["number", "null"],
+        "description": "已明确量化的模型信心 0-100；未知必须null，不得默认50或70",
     },
     "risk_assessment": {
         "type": "object",
@@ -176,7 +208,7 @@ _SUMMARIZER_PROPS: Dict[str, Any] = {
     "final_signal": {
         "type": "string",
         "enum": list(_SIGNAL_CANONICAL),
-        "description": "最终信号（Buy/Hold/Sell）",
+        "description": "最终信号（Buy/Hold/Sell/Watch/Reduce）",
     },
 }
 
@@ -230,10 +262,15 @@ def build_tool_description(node_type: str) -> str:
         "terminal": "，并填写最终决策参数（action 必填）",
         "summarizer": "，并填写全部结构化总结字段",
     }.get(node_type, "")
+    partition_hint = ""
+    if node_type in ("trader", "terminal"):
+        from app.engine.strategy_partition import GENERATION_INSTRUCTION
+        partition_hint = GENERATION_INSTRUCTION
     return (
         "提交你的最终产出（唯一提交入口；提交即定稿，不要再用其他方式输出结论）。"
         f"content 为完整报告 markdown 正文{extra_hint}。"
         "提交成功后简短收尾并结束回复，不要重复报告内容。"
+        + partition_hint
     )
 
 
@@ -262,9 +299,16 @@ def validate_submission(node_type: str, content: str, fields: Dict[str, Any]) ->
             normalized["risk_score"] = _clamp(_coerce_number(fields["risk_score"], "risk_score"), 0.0, 1.0)
         if fields.get("reasoning") is not None:
             normalized["reasoning"] = str(fields["reasoning"])
+        if fields.get("risk_level") is not None:
+            normalized["risk_level"] = _normalize_enum(fields["risk_level"],
+                {"high": "High", "medium": "Medium", "low": "Low", "unknown": "Unknown"},
+                ("High", "Medium", "Low", "Unknown"), "risk_level")
+        if isinstance(fields.get("confidence_label"), str):
+            normalized["confidence_label"] = fields["confidence_label"].strip()
+        _copy_decision_semantics(fields, normalized)
         return normalized
     if node_type == "summarizer":
-        missing = [k for k in _SUMMARIZER_REQUIRED if fields.get(k) is None]
+        missing = [k for k in _SUMMARIZER_REQUIRED if k not in fields or (fields[k] is None and k != "model_confidence")]
         if missing:
             raise SubmissionError(f"结构化总结缺少必填字段: {', '.join(missing)}，请补齐后重新提交")
         if not isinstance(fields["key_indicators"], dict):
@@ -273,19 +317,33 @@ def validate_submission(node_type: str, content: str, fields: Dict[str, Any]) ->
             raise SubmissionError("risk_assessment 必须是对象（level/score/description）")
         normalized = {
             "key_indicators": fields["key_indicators"],
-            "model_confidence": _clamp(_coerce_number(fields["model_confidence"], "model_confidence"), 0, 100),
+            "model_confidence": _clamp(_coerce_number(fields["model_confidence"], "model_confidence"), 0, 100) if fields["model_confidence"] is not None else None,
             "risk_assessment": fields["risk_assessment"],
             "analysis_summary": str(fields["analysis_summary"]),
             "investment_recommendation": str(fields["investment_recommendation"]),
             "final_signal": _normalize_enum(fields["final_signal"], _SIGNAL_ALIASES, _SIGNAL_CANONICAL, "final_signal"),
         }
         reference = fields.get("analysis_reference")
+        if isinstance(fields.get("confidence_label"), str):
+            normalized["confidence_label"] = fields["confidence_label"]
         if reference is not None:
             if not isinstance(reference, list):
                 raise SubmissionError("analysis_reference 必须是字符串数组")
             normalized["analysis_reference"] = [str(item) for item in reference]
+        _copy_decision_semantics(fields, normalized)
         return normalized
     raise SubmissionError(f"未知节点类型: {node_type!r}（支持: {SUPPORTED_NODE_TYPES}）")
+
+
+def _copy_decision_semantics(fields: Dict[str, Any], normalized: Dict[str, Any]) -> None:
+    semantics = fields.get("decision_semantics")
+    if semantics is None:
+        return
+    if not isinstance(semantics, dict):
+        raise SubmissionError("decision_semantics 必须是分账户决策对象")
+    normalized["decision_semantics"] = {
+        key: value for key, value in semantics.items() if key in _SEMANTICS_PROP["properties"]
+    }
 
 
 # ── 写入路径（structured 即时 / fallback 会话结束，共用单条路径）───────────
@@ -311,6 +369,9 @@ async def commit_submission(
         return
     if state is not None:
         state.setdefault("reports", {})[report_key] = submission.content
+        if report_key in ("final_trade_decision", "trader_investment_plan", "risk_manager_decision"):
+            from app.engine.strategy_partition import partition_strategy
+            state.setdefault("strategy_partitions", {})[report_key] = partition_strategy(submission.content)
     if event_sink is None:
         return
     try:
@@ -355,7 +416,12 @@ def make_submit_report_tool(
     async def handler(**input: Any) -> str:
         fields = {k: v for k, v in input.items() if k != "content"}
         normalized = validate_submission(node_type, input.get("content"), fields)
-        box.set(Submission(content=input["content"].strip(), fields=normalized, source=SUBMISSION_STRUCTURED))
+        content = input["content"].strip()
+        if node_type == "analyst" and agent_key == "market":
+            from app.engine.wyckoff_submission import check_submission
+            content, method_fields = check_submission(content, fields.get("wyckoff"), (state or {}).get("analysis_context") or {})
+            normalized.update(method_fields)
+        box.set(Submission(content=content, fields=normalized, source=SUBMISSION_STRUCTURED))
         await commit_submission(
             box.value,
             state=state,
@@ -365,12 +431,17 @@ def make_submit_report_tool(
             phase=phase,
             display_name=display_name,
         )
-        return "✅ 已收到报告提交。请简短收尾并结束本轮回复，不要重复报告内容。"
+        return "✅ 已收到报告提交，本节点已完成。"
 
+    schema = build_params_schema(node_type)
+    if node_type == "analyst" and agent_key == "market":
+        from app.models.wyckoff import WyckoffAssessment
+        from app.engine.research_tracking import tool_schema
+        schema["properties"]["wyckoff"] = tool_schema(WyckoffAssessment)
     return ToolDef(
         name=TOOL_NAME,
         description=build_tool_description(node_type),
-        params_schema=build_params_schema(node_type),
+        params_schema=schema,
         handler=handler,
         is_concurrency_safe=False,
     )

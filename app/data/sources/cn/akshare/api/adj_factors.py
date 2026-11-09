@@ -80,36 +80,30 @@ async def fetch_adj_factors(
     if hfq_df is not None and not hfq_df.empty and hfq_df.index.name == "date":
         hfq_df = hfq_df.reset_index()
 
-    # 统一日期列名（统一为 YYYYMMDD，便于与 start_date/end_date 比较）
-    date_col = "date"
-    qfq_df[date_col] = pd.to_datetime(qfq_df[date_col], errors="coerce").dt.strftime("%Y%m%d")
-    qfq_df = qfq_df.dropna(subset=[date_col])
+    # These are effective-date events, not a daily table. Normalize the full
+    # response before selecting the interval, keeping its preceding anchor.
+    # Sina qfq_factor is a divisor; storing it as a price multiplier was wrong.
+    from app.data.processor.adjustment_contract import normalize_adjustment_events
+    from app.utils.timezone import now_tz
 
-    # 合并前/后复权因子
-    if hfq_df is not None and not hfq_df.empty:
-        hfq_df[date_col] = pd.to_datetime(hfq_df[date_col], errors="coerce").dt.strftime("%Y%m%d")
-        hfq_df = hfq_df.dropna(subset=[date_col])
-        merged = qfq_df.merge(hfq_df[[date_col, "hfq_factor"]], on=date_col, how="outer")
-    else:
-        merged = qfq_df.copy()
-        merged["hfq_factor"] = None
+    try:
+        qfq_df = qfq_df.copy()
+        qfq_df["date"] = pd.to_datetime(qfq_df["date"], errors="raise").dt.date
+        if hfq_df is not None and not hfq_df.empty:
+            hfq_df = hfq_df.copy()
+            hfq_df["date"] = pd.to_datetime(hfq_df["date"], errors="raise").dt.date
+            merged = qfq_df.merge(hfq_df[["date", "hfq_factor"]], on="date", how="left")
+        else:
+            merged = qfq_df
+        normalized = normalize_adjustment_events(
+            merged, source="akshare", symbol=str(symbol).zfill(6),
+            start_date=start_date, end_date=end_date or now_tz().date().isoformat(),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DataFormatError("akshare", _DOMAIN, f"symbol={symbol}: {exc}") from exc
 
-    # 日期过滤（归一化用户输入：支持 YYYY-MM-DD / YYYYMMDD 两种格式）
-    def _norm_date(s: str) -> str:
-        return str(s).replace("-", "")
-
-    if start_date:
-        merged = merged[merged[date_col] >= _norm_date(start_date)]
-    if end_date:
-        merged = merged[merged[date_col] <= _norm_date(end_date)]
-
-    # 标准化输出列名
-    merged = merged.rename(columns={date_col: "trade_date"})
-    merged["symbol"] = str(symbol).zfill(6)
-    merged["adj_factor"] = merged.get("qfq_factor")
-
-    if merged.empty:
+    if normalized.empty:
         raise DataNotFoundError("akshare", _DOMAIN, f"symbol={symbol} 合并后无数据")
 
-    logger.debug(f"AKShare 复权因子: {symbol} {len(merged)} 条")
-    return merged[["symbol", "trade_date", "adj_factor", "qfq_factor", "hfq_factor"]]
+    logger.debug(f"AKShare 复权因子: {symbol} {len(normalized)} 条")
+    return normalized

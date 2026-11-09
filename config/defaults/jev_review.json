@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "api_key": "",
+  "model": "jev-1.13.0",
+  "timeout_seconds": 20
+}

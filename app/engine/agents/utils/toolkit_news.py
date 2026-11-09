@@ -99,7 +99,7 @@ def get_realtime_stock_news(
         report_lines = [f"## {ticker} 实时新闻分析 ({curr_date})\n"]
         for item in items:
             title = item.get("title", "")
-            content = item.get("content", item.get("summary", ""))
+            content = item.get("content", "")
             source = item.get("source", item.get("data_source", ""))
             pub_time = item.get("publish_time", "")
             report_lines.append(f"- [{source} {pub_time}] {title}")
@@ -154,17 +154,8 @@ def get_stock_news_unified(
 
             # 1. 尝试获取AKShare东方财富新闻
             try:
-                clean_ticker = (
-                    ticker.replace(".SH", "")
-                    .replace(".SZ", "")
-                    .replace(".SS", "")
-                    .replace(".HK", "")
-                    .replace(".XSHE", "")
-                    .replace(".XSHG", "")
-                )
-
                 logger.debug(
-                    f"🇨🇳🇭🇰 [统一新闻工具] 尝试获取东方财富新闻: {clean_ticker}"
+                    f"🇨🇳🇭🇰 [统一新闻工具] 尝试获取东方财富新闻: {ticker}"
                 )
 
                 try:
@@ -172,7 +163,7 @@ def get_stock_news_unified(
 
                     _di = DataInterface.get_instance()
                     market_code = "CN" if market_info.get("is_china") else "HK"
-                    _r = _run_async(_di.read(market_code, "news", symbol=clean_ticker))
+                    _r = _run_async(_di.read(market_code, "news", symbol=ticker))
                     news_data = _r.get("data", [])
                     if news_data:
                         if isinstance(news_data, list):
@@ -204,24 +195,18 @@ def get_stock_news_unified(
                         result_data.append("## 东方财富新闻\n暂无新闻数据")
                 except Exception as inner_e:
                     logger.error(
-                        f"❌ [统一新闻工具] 东方财富新闻获取失败: {inner_e}"
+                        f"❌ [统一新闻工具] 东方财富新闻获取失败: {inner_e}",
+                        exc_info=True,
                     )
                     result_data.append(f"## 东方财富新闻\n获取失败: {inner_e}")
             except Exception as em_e:
-                logger.error(f"❌ [统一新闻工具] 东方财富新闻获取失败: {em_e}")
+                logger.error(f"❌ [统一新闻工具] 东方财富新闻获取失败: {em_e}", exc_info=True)
                 result_data.append(f"## 东方财富新闻\n获取失败: {em_e}")
 
             # 2. 获取Google新闻作为补充
             try:
                 if is_china:
-                    clean_ticker = (
-                        ticker.replace(".SH", "")
-                        .replace(".SZ", "")
-                        .replace(".SS", "")
-                        .replace(".XSHE", "")
-                        .replace(".XSHG", "")
-                    )
-                    search_query = f"{clean_ticker} 股票 公司 财报 新闻"
+                    search_query = f"{ticker} 股票 公司 财报 新闻"
                     logger.debug(
                         f"🇨🇳 [统一新闻工具] A股Google新闻搜索关键词: {search_query}"
                     )
@@ -240,7 +225,7 @@ def get_stock_news_unified(
                 result_data.append(f"## Google新闻\n{news_data}")
                 logger.debug("🇨🇳🇭🇰 [统一新闻工具] 成功获取Google新闻")
             except Exception as google_e:
-                logger.error(f"❌ [统一新闻工具] Google新闻获取失败: {google_e}")
+                logger.error(f"❌ [统一新闻工具] Google新闻获取失败: {google_e}", exc_info=True)
                 result_data.append(f"## Google新闻\n获取失败: {google_e}")
 
         else:
@@ -277,5 +262,5 @@ def get_stock_news_unified(
 
     except Exception as e:
         error_msg = f"统一新闻工具执行失败: {str(e)}"
-        logger.error(f"❌ [统一新闻工具] {error_msg}")
+        logger.error(f"❌ [统一新闻工具] {error_msg}", exc_info=True)
         return error_msg

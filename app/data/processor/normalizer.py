@@ -11,6 +11,7 @@ DOMAIN_METHOD_MAP = {
     "basic_info": "adapt_basic_info",
     "trade_calendar": "adapt_trade_calendar",
     "daily_quotes": "adapt_daily_quotes",
+    "index_quotes": "adapt_index_quotes",
     "daily_indicators": "adapt_daily_indicators",
     "financial_data": "adapt_financial_data",
     "adj_factors": "adapt_adj_factors",

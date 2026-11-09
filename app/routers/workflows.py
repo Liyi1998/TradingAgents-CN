@@ -71,6 +71,7 @@ class ValidateRunPayload(BaseModel):
     workflow_slug: str = Field(..., min_length=1)
     selected_nodes: Optional[List[str]] = None
     stage_overrides: Dict[str, StageOverride] = Field(default_factory=dict)
+    analysis_horizon: str = "short"
 
 
 def _stage_summary(spec: WorkflowSpec) -> List[Dict[str, Any]]:
@@ -126,6 +127,7 @@ async def list_workflows(user: dict = Depends(get_current_user)):
                 "valid": not errors,
                 "validation_errors": errors,
                 "is_default": doc.get("_id") == default_slug,
+                "analysis_horizon": (spec_raw.get("research_profile") or {}).get("horizon", "short"),
             }
         )
     return {"success": True, "data": {"workflows": items, "default_slug": default_slug}}
@@ -244,17 +246,24 @@ async def validate_run(payload: ValidateRunPayload, user: dict = Depends(get_cur
     errors: List[str] = []
     plan = None
     try:
-        spec, _ = load_workflow_by_slug(payload.workflow_slug)
-        params = CompileParams(
-            selected_nodes=tuple(payload.selected_nodes or ()),
-            stage_overrides=dict(payload.stage_overrides),
-        )
-        plan = compile_workflow(spec, params)
-        errors.extend(check_required_inputs(spec, plan))
-    except (WorkflowLoadError, CompileError, WorkflowValidationError) as e:
+        if payload.analysis_horizon == "short":
+            spec, _ = load_workflow_by_slug(payload.workflow_slug)
+            from app.engine.orchestrator.workflow.research import period_params
+            params = period_params(spec, CompileParams(
+                selected_nodes=tuple(payload.selected_nodes or ()),
+                stage_overrides=dict(payload.stage_overrides),
+            ), "short")
+            plan = compile_workflow(spec, params)
+            errors.extend(check_required_inputs(spec, plan))
+        else:
+            from app.engine.orchestrator.workflow.research import prepare_workflow
+            spec, _, plan = prepare_workflow(payload.model_dump(), payload.selected_nodes or ())
+    except (WorkflowLoadError, CompileError, WorkflowValidationError, ValueError) as e:
         errors.append(str(e))
 
     data: Dict[str, Any] = {"valid": not errors, "errors": errors}
     if plan is not None:
         data["plan"] = _plan_summary(plan)
+        data["plan"]["workflow_slug"] = plan.workflow_slug
+        data["plan"]["selected_nodes"] = list(plan.params.selected_nodes)
     return {"success": True, "data": data}

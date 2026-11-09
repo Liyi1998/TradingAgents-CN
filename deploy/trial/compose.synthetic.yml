@@ -1,0 +1,5 @@
+# Opt-in overlay. Use only with the trial project and the bundled synthetic fixtures.
+services:
+  backend:
+    environment:
+      STRUCTURE_AUXILIARY_SYNTHETIC_DIR: /opt/trial-fixtures

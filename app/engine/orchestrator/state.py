@@ -68,8 +68,10 @@ class PipelineState(TypedDict, total=False):
     messages: List[Any]
     company_of_interest: str
     trade_date: str
+    analysis_horizon: str
     task_id: Optional[str]
     user_id: str
+    account_position: str
     investment_debate_state: InvestmentDebateState
     risk_debate_state: RiskDebateState
     reports: Dict[str, str]  # 报告输出唯一聚合点
@@ -324,20 +326,35 @@ def create_initial_state(
     trade_date: str,
     task_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    account_position: str = "UNKNOWN",
+    analysis_horizon: str = "short",
 ) -> Dict[str, Any]:
     """创建流水线初始状态（canonical 形状）"""
+    if not isinstance(company_name, str) or company_name.strip().lower() in {"", "none", "null", "undefined"}:
+        raise ValueError("分析目标股票代码缺失，已停止执行；请检查 symbol/stock_code 参数传递")
+    company_name = company_name.strip()
     from app.llm.core.types import Message, Role
+    from app.core.analysis_horizon import get_horizon_profile
 
+    profile = get_horizon_profile(analysis_horizon)
     task_description = f"请对股票 {company_name} 进行全面分析，交易日期：{trade_date}"
+    if profile.key != "short":
+        task_description += f"；分析周期：{profile.label}（{profile.holding_period}）"
 
     state: Dict[str, Any] = {
         "messages": [Message(role=Role.USER, content=task_description)],
         "company_of_interest": company_name,
         "trade_date": str(trade_date),
+        "analysis_horizon": profile.key,
         "task_id": task_id,
         "user_id": user_id or "",  # 任务发起者（token 用量统计归属）
-        "investment_debate_state": InvestmentDebateState(rounds=[], count=0, max_rounds=2, judge_decision=""),
-        "risk_debate_state": RiskDebateState(rounds=[], count=0, max_rounds=3, latest_speaker="", judge_decision=""),
+        "account_position": account_position,
+        "investment_debate_state": InvestmentDebateState(
+            rounds=[], count=0, max_rounds=2, judge_decision=""
+        ),
+        "risk_debate_state": RiskDebateState(
+            rounds=[], count=0, max_rounds=3, latest_speaker="", judge_decision=""
+        ),
         "reports": {},
         "errors": [],
         # Trader / Judge / Summary 输出字段（与旧 AgentState 一致）

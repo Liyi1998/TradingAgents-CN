@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:report-levels-f2adf393
+  frontend:
+    image: tradingagents-cn-hub-frontend:report-levels-f2adf393

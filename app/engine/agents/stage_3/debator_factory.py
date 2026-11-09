@@ -208,7 +208,7 @@ def create_debator(llm, side: Literal["risky", "safe", "neutral"] = "risky", *, 
             base_prompt = load_agent_config(cfg["slug"])
             if not base_prompt:
                 error_msg = f"❌ 未找到 {cfg['slug']} 智能体配置，请检查 agent_specs 智能体库（DB）。"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 raise ValueError(error_msg)
 
             system = build_context_prefix(ticker, company_name, currency) + "\n\n" + base_prompt
@@ -295,7 +295,7 @@ def create_debator(llm, side: Literal["risky", "safe", "neutral"] = "risky", *, 
                 os.replace(tmp_filename, filename)
                 logger.info(f"{emoji} [{label}] 已更新报告文件: {filename}")
             except Exception as e:
-                logger.error(f"{emoji} [ERROR] 保存报告文件失败: {e}")
+                logger.error(f"{emoji} [ERROR] 保存报告文件失败: {e}", exc_info=True)
 
             # ── 10. 构造返回状态（history/current_* 等由 export_legacy_state 派生）──
             new_risk_debate_state["latest_speaker"] = cfg["speaker"]
@@ -305,14 +305,19 @@ def create_debator(llm, side: Literal["risky", "safe", "neutral"] = "risky", *, 
                 "reports": {cfg["report_key"]: report_content},
             }
 
-        except Exception:
+        except Exception as exc:
+            from app.llm.failures import describe_failure
+
             logger.error(
-                f"{emoji} [{label}] 节点执行异常，降级返回以保持流程继续",
+                f"{emoji} [{label}] 节点执行异常，保留失败原因供质量检查拦截",
                 exc_info=True,
             )
             # 降级状态：count 仍递增（append_round 内完成），降级内容也入 rounds，
             # 报告/历史由派生视图统一重建
-            fallback_content = f"⚠️ {label}节点本轮执行异常，未能生成有效辩论内容。"
+            fallback_content = (
+                f"⚠️ {label}节点本轮执行异常，未能生成有效辩论内容。"
+                f"原因：{describe_failure(exc)['message']}"
+            )
             new_risk_debate_state = dict(risk_debate_state)
             append_round(new_risk_debate_state, cfg["round_key"], fallback_content, per_turn)
             new_risk_debate_state["latest_speaker"] = cfg["speaker"]

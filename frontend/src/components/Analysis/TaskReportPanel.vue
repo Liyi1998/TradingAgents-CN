@@ -23,6 +23,7 @@
 
     <!-- 报告内容 -->
     <template v-else>
+      <p class="report-horizon">分析周期：{{ analysisHorizonLabel(result) }}</p>
       <!-- 风险提示 -->
       <el-alert
         type="warning"
@@ -35,28 +36,43 @@
         </template>
       </el-alert>
 
-      <!-- 最终决策卡（structured_summary 优先，decision 兜底） -->
+      <DecisionSemanticsCard
+        v-if="hasDecisionSemantics && decision"
+        :decision="decision"
+        compact
+      />
+
+      <!-- 研究参考与当前分账户动作分别呈现；v3 也保留研究指标。 -->
       <div v-if="result?.structured_summary || result?.decision" class="decision-section">
         <h4 class="section-title">🎯 分析参考</h4>
         <div class="decision-card">
           <div class="decision-main">
-            <div class="decision-action">
+            <div v-if="!hasDecisionSemantics" class="decision-action">
               <span class="label">分析倾向:</span>
               <el-tag :type="actionTagType" size="large">{{ finalSignal || '暂无' }}</el-tag>
               <el-tag type="info" size="small" style="margin-left: 8px;">仅供参考</el-tag>
+              <el-tag
+                v-if="structured?.degraded"
+                type="warning"
+                size="small"
+                effect="dark"
+                style="margin-left: 8px;"
+                title="总结生成失败后的降级占位结果，信号与置信度不可信，请勿依据此报告决策"
+              >降级结果</el-tag>
+              <SettlementBadge :task-id="taskId" style="margin-left: 8px;" />
             </div>
 
             <div class="decision-metrics">
               <div class="metric-item">
-                <span class="label">参考价格:</span>
+                <span class="label">条件目标参考（非委托）:</span>
                 <span class="value">{{ structured?.key_indicators?.target_price || decision?.target_price || '暂无' }}</span>
               </div>
               <div class="metric-item">
-                <span class="label">模型置信度:</span>
+                <span class="label">模型自评（非胜率）:</span>
                 <span class="value">{{ confidenceText }}</span>
               </div>
               <div class="metric-item">
-                <span class="label">风险评分:</span>
+                <span class="label">研究风险评估:</span>
                 <span class="value">{{ structured?.risk_assessment?.level || formatPercentage(decision?.risk_score) }}</span>
               </div>
             </div>
@@ -71,14 +87,14 @@
 
             <!-- 关键指标 -->
             <div v-if="structured?.key_indicators" class="key-indicators">
-              <h5 class="key-indicators-title">🔑 关键点位参考:</h5>
+              <h5 class="key-indicators-title">🔑 条件研究点位（非当前买卖指令）:</h5>
               <div class="key-indicators-grid">
                 <div class="key-indicator-item">
-                  <span class="key-indicator-label">入场:</span>
+                  <span class="key-indicator-label">条件入场参考:</span>
                   <strong class="key-indicator-value">{{ structured.key_indicators.entry_price ?? '暂无' }}</strong>
                 </div>
                 <div class="key-indicator-item">
-                  <span class="key-indicator-label">止损:</span>
+                  <span class="key-indicator-label">保护/失效参考:</span>
                   <strong class="key-indicator-value">{{ structured.key_indicators.stop_loss ?? '暂无' }}</strong>
                 </div>
                 <div class="key-indicator-item">
@@ -109,9 +125,9 @@
             <h5>分析摘要:</h5>
             <p style="white-space: pre-wrap;">{{ structured?.analysis_summary || result?.summary }}</p>
           </div>
-          <div v-if="structured?.investment_recommendation || result?.recommendation" class="overview-recommendation">
+          <div v-if="recommendationText" class="overview-recommendation">
             <h5>投资建议:</h5>
-            <p style="white-space: pre-wrap;">{{ structured?.investment_recommendation || result?.recommendation }}</p>
+            <p style="white-space: pre-wrap;">{{ recommendationText }}</p>
           </div>
         </div>
       </div>
@@ -156,8 +172,12 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { analysisApi } from '@/api/analysis'
 import { reportsApi } from '@/api/reports'
+import SettlementBadge from '@/components/Settlement/SettlementBadge.vue'
 import { renderMarkdown } from '@/utils/markdown'
 import { loadAgentDisplayNames } from '@/utils/agentDisplayNames'
+import DecisionSemanticsCard from '@/components/Analysis/DecisionSemanticsCard.vue'
+import type { AnalysisDecision } from '@/types/analysis'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
 
 /** 后端 GET /tasks/{id}/result 返回 data 的消费字段（app/routers/analysis.py final_result_data） */
 interface TaskResultData {
@@ -167,17 +187,12 @@ interface TaskResultData {
   analysis_date?: string
   summary?: string
   recommendation?: string
-  decision?: {
-    action?: string
-    confidence?: number
-    target_price?: string | number
-    risk_score?: number
-    reasoning?: string
-    reason?: string
-  } | Record<string, never>
+  decision?: AnalysisDecision | Record<string, never>
   structured_summary?: {
     final_signal?: string
-    model_confidence?: number
+    model_confidence?: number | null
+    confidence_label?: string | null
+    degraded?: boolean
     analysis_summary?: string
     investment_recommendation?: string
     risk_assessment?: { level?: string; description?: string }
@@ -251,21 +266,38 @@ const structured = computed(() => {
 })
 const decision = computed(() => {
   const d = result.value?.decision
-  return d && Object.keys(d).length ? d : null
+  return d && Object.keys(d).length ? d as AnalysisDecision : null
 })
-const finalSignal = computed(() => structured.value?.final_signal || decision.value?.action || '')
+const hasDecisionSemantics = computed(() =>
+  Boolean((decision.value?.schema_version ?? 0) >= 2 && decision.value?.unheld_action && decision.value?.held_action),
+)
+const finalSignal = computed(() =>
+  decision.value?.primary_action || decision.value?.action || structured.value?.final_signal || '',
+)
+const recommendationText = computed(() =>
+  hasDecisionSemantics.value
+    ? result.value?.recommendation || structured.value?.investment_recommendation || ''
+    : structured.value?.investment_recommendation || result.value?.recommendation || '',
+)
 const actionTagType = computed((): 'primary' | 'success' | 'warning' | 'info' | 'danger' => {
   const actionTypes: Record<string, 'primary' | 'success' | 'warning' | 'info' | 'danger'> = {
     买入: 'success',
+    BUY: 'success',
     持有: 'warning',
+    HOLD: 'warning',
     卖出: 'danger',
+    SELL: 'danger',
+    REDUCE: 'warning',
     观望: 'info',
+    WATCH: 'info',
   }
   return actionTypes[finalSignal.value] || 'info'
 })
 const confidenceText = computed(() =>
   structured.value
-    ? formatPercentage(structured.value.model_confidence === undefined ? undefined : structured.value.model_confidence / 100)
+    ? structured.value.model_confidence == null
+      ? structured.value.confidence_label || '未量化'
+      : formatPercentage(structured.value.model_confidence / 100)
     : formatPercentage(decision.value?.confidence),
 )
 
@@ -296,7 +328,7 @@ watch(
     if (!v) return
     // report_titles 未覆盖全部 key 时也要兜底（部分覆盖场景按 key 缺失加载）
     const reportsData = (result.value?.reports ?? result.value?.state ?? {}) as Record<string, unknown>
-    const uncovered = Object.keys(reportsData).some(k => !result.value?.report_titles?.[k])
+    const uncovered = Object.keys(reportsData).some(k => k !== 'analysis_horizon' && !result.value?.report_titles?.[k])
     if (!uncovered) return
     loadAgentDisplayNames()
       .then((m) => {
@@ -319,6 +351,8 @@ const reportEntries = computed<ReportEntry[]>(() => {
   const titles = r.report_titles ?? {}
 
   const keys = Object.keys(reportsData).filter((k) => {
+    // Horizon is task metadata, never a report module in legacy state fallbacks.
+    if (k === 'analysis_horizon') return false
     const v = reportsData[k]
     // state 兜底时过滤非报告字段与空值
     return v !== null && v !== undefined && String(v).trim() !== ''
@@ -425,7 +459,7 @@ async function download(format: string = 'markdown') {
       'stock'
     const dateStr = result.value?.analysis_date || new Date().toISOString().slice(0, 10)
     const ext = FORMAT_EXTS[format] || 'txt'
-    a.download = `${String(code)}_分析报告_${String(dateStr).slice(0, 10)}.${ext}`
+    a.download = `${String(code)}_${analysisHorizonLabel(result.value, true)}分析报告_${String(dateStr).slice(0, 10)}.${ext}`
 
     document.body.appendChild(a)
     a.click()
@@ -453,6 +487,12 @@ defineExpose({ download, reload: load })
 <style scoped>
 .task-report-panel {
   padding: 4px 0 12px;
+}
+
+.report-horizon {
+  margin: 0 0 12px;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 .panel-loading {

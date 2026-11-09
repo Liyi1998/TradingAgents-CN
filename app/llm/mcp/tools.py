@@ -9,7 +9,7 @@ MCP 工具桥接：发现 → ToolDef，调用 → call_tool（参考 claude-cod
 
 import json
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from mcp import ClientSession
 
@@ -19,7 +19,7 @@ from ..core.types import ToolDef
 from .client import MCPManager
 from .config import MCPServerConfig
 
-logger = logging.getLogger("app.llm.mcp")
+logger = logging.getLogger(__name__)
 
 TOOL_NAME_PREFIX = "mcp__"
 MAX_DESCRIPTION_CHARS = 2048
@@ -49,7 +49,13 @@ def _format_content(result, *, task_id: str = "") -> str:
     return apply_result_budget("mcp_result", "\n".join(parts), task_id=task_id, max_chars=MAX_TOOL_RESULT_CHARS)
 
 
-def make_mcp_tool_def(cfg: MCPServerConfig, manager: MCPManager, tool) -> ToolDef:
+def make_mcp_tool_def(
+    cfg: MCPServerConfig,
+    manager: MCPManager,
+    tool,
+    *,
+    task_manager: Optional[Any] = None,
+) -> ToolDef:
     """把 server 端单个 tool 包装为本地 ToolDef（handler 绑定该 server）"""
     display_name = mcp_tool_name(cfg.name, tool.name)
     desc = (tool.description or f"MCP tool '{tool.name}' from server '{cfg.name}'")[:MAX_DESCRIPTION_CHARS]
@@ -57,15 +63,45 @@ def make_mcp_tool_def(cfg: MCPServerConfig, manager: MCPManager, tool) -> ToolDe
     async def _call(*call_args, **call_kwargs) -> str:
         # registry 以位置参数传 input dict；直接调用时可能用关键字
         payload = call_args[0] if call_args and isinstance(call_args[0], dict) else call_kwargs
-        session: ClientSession = await manager.get_session(cfg)
-        result = await session.call_tool(tool.name, arguments=payload or {})
-        # mcp SDK 新版 CallToolResult 字段为 is_error（旧版 isError），双兼容避免属性错误
-        is_error = getattr(result, "is_error", None)
-        if is_error is None:
-            is_error = getattr(result, "isError", False)
-        if is_error:
-            return f"MCP 工具执行错误: {_format_content(result)}"
-        return _format_content(result)
+
+        async def _invoke() -> str:
+            session: ClientSession = await manager.get_session(cfg)
+            result = await session.call_tool(tool.name, arguments=payload or {})
+            # mcp SDK 新版 CallToolResult 字段为 is_error（旧版 isError），双兼容避免属性错误
+            is_error = getattr(result, "is_error", None)
+            if is_error is None:
+                is_error = getattr(result, "isError", False)
+            formatted = _format_content(result)
+            if is_error:
+                return f"MCP 工具执行错误: {formatted}"
+            return formatted
+
+        try:
+            if task_manager is not None:
+                formatted = await task_manager.execute_tool(tool.name, _invoke, server_name=cfg.name)
+            else:
+                formatted = await _invoke()
+        except Exception as exc:
+            formatted = {"status": "error", "message": f"MCP调用不可用: {type(exc).__name__}"}
+
+        from ..tools.result_status import classify_tool_result
+
+        failure = isinstance(formatted, dict) and formatted.get("status") in {"error", "disabled"}
+        if failure or classify_tool_result(str(formatted)) == "error":
+            message = str(formatted.get("message") or formatted) if failure else str(formatted)
+            from .free_fallback import builtin_fallback
+            substitute = await builtin_fallback(tool.name, payload or {})
+            suffix = "\n本地定向备用数据（非完整等价替代）：\n" + json.dumps(substitute, ensure_ascii=False) if substitute else ""
+            return f"MCP 工具执行错误: {message}{suffix}"
+        formatted_text = str(formatted)
+        if classify_tool_result(formatted_text) == "success":
+            try:
+                from app.services.mcp_data_cache import persist_mcp_result
+
+                await persist_mcp_result(display_name, payload or {}, formatted_text)
+            except Exception as cache_error:  # noqa: BLE001 - 写回失败不影响本次分析
+                logger.warning("⚠️ [mcp] 妙想结果写回失败（继续分析）: %s", cache_error)
+        return formatted_text
 
     annotations = getattr(tool, "annotations", None)  # annotations 可能为 None
     # mcp SDK 新版 annotations 字段为 read_only_hint（旧版 readOnlyHint），双兼容
@@ -96,6 +132,7 @@ async def discover_mcp_tools(
     manager: Optional[MCPManager] = None,
     servers: Optional[Dict[str, MCPServerConfig]] = None,
     config_path: Optional[str] = None,  # 保留参数兼容旧签名；实际配置源为 config/mcp.json
+    task_manager: Optional[Any] = None,
 ) -> List[ToolDef]:
     """连接全部配置的 server 并发现工具，返回 ToolDef 列表"""
     mgr = manager or MCPManager()
@@ -114,7 +151,14 @@ async def discover_mcp_tools(
             continue
         for tool in listed.tools:
             try:
-                defs.append(make_mcp_tool_def(cfg, mgr, tool))
+                defs.append(
+                    make_mcp_tool_def(
+                        cfg,
+                        mgr,
+                        tool,
+                        task_manager=task_manager,
+                    )
+                )
             except Exception as e:  # noqa: BLE001 - 单工具包装失败跳过，不炸整个发现流程
                 logger.warning(f"⚠️ [mcp] server '{name}' 工具 '{tool.name}' 包装失败: {e}")
         logger.info(f"[mcp] server '{name}' 发现 {len(listed.tools)} 个工具")

@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import math
 import re
 from collections import OrderedDict
 from threading import Lock
@@ -15,6 +16,14 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.core.database import get_mongo_db, get_mongo_db_sync
+from app.core.analysis_horizon import get_horizon_profile
+from app.services.analysis_horizon import horizon_from_snapshot, require_matching_horizon
+from app.engine.decision_semantics import (
+    collect_decision_source,
+    format_decision_recommendation,
+    merge_decision_key_points,
+    normalize_decision,
+)
 from app.utils.timezone import now_utc, to_config_tz
 
 logger = logging.getLogger(__name__)
@@ -121,6 +130,13 @@ def _build_report_query(report_id: str) -> Dict[str, Any]:
     return {"$or": ors}
 
 
+def _with_report_owner(query: Dict[str, Any], user_id: Optional[str]) -> Dict[str, Any]:
+    """为报告查询追加所有权约束，保留原有的多 ID ``$or`` 条件。"""
+    if not user_id:
+        return query
+    return {"$and": [query, {"user_id": str(user_id)}]}
+
+
 # ---------------------------------------------------------------------------
 # 辅助：从 state 中动态提取报告模块
 # ---------------------------------------------------------------------------
@@ -160,7 +176,8 @@ def _extract_reports_from_state(state: Dict[str, Any]) -> Dict[str, str]:
 # 辅助：提取结构化摘要中的置信度、风险等级、投资建议
 # ---------------------------------------------------------------------------
 
-_RISK_LEVEL_MAP = {"High": "高", "Medium": "中等", "Low": "低"}
+_RISK_LEVEL_MAP = {"High": "高", "Medium": "中等", "Low": "低", "Unknown": "未知",
+                   "高": "高", "中高": "中高", "中等": "中等", "中低": "中低", "低": "低", "未知": "未知"}
 
 
 def _extract_structured_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -169,24 +186,48 @@ def _extract_structured_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
     返回包含 confidence_score / risk_level / recommendation / summary 的字典。
     """
     structured_summary = doc.get("structured_summary") or {}
+    if not isinstance(structured_summary, dict):
+        structured_summary = {}
 
-    confidence_score = doc.get("confidence_score", 0.0)
-    risk_level = doc.get("risk_level", "中等")
+    confidence_score = doc.get("confidence_score")
+    risk_level = doc.get("risk_level") or "未知"
     recommendation = doc.get("recommendation", "")
     summary = doc.get("summary", "")
+    decision_source = collect_decision_source(doc)
+    raw_decision = doc.get("decision") or structured_summary.get("decision_semantics")
+    has_decision_evidence = bool(raw_decision or decision_source)
+    decision = (
+        normalize_decision(raw_decision, decision_source)
+        if has_decision_evidence
+        else {}
+    )
 
     if structured_summary:
-        if structured_summary.get("model_confidence"):
-            confidence_score = structured_summary.get("model_confidence", 0) / 100.0
-        if structured_summary.get("risk_assessment", {}).get("level"):
+        if "model_confidence" in structured_summary:
+            confidence = structured_summary["model_confidence"]
+            valid = (isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+                     and math.isfinite(confidence) and 0 <= confidence <= 100)
+            confidence_score = confidence / 100 if valid else None
+        risk_assessment = structured_summary.get("risk_assessment") or {}
+        if not isinstance(risk_assessment, dict):
+            risk_assessment = {}
+        if risk_assessment.get("level"):
             risk_level = _RISK_LEVEL_MAP.get(
-                structured_summary.get("risk_assessment", {}).get("level", "Medium"),
-                "中等"
+                risk_assessment["level"],
+                "未知"
             )
         if structured_summary.get("investment_recommendation"):
             recommendation = structured_summary.get("investment_recommendation", "")
         if structured_summary.get("analysis_summary") and not summary:
             summary = structured_summary.get("analysis_summary", "")
+
+    if has_decision_evidence:
+        from app.engine.decision_semantics import synchronize_summary
+        structured_summary = synchronize_summary(structured_summary, decision)
+        confidence = structured_summary.get("model_confidence")
+        confidence_score = confidence / 100 if confidence is not None else None
+        risk_level = _RISK_LEVEL_MAP.get(structured_summary.get("risk_assessment", {}).get("level"), "未知")
+        recommendation = format_decision_recommendation(decision)
 
     return {
         "confidence_score": confidence_score,
@@ -194,6 +235,12 @@ def _extract_structured_fields(doc: Dict[str, Any]) -> Dict[str, Any]:
         "recommendation": recommendation,
         "summary": summary,
         "structured_summary": structured_summary,
+        "decision": decision,
+        "key_points": (
+            merge_decision_key_points(doc.get("key_points", []), decision)
+            if has_decision_evidence
+            else doc.get("key_points", [])
+        ),
     }
 
 
@@ -231,6 +278,10 @@ class ReportsService:
     def __init__(self, db: AsyncIOMotorDatabase):
         self.db = db
 
+    async def get_condition_check(self, analysis_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        from app.services.jev_condition_service import get_condition_check
+        return await get_condition_check(self.db, analysis_id, user_id)
+
     # ------------------------------------------------------------------
     # 公开方法
     # ------------------------------------------------------------------
@@ -259,6 +310,8 @@ class ReportsService:
         Returns:
             {"reports": [...], "total": int, "page": int, "page_size": int}
         """
+        # 一次性修复旧版报告缺少 user_id 的数据。操作幂等；迁移完成后查询为空。
+        await self._backfill_legacy_report_owners()
         query = self._build_list_query(filters or {}, user_id)
 
         total = await self.db.analysis_reports.count_documents(query)
@@ -284,7 +337,9 @@ class ReportsService:
             "page_size": page_size,
         }
 
-    async def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+    async def get_report(
+        self, report_id: str, user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         获取单个报告详情。
 
@@ -294,16 +349,19 @@ class ReportsService:
         Returns:
             格式化后的报告字典，或 None
         """
-        query = _build_report_query(report_id)
+        await self._backfill_legacy_report_owners()
+        query = _with_report_owner(_build_report_query(report_id), user_id)
         doc = await self.db.analysis_reports.find_one(query)
 
         if doc:
             return await self._format_report_detail_from_reports_collection(doc)
 
         # 兜底：从 analysis_tasks 中还原
-        return await self._restore_report_from_tasks(report_id)
+        return await self._restore_report_from_tasks(report_id, user_id)
 
-    async def get_report_by_task_id(self, task_id: str) -> Optional[Dict[str, Any]]:
+    async def get_report_by_task_id(
+        self, task_id: str, user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         通过 task_id 查找报告。
         先在 analysis_reports 中查找，若找不到则在 analysis_tasks 中查找。
@@ -312,12 +370,14 @@ class ReportsService:
             格式化后的报告字典，或 None
         """
         # 先在 reports 集合中按 task_id 查找
-        doc = await self.db.analysis_reports.find_one({"task_id": task_id})
+        await self._backfill_legacy_report_owners()
+        query = _with_report_owner({"task_id": task_id}, user_id)
+        doc = await self.db.analysis_reports.find_one(query)
         if doc:
             return await self._format_report_detail_from_reports_collection(doc)
 
         # 兜底：从 tasks 集合中查找
-        return await self._restore_report_from_tasks(task_id)
+        return await self._restore_report_from_tasks(task_id, user_id)
 
     async def delete_report(
         self,
@@ -331,7 +391,8 @@ class ReportsService:
         Returns:
             是否删除成功
         """
-        query = _build_report_query(report_id)
+        await self._backfill_legacy_report_owners()
+        query = _with_report_owner(_build_report_query(report_id), user_id)
         result = await self.db.analysis_reports.delete_one(query)
         return result.deleted_count > 0
 
@@ -388,18 +449,37 @@ class ReportsService:
             "last_30_days": last_30_days,
         }
 
-    async def download_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+    async def download_report(
+        self, report_id: str, user_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         获取报告完整数据用于下载。
 
         Returns:
             原始报告文档字典（ObjectId 已转为字符串），或 None
         """
-        query = _build_report_query(report_id)
+        await self._backfill_legacy_report_owners()
+        query = _with_report_owner(_build_report_query(report_id), user_id)
         doc = await self.db.analysis_reports.find_one(query)
 
         if not doc:
             return None
+
+        # 返回时适配旧裁决，不回写 MongoDB，也不改动历史报告正文。
+        doc = dict(doc)
+        doc["analysis_horizon"] = horizon_from_snapshot(doc)
+        decision_source = collect_decision_source(doc)
+        if doc.get("decision") or decision_source:
+            decision = normalize_decision(doc.get("decision"), decision_source)
+            doc["decision"] = decision
+            from app.engine.decision_semantics import synchronize_summary
+            doc["structured_summary"] = synchronize_summary(doc.get("structured_summary") or {}, decision)
+            confidence = doc["structured_summary"].get("model_confidence")
+            doc["confidence_score"] = confidence / 100 if confidence is not None else None
+            doc["recommendation"] = format_decision_recommendation(decision)
+            doc["key_points"] = merge_decision_key_points(
+                doc.get("key_points", []), decision
+            )
 
         # 序列化 ObjectId
         if "_id" in doc:
@@ -451,6 +531,62 @@ class ReportsService:
 
         return query
 
+    async def _backfill_legacy_report_owners(self) -> int:
+        """从任务归属回填旧报告的 user_id。
+
+        若历史任务已被清理，仅在系统恰好只有一个活跃用户时才归属给该用户；
+        多用户环境不会猜测所有权，避免把报告暴露给错误用户。
+        """
+        legacy_filter = {
+            "$or": [
+                {"user_id": {"$exists": False}},
+                {"user_id": None},
+                {"user_id": ""},
+            ]
+        }
+        legacy = await self.db.analysis_reports.find(
+            legacy_filter, {"_id": 1, "task_id": 1}
+        ).to_list(length=None)
+        if not legacy:
+            return 0
+
+        task_ids = [item.get("task_id") for item in legacy if item.get("task_id")]
+        owners: Dict[str, str] = {}
+        if task_ids:
+            async for task in self.db.analysis_tasks.find(
+                {"task_id": {"$in": task_ids}}, {"task_id": 1, "user_id": 1}
+            ):
+                if task.get("task_id") and task.get("user_id") is not None:
+                    owners[str(task["task_id"])] = str(task["user_id"])
+
+        updated = 0
+        unresolved_ids: List[ObjectId] = []
+        for report in legacy:
+            owner = owners.get(str(report.get("task_id") or ""))
+            if owner:
+                result = await self.db.analysis_reports.update_one(
+                    {"_id": report["_id"], **legacy_filter},
+                    {"$set": {"user_id": owner}},
+                )
+                updated += result.modified_count
+            else:
+                unresolved_ids.append(report["_id"])
+
+        if unresolved_ids:
+            active_users = await self.db.users.find(
+                {"is_active": {"$ne": False}}, {"_id": 1}
+            ).limit(2).to_list(length=2)
+            if len(active_users) == 1:
+                result = await self.db.analysis_reports.update_many(
+                    {"_id": {"$in": unresolved_ids}, **legacy_filter},
+                    {"$set": {"user_id": str(active_users[0]["_id"])}},
+                )
+                updated += result.modified_count
+
+        if updated:
+            logger.info("已回填 %s 份历史报告的用户归属", updated)
+        return updated
+
     # ------------------------------------------------------------------
     # 私有方法：格式化报告
     # ------------------------------------------------------------------
@@ -472,8 +608,10 @@ class ReportsService:
 
         return {
             "id": str(doc["_id"]),
+            "user_id": str(doc.get("user_id") or ""),
             "analysis_id": doc.get("analysis_id", ""),
-            "title": f"{stock_name}({stock_code}) 分析报告",
+            "analysis_horizon": horizon_from_snapshot(doc),
+            "title": f"{stock_name}({stock_code}) {get_horizon_profile(horizon_from_snapshot(doc)).label}分析报告",
             "stock_code": stock_code,
             "stock_name": stock_name,
             "market_type": market_type,
@@ -508,14 +646,19 @@ class ReportsService:
         # 尝试修复空报告：从 analysis_tasks 中的 state 恢复
         reports = doc.get("reports", {})
         if not reports and doc.get("task_id"):
-            reports = await self._recover_reports_from_task_state(doc["task_id"])
+            reports = await self._recover_reports_from_task_state(doc["task_id"], horizon_from_snapshot(doc))
+        from app.services.report_utils import dedupe_report_aliases
+        reports, report_aliases = dedupe_report_aliases(reports)
 
         # 提取结构化字段
-        extracted = _extract_structured_fields(doc)
+        # 空 reports 从任务状态恢复后，也必须使用恢复出的裁决原文做兼容解析。
+        extracted = _extract_structured_fields({**doc, "reports": reports})
 
         return {
             "id": str(doc["_id"]),
+            "user_id": str(doc.get("user_id") or ""),
             "analysis_id": doc.get("analysis_id", ""),
+            "analysis_horizon": horizon_from_snapshot(doc),
             "stock_symbol": stock_symbol,
             "stock_name": stock_name,
             "model_info": doc.get("model_info", "Unknown"),
@@ -526,29 +669,45 @@ class ReportsService:
             "analysts": doc.get("analysts", []),
             "summary": extracted["summary"],
             "reports": reports,
+            "report_aliases": {**doc.get("report_aliases", {}), **report_aliases},
             "source": doc.get("source", "unknown"),
             "task_id": doc.get("task_id", ""),
             "recommendation": extracted["recommendation"],
             "confidence_score": extracted["confidence_score"],
             "risk_level": extracted["risk_level"],
-            "key_points": doc.get("key_points", []),
+            "key_points": extracted["key_points"],
             "execution_time": doc.get("execution_time", 0),
             "tokens_used": doc.get("tokens_used", 0),
             "structured_summary": extracted["structured_summary"],
-            "decision": doc.get("decision", {}),
+            "decision": extracted["decision"],
         }
 
     async def _restore_report_from_tasks(
         self,
         report_id: str,
+        user_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         从 analysis_tasks 集合中还原报告详情（兜底逻辑）。
         当 analysis_reports 中没有找到时使用。
         """
+        task_query: Dict[str, Any] = {
+            "$or": [{"task_id": report_id}, {"result.analysis_id": report_id}]
+        }
+        if user_id:
+            task_query = {"$and": [task_query, {"user_id": str(user_id)}]}
         tasks_doc = await self.db.analysis_tasks.find_one(
-            {"$or": [{"task_id": report_id}, {"result.analysis_id": report_id}]},
-            {"result": 1, "task_id": 1, "stock_code": 1, "created_at": 1, "completed_at": 1}
+            task_query,
+            {
+                "result": 1,
+                "analysis_horizon": 1,
+                "parameters.analysis_horizon": 1,
+                "task_id": 1,
+                "user_id": 1,
+                "stock_code": 1,
+                "created_at": 1,
+                "completed_at": 1,
+            },
         )
 
         if not tasks_doc or not tasks_doc.get("result"):
@@ -585,7 +744,9 @@ class ReportsService:
 
         return {
             "id": tasks_doc.get("task_id", report_id),
+            "user_id": str(tasks_doc.get("user_id") or ""),
             "analysis_id": r.get("analysis_id", ""),
+            "analysis_horizon": horizon_from_snapshot(tasks_doc),
             "stock_symbol": stock_symbol,
             "stock_name": stock_name,
             "model_info": r.get("model_info", "Unknown"),
@@ -601,16 +762,17 @@ class ReportsService:
             "recommendation": extracted["recommendation"],
             "confidence_score": extracted["confidence_score"],
             "risk_level": extracted["risk_level"],
-            "key_points": r.get("key_points", []),
+            "key_points": extracted["key_points"],
             "execution_time": r.get("execution_time", 0),
             "tokens_used": r.get("tokens_used", 0),
             "structured_summary": extracted["structured_summary"],
-            "decision": r.get("decision", {}),
+            "decision": extracted["decision"],
         }
 
     async def _recover_reports_from_task_state(
         self,
         task_id: str,
+        analysis_horizon: str = "short",
     ) -> Dict[str, str]:
         """
         尝试从 analysis_tasks 中查找 task_id 对应的 state，恢复报告模块。
@@ -619,10 +781,11 @@ class ReportsService:
         try:
             task_doc = await self.db.analysis_tasks.find_one(
                 {"task_id": task_id},
-                {"result.state": 1}
+                {"result.state": 1, "analysis_horizon": 1, "parameters.analysis_horizon": 1}
             )
             if not task_doc or not task_doc.get("result"):
                 return {}
+            require_matching_horizon(task_doc, {"analysis_horizon": analysis_horizon})
 
             state = task_doc["result"].get("state")
             if not isinstance(state, dict):

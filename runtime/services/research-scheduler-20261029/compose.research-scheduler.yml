@@ -1,0 +1,3 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:research-scheduler-8f6d630c

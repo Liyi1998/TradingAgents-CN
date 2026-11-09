@@ -24,7 +24,8 @@ def rank_factors_by_industry(df: pd.DataFrame,
                              factor_fields: List[str]) -> pd.DataFrame:
     """每因子行业内 pct rank ×100；lower_better 反转。产出 <f>_rank 列。"""
     out = df.copy()
-    grouped = out.groupby("industry", group_keys=False)
+    groups = ["_industry_classification", "industry"] if "_industry_classification" in out else "industry"
+    grouped = out.groupby(groups, group_keys=False)
     for f in factor_fields:
         if f not in out.columns:
             out[f] = np.nan

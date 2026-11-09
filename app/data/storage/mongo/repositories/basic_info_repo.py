@@ -1,12 +1,48 @@
 """股票基本信息仓储。"""
 
 from typing import Dict, List, Optional
+from datetime import date
 
 from pymongo import UpdateOne
 
 from app.data.storage.mongo.client import get_motor_db
 from app.data.storage.mongo.collections import get_collection_name
 from app.data.storage.mongo.bulk_utils import batched_bulk_write
+from app.data.processor.industry_contract import INDUSTRY_CONTRACT, INDUSTRY_FIELDS, industry_label, industry_verified
+
+
+def _valid_industry_text(field):
+    text = {"$convert": {"input": "$" + field, "to": "string", "onError": "", "onNull": ""}}
+    return {"$and": [
+        {"$eq": [{"$type": "$" + field}, "string"]},
+        {"$not": [{"$regexMatch": {"input": text,
+            "regex": r"^\s*(?:[+-]?\d+(?:\.\d+)?|nan|inf|none|null|unknown|n/a|-)?\s*$", "options": "i"}}]},
+    ]}
+
+
+def cn_basic_update(record: Dict) -> List[Dict]:
+    """Atomic sparse updates preserve field provenance, and retire invalid type labels."""
+    fields = {key: {"$literal": value} for key, value in record.items()
+              if key not in INDUSTRY_FIELDS and key != "_id"}
+    valid_old = _valid_industry_text("industry")
+    if industry_verified(record):
+        # A slow older fetch cannot replace a newer dated classification.
+        newer_old = {"$and": [valid_old,
+            {"$eq": ["$industry_contract", INDUSTRY_CONTRACT]},
+            {"$gt": ["$industry_as_of", record["industry_as_of"]]},
+            {"$lte": ["$industry_as_of", date.today().isoformat()]},
+            {"$ne": [{"$dateFromString": {"dateString": {"$convert": {"input": "$industry_as_of", "to": "string", "onError": "", "onNull": ""}},
+                "format": "%Y-%m-%d", "onError": None, "onNull": None}}, None]},
+            _valid_industry_text("industry_source"),
+            _valid_industry_text("industry_classification"),
+        ]}
+        for key in INDUSTRY_FIELDS:
+            fields[key] = {"$cond": [newer_old, "$" + key, {"$literal": record.get(key)}]}
+    else:
+        fields["industry"] = {"$cond": [valid_old, "$industry", {"$literal": industry_label(record.get("industry"))}]}
+        for key in INDUSTRY_FIELDS[1:]:
+            fields[key] = {"$cond": [valid_old, {"$ifNull": ["$" + key, None]}, None]}
+    return [{"$set": fields}]
 
 
 class BasicInfoRepo:
@@ -23,7 +59,7 @@ class BasicInfoRepo:
                 continue
             ops.append(UpdateOne(
                 {"symbol": rec["symbol"]},
-                {"$set": rec},
+                cn_basic_update(rec) if market == "CN" else {"$set": rec},
                 upsert=True,
             ))
         if not ops:

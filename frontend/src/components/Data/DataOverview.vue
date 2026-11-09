@@ -11,6 +11,11 @@
       class="market-banner"
     />
 
+    <details v-if="domainHealth.some(item => item.status !== 'healthy')" class="domain-issues">
+      <summary>查看异常与降级原因（本地数据域概览，不代表每只股票的实时取数结果）</summary>
+      <p v-for="item in domainHealth.filter(item => item.status !== 'healthy')" :key="item.domain"><strong>{{ domainLabel(item.domain) }}</strong>：{{ item.reason }}。{{ domainImpact(item.domain) }}</p>
+    </details>
+
     <!-- 监控失联横幅：请求失败绝不退回"推断正常" -->
     <el-alert
       v-if="loadErrors.length > 0"
@@ -38,15 +43,15 @@
             </div>
           </div>
           <div class="summary-info">
-            <div class="summary-title">系统综合数据质量</div>
+            <div class="summary-title">记录标识完整度</div>
             <div class="summary-desc" :style="{ color: scoreColor }">
-              评级：{{ scoreLabel }}
+              标识评级：{{ scoreLabel }}
             </div>
             <div class="summary-meta">
               包含 {{ totalDomains }} 个数据域 | 共计 {{ formatNumber(totalRecords) }} 条底层记录
             </div>
             <p class="summary-explanation">
-              该评分由各数据源的<strong style="color:var(--el-text-color-primary)">字段完整度</strong>和<strong style="color:var(--el-text-color-primary)">更新及时性</strong>加权计算得出。高评分意味着系统在执行量化回测或 AI 分析时，能够获取更准确、无偏差的底层支持。
+              该比例仅按各数据域的股票代码字段存在率取平均（空库记为 0），不检查价格正确性、业务日期、其他字段或全市场覆盖。数据健康请以上方逐域状态和具体分析中的证据为准。
             </p>
           </div>
         </div>
@@ -197,7 +202,7 @@
             ></div>
           </div>
           <span class="bar-hint" v-if="card.completeness < 1">部分历史或罕见字段缺失</span>
-          <span class="bar-hint" style="color:#7CB342" v-else>数据结构极其完整</span>
+          <span class="bar-hint" style="color:#7CB342" v-else>标识字段存在，不代表全部业务字段完整</span>
         </div>
 
         <div class="card-actions">
@@ -272,6 +277,7 @@ const DOMAIN_ICON_MAP: Record<string, any> = {
 
 const DOMAIN_DESCRIPTIONS: Record<string, string> = {
   basic_info: '构建本地标的池，存储股票代码、名称、行业及上市状态等底层基建信息。',
+  index_quotes: '存储指数日线，用于结算时比较指数收益和超额收益；指数缺失不等于个股股价缺失。',
   daily_quotes: '落地每日 OHLC、成交量等行情序列，是技术分析代理节点的核心输入。',
   daily_indicators: '存储 PE、PB、换手率等估值指标，用于基本面筛股和流动性分析。',
   adj_factors: '除权除息修复因子，保证收益率计算与长线趋势分析的准确性。',
@@ -350,6 +356,17 @@ const marketBanner = computed(() => {
     type: meta.type,
   }
 })
+
+function domainImpact(domain: string) {
+  const hints: Record<string, string> = {
+    index_quotes: '影响结算的指数对照和超额收益；个股日线是独立数据域。',
+    corporate_actions: '这是全市场落库覆盖率；没有公司行为事件的股票不应据此断言缺失分红数据。',
+    margin_trading: '这是全股票池覆盖率，两融有适用标的范围；实际分析须逐股核对余额与日期。',
+    intraday_quotes: '此处检查本地分时域缓存；短线研究的分钟快照另有来源和时点校验。',
+    market_quotes: '本地报价缓存较旧；个股页面按需获取的新报价须以自己的时间戳为准。'
+  }
+  return hints[domain] || '请结合该域最新业务日期和具体标的核验。'
+}
 
 // 股票查询
 const stockSymbol = ref('')
@@ -606,6 +623,8 @@ const { lastRefreshTime } = usePolling(loadData, 60_000)
 </script>
 
 <style scoped lang="scss">
+.domain-issues { margin: 12px 0 20px; padding: 12px 16px; border: 1px solid var(--el-border-color-light); border-radius: 8px; line-height: 1.8; overflow-wrap: anywhere; }
+.domain-issues summary { cursor: pointer; }
 .data-overview {
   animation: fadeIn 0.4s ease-out;
 }

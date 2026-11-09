@@ -97,6 +97,7 @@
             </div>
 
             <div class="card-body">
+              <div v-if="task.status !== 'unknown'" class="card-line muted">分析周期：{{ analysisHorizonLabel(task) }}</div>
               <!-- 进度：非终态显示步骤提示，终态显示结果摘要 -->
               <div v-if="task.status === 'unknown'" class="card-line muted">状态获取失败，等待下次刷新…</div>
               <div v-else-if="!isTerminal(task.status)" class="card-line muted">
@@ -141,6 +142,8 @@ import { Loading } from '@element-plus/icons-vue'
 import { analysisApi } from '@/api/analysis'
 import { reportsApi } from '@/api/reports'
 import { request } from '@/api/request'
+import type { AnalysisHorizon } from '@/types/analysis'
+import { analysisHorizonLabel, resolveAnalysisHorizon } from '@/utils/analysisHorizon'
 
 /**
  * 批次接口返回结构（后端 QueueService.get_batch，Redis hash 原样返回）：
@@ -159,6 +162,7 @@ interface BatchInfo {
 /** 卡片任务（字段来自 getTaskStatus 的 data，均为可选，缺失不显示） */
 interface BatchTask {
   task_id: string
+  analysis_horizon?: AnalysisHorizon
   status: string
   symbol?: string
   stock_symbol?: string
@@ -269,6 +273,7 @@ async function fetchTask(taskId: string): Promise<BatchTask> {
     lastKnownStatus.set(taskId, status)
     return {
       task_id: taskId,
+      analysis_horizon: resolveAnalysisHorizon(d),
       status,
       symbol: d.symbol as string | undefined,
       stock_symbol: d.stock_symbol as string | undefined,
@@ -281,7 +286,8 @@ async function fetchTask(taskId: string): Promise<BatchTask> {
     }
   } catch {
     // 单个任务状态查询失败不阻断整页：保留占位卡片，沿用上次已知状态（无则 unknown，不计终态）
-    return { task_id: taskId, status: lastKnownStatus.get(taskId) ?? 'unknown' }
+    const previous = tasks.value.find(task => task.task_id === taskId)
+    return { ...previous, task_id: taskId, status: lastKnownStatus.get(taskId) ?? 'unknown' }
   }
 }
 
@@ -363,7 +369,7 @@ async function downloadReport(task: BatchTask, format = 'markdown'): Promise<voi
   const a = document.createElement('a')
   a.href = url
   const dateStr = new Date().toISOString().slice(0, 10)
-  a.download = `${symbolText(task)}_分析报告_${dateStr}.md`
+  a.download = `${symbolText(task)}_${analysisHorizonLabel(task, true)}分析报告_${dateStr}.md`
   document.body.appendChild(a)
   a.click()
   window.URL.revokeObjectURL(url)

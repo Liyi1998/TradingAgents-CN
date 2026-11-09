@@ -1,0 +1,177 @@
+# Isolated trial stack. Project name must stay tradingagents-smc-tpo-trial.
+# Service containers use the Compose project prefix. MongoDB and Redis are not published.
+
+name: tradingagents-smc-tpo-trial
+
+services:
+  mongodb:
+    image: mongo:7.0
+    restart: "no"
+    mem_limit: 512m
+    cpus: 0.40
+    command:
+      - mongod
+      - --bind_ip_all
+      - --wiredTigerCacheSizeGB
+      - "0.25"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-trial}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_PASSWORD:?set in the 0600 trial env}
+      MONGO_INITDB_DATABASE: tradingagents_smc_tpo_trial
+      TZ: Asia/Shanghai
+    volumes:
+      - trial_mongodb:/data/db
+    networks:
+      - trial
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh -u \"$MONGO_INITDB_ROOT_USERNAME\" -p \"$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --quiet --eval 'db.adminCommand({ping:1}).ok'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: "no"
+    mem_limit: 128m
+    cpus: 0.25
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?set in the 0600 trial env}
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - trial_redis:/data
+    networks:
+      - trial
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 5s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set in the 0600 trial env}
+      TZ: Asia/Shanghai
+
+  backend:
+    image: tradingagents-smc-tpo-trial-backend:${TRIAL_IMAGE_TAG:?set by the bundle}
+    build:
+      context: .
+      dockerfile: deploy/trial/Dockerfile.backend
+    restart: "no"
+    mem_limit: 1024m
+    cpus: 0.80
+    environment:
+      TZ: Asia/Shanghai
+      DOCKER_CONTAINER: "true"
+      DEBUG: "false"
+      BACKGROUND_JOBS_ENABLED: "false"
+      QUOTES_INGEST_ENABLED: "false"
+      QUOTES_BACKFILL_ON_STARTUP: "false"
+      QUOTES_BACKFILL_ON_OFFHOURS: "false"
+      FREE_DATA_AUTO_BACKFILL_ENABLED: "false"
+      SYNC_STOCK_BASICS_ENABLED: "false"
+      DATA_FRESHNESS_PATROL_ENABLED: "false"
+      DATA_REFRESH_CONSUMER_ENABLED: "false"
+      TUSHARE_ENABLED: "false"
+      DASHSCOPE_ENABLED: "false"
+      DEEPSEEK_ENABLED: "false"
+      OPENAI_ENABLED: "false"
+      GOOGLE_ENABLED: "false"
+      BAIDU_ENABLED: "false"
+      OPENROUTER_ENABLED: "false"
+      MONGODB_HOST: mongodb
+      MONGODB_PORT: "27017"
+      MONGODB_USERNAME: ${MONGO_ROOT_USERNAME:-trial}
+      MONGODB_PASSWORD: ${MONGODB_PASSWORD:?set in the 0600 trial env}
+      MONGODB_DATABASE: tradingagents_smc_tpo_trial
+      MONGODB_AUTH_SOURCE: admin
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set in the 0600 trial env}
+      JWT_SECRET: ${JWT_SECRET:?set in the 0600 trial env}
+      CSRF_SECRET: ${CSRF_SECRET:?set in the 0600 trial env}
+      JWT_ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: "480"
+      REFRESH_TOKEN_EXPIRE_DAYS: "30"
+      BCRYPT_ROUNDS: "12"
+      ALLOWED_ORIGINS: '["http://127.0.0.1:${TRIAL_HTTP_PORT:-18082}"]'
+      ALLOWED_HOSTS: '["127.0.0.1","localhost"]'
+      INITIAL_ADMIN_USERNAME: ${INITIAL_ADMIN_USERNAME:-trial-operator}
+      INITIAL_ADMIN_EMAIL: ${INITIAL_ADMIN_EMAIL:-trial-operator@example.com}
+      INITIAL_ADMIN_PASSWORD: ${INITIAL_ADMIN_PASSWORD:?set in the 0600 trial env}
+      STRUCTURE_AUXILIARY_SYNTHETIC_DIR: ${STRUCTURE_AUXILIARY_SYNTHETIC_DIR:-}
+      TRADINGAGENTS_LOG_DIR: /app/runtime/logs
+    volumes:
+      - trial_runtime:/app/runtime
+      - trial_config:/app/config
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trial
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+
+  frontend:
+    image: tradingagents-smc-tpo-trial-frontend:${TRIAL_IMAGE_TAG:?set by the bundle}
+    build:
+      context: .
+      dockerfile: deploy/trial/Dockerfile.frontend
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.20
+    networks:
+      - trial
+
+  nginx:
+    image: nginx:1.27.3-alpine
+    restart: "no"
+    mem_limit: 64m
+    cpus: 0.20
+    ports:
+      - "127.0.0.1:${TRIAL_HTTP_PORT:-18082}:80"
+    volumes:
+      - ./deploy/trial/proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - trial
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 10s
+
+networks:
+  trial:
+    name: tradingagents-smc-tpo-trial_net
+    driver: bridge
+
+volumes:
+  trial_mongodb:
+    name: tradingagents-smc-tpo-trial_mongodb
+  trial_redis:
+    name: tradingagents-smc-tpo-trial_redis
+  trial_runtime:
+    name: tradingagents-smc-tpo-trial_runtime
+  trial_config:
+    name: tradingagents-smc-tpo-trial_config

@@ -9,12 +9,14 @@
 # 若后续板块数据入标准库（market_quotes 扩展），应移除本豁免。
 
 import json
+import asyncio
 import logging
 from typing import Optional
 from datetime import timedelta
 
 from app.utils.time_utils import now_utc, get_current_date, get_current_date_compact
-from app.engine.tools.common.tool_result import success_result, error_result, format_tool_result, ErrorCodes
+from app.engine.tools.common.tool_result import success_result, no_data_result, error_result, format_tool_result, ErrorCodes
+from app.engine.tools.common.data_access import read_with_refresh, render_data_quality
 from app.data.core.interface import DataInterface
 from app.core.async_utils import run_async
 
@@ -45,36 +47,39 @@ def get_china_market_overview(date: str = None, include_indices: bool = True, in
 
     if include_indices:
         indices_to_fetch = [
-            ("000001", "上证指数"),
-            ("399001", "深证成指"),
-            ("399006", "创业板指"),
+            ("000001.SH", "上证指数"),
+            ("399001.SZ", "深证成指"),
+            ("399006.SZ", "创业板指"),
         ]
 
         indices_data = []
         try:
-            di = DataInterface.get_instance()
             for symbol, name in indices_to_fetch:
                 try:
-                    result = run_async(di.read("CN", "market_quotes", symbol=symbol))
+                    result = read_with_refresh("CN", "market_quotes", symbol=symbol, end_date=date, timeout=6,
+                        filters={"asset_type": "index", "exchange": symbol.split(".")[-1]})
                     data = result.get("data")
                     if data:
-                        if isinstance(data, dict):
-                            price = data.get("last_price", "N/A")
-                        elif isinstance(data, list) and data:
-                            price = data[0].get("last_price", "N/A")
-                        else:
-                            price = "N/A"
-                        indices_data.append(f"- **{name}**: {price}")
+                        rows = data if isinstance(data, list) else [data]
+                        row = max(rows, key=lambda item: str(item.get("trade_date") or ""))
+                        price = row.get("close") if row.get("close") is not None else row.get("last_price")
+                        indices_data.append(f"- **{name}**: {price if price is not None else '未取得'}；交易日 {row.get('trade_date')}；来源 {row.get('data_source')}")
+                    else:
+                        indices_data.append(f"- **{name}**: 未取得。{render_data_quality(result)}")
                 except Exception as e:
                     logger.warning(f"获取 {name} 失败: {e}")
+                    indices_data.append(f"- **{name}**: 未取得（{type(e).__name__}）；继续其余指数，不填零。")
         except Exception as e:
             logger.warning(f"获取指数数据异常: {e}")
 
         if indices_data:
             result_sections.append("## 主要指数\n\n" + "\n".join(indices_data))
         else:
-            result_sections.append("## 主要指数\n\n指数数据暂时无法获取（请先同步 market_quotes 数据）")
+            result_sections.append("## 主要指数\n\n有界免费链路未取得指数数据，继续其他资料，不将未知填为零。")
 
+    if include_sectors and date != now_utc().astimezone(__import__("zoneinfo").ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d"):
+        result_sections.append("## 板块表现\n历史板块快照不可用；未使用今日板块冒充分析日数据。")
+        include_sectors = False
     if include_sectors:
         try:
             sector_df = None
@@ -84,7 +89,7 @@ def get_china_market_overview(date: str = None, include_indices: bool = True, in
             try:
                 import akshare as ak
 
-                raw = ak.stock_board_industry_name_em()
+                raw = run_async(asyncio.wait_for(asyncio.to_thread(ak.stock_board_industry_name_em), timeout=6))
                 if raw is not None and not raw.empty:
                     import pandas as pd
 
@@ -99,7 +104,7 @@ def get_china_market_overview(date: str = None, include_indices: bool = True, in
                 try:
                     from app.data.sources.cn.eastmoney.direct import fetch_em_board_direct
 
-                    board_data = fetch_em_board_direct()
+                    board_data = run_async(asyncio.wait_for(asyncio.to_thread(fetch_em_board_direct), timeout=6))
                     if board_data:
                         import pandas as pd
 
@@ -128,11 +133,11 @@ def get_china_market_overview(date: str = None, include_indices: bool = True, in
                     sector_info += f"- {name}: {change}%\n"
 
                 result_sections.append(sector_info)
-            elif not result_sections:
-                result_sections.append("## 板块表现\n\n板块数据暂时无法获取 (空数据)")
+            else:
+                result_sections.append("## 板块表现\n\n免费备用链路未取得板块数据，不影响已返回的指数；板块涨跌/资金结论保持未知。")
 
         except Exception as e:
-            logger.error(f"[中国市场工具] 获取板块数据失败: {e}")
+            logger.error(f"[中国市场工具] 获取板块数据失败: {e}", exc_info=True)
             result_sections.append(f"## 板块表现\n\n获取失败: {e}")
 
     execution_time = (now_utc() - start_time).total_seconds()
@@ -151,32 +156,42 @@ def get_china_market_overview(date: str = None, include_indices: bool = True, in
     return format_tool_result(success_result(combined_result))
 
 
-def get_dragon_tiger_inst(trade_date: Optional[str] = None, ts_code: Optional[str] = None) -> str:
+def get_dragon_tiger_inst(trade_date: Optional[str] = None, symbol: Optional[str] = None) -> str:
     """
     获取龙虎榜机构明细。
 
     Args:
-        trade_date: 交易日期，格式 YYYYMMDD，默认今天
-        ts_code: 股票代码，可选
+        trade_date: 交易日期，格式 YYYYMMDD；分析日默认对齐最近已完成交易日
+        symbol: 股票代码，可选
 
     Returns:
         JSON 格式的 ToolResult
     """
     try:
+        from app.data.core.analysis_context import ACTIVE_ANALYSIS_CONTEXT
+
+        context = ACTIVE_ANALYSIS_CONTEXT.get() or {}
+        analysis_day = str(context.get("analysis_date") or "").replace("-", "")
+        if context and (not trade_date or str(trade_date).replace("-", "") == analysis_day):
+            completed = context.get("last_completed_trade_date")
+            if not completed:
+                return format_tool_result(error_result(
+                    ErrorCodes.DATA_FETCH_ERROR,
+                    "最近已完成交易日未核验；未向休市日或未收盘日期请求龙虎榜，继续其他分析。",
+                ))
+            trade_date = completed.replace("-", "")
         if not trade_date:
             trade_date = get_current_date_compact()
 
-        logger.info(f"获取龙虎榜数据: 日期{trade_date}, 股票{ts_code}")
+        logger.info(f"获取龙虎榜数据: 日期{trade_date}, 股票{symbol}")
 
         from app.engine.tools.common.data_access import read_with_refresh
 
         filters = {"limit": 100}
-        symbol = None
-        if ts_code:
-            symbol = ts_code.replace(".SH", "").replace(".SZ", "").replace(".sh", "").replace(".sz", "").zfill(6)
 
         if symbol:
-            result = read_with_refresh("CN", "dragon_tiger", symbol=symbol, filters=filters)
+            day = trade_date if "-" in trade_date else f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+            result = read_with_refresh("CN", "dragon_tiger", symbol=symbol, start_date=day, end_date=day, filters=filters)
         else:
             result = run_async(DataInterface.get_instance().read("CN", "dragon_tiger", start_date=trade_date, filters=filters))
 
@@ -190,17 +205,22 @@ def get_dragon_tiger_inst(trade_date: Optional[str] = None, ts_code: Optional[st
 
             json_data = json.dumps(records, ensure_ascii=False, default=str)
             return format_tool_result(success_result(data=json_data))
+        if (result or {}).get("quality", {}).get("status") == "no_events":
+            return format_tool_result(no_data_result(
+                f"免费源正常查询后，在 {trade_date} 未返回 {symbol or '所查询范围'} 的龙虎榜事项记录；这不是网络获取失败，也不证明无风险。",
+                suggestion="不用重复同步；可继续其余分析，不虚构席位或机构交易。"))
 
         return format_tool_result(
-            error_result(ErrorCodes.DATA_FETCH_ERROR, f"无法获取龙虎榜数据: {trade_date}（请先同步 dragon_tiger 数据）")
+            error_result(ErrorCodes.DATA_FETCH_ERROR, f"无法获取龙虎榜数据: {trade_date}。" + render_data_quality(result),
+                         suggestion="披露源失败或未确认缺项并继续其他分析，不重复请求或编造席位。")
         )
     except Exception as e:
-        logger.error(f"get_dragon_tiger_inst failed: {e}")
+        logger.error(f"get_dragon_tiger_inst failed: {e}", exc_info=True)
         return format_tool_result(error_result(ErrorCodes.DATA_FETCH_ERROR, str(e)))
 
 
 def get_block_trade(
-    start_date: Optional[str] = None, end_date: Optional[str] = None, code: Optional[str] = None
+    start_date: Optional[str] = None, end_date: Optional[str] = None, symbol: Optional[str] = None
 ) -> str:
     """
     获取大宗交易数据。
@@ -208,7 +228,7 @@ def get_block_trade(
     Args:
         start_date: 开始日期，格式 YYYYMMDD，默认 7 天前
         end_date: 结束日期，格式 YYYYMMDD，默认今天
-        code: 股票代码，可选
+        symbol: 股票代码，可选
 
     Returns:
         JSON 格式的 ToolResult
@@ -219,13 +239,12 @@ def get_block_trade(
         if not start_date:
             start_date = (now_utc() - timedelta(days=7)).strftime("%Y%m%d")
 
-        logger.info(f"获取大宗交易数据: 日期范围 {start_date}-{end_date}, 股票{code}")
+        logger.info(f"获取大宗交易数据: 日期范围 {start_date}-{end_date}, 股票{symbol}")
 
         from app.engine.tools.common.data_access import read_with_refresh
 
-        if code:
-            symbol = code.replace(".SH", "").replace(".SZ", "").replace(".sh", "").replace(".sz", "").zfill(6)
-            result = read_with_refresh("CN", "block_trade", symbol=symbol)
+        if symbol:
+            result = read_with_refresh("CN", "block_trade", symbol=symbol, start_date=start_date, end_date=end_date)
         else:
             result = run_async(
                 DataInterface.get_instance().read("CN", "block_trade", start_date=start_date, end_date=end_date)
@@ -241,10 +260,15 @@ def get_block_trade(
 
             json_data = json.dumps(records, ensure_ascii=False, default=str)
             return format_tool_result(success_result(data=json_data))
+        if (result or {}).get("quality", {}).get("status") == "no_events":
+            return format_tool_result(no_data_result(
+                f"免费源正常查询后，在 {start_date}..{end_date} 未返回 {symbol or '所查询范围'} 的大宗交易事项；不等于网络错误，也不证明不存在未披露事项。",
+                suggestion="继续其余分析，不虚构交易或反复要求手动同步。"))
 
         return format_tool_result(
-            error_result(ErrorCodes.DATA_FETCH_ERROR, "无法获取大宗交易数据（请先同步 block_trade 数据）")
+            error_result(ErrorCodes.DATA_FETCH_ERROR, "无法获取大宗交易数据。" + render_data_quality(result),
+                         suggestion="披露实际链路缺项并继续，不把源失败当成无事项。")
         )
     except Exception as e:
-        logger.error(f"get_block_trade failed: {e}")
+        logger.error(f"get_block_trade failed: {e}", exc_info=True)
         return format_tool_result(error_result(ErrorCodes.DATA_FETCH_ERROR, str(e)))

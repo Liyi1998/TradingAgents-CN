@@ -92,17 +92,21 @@ class _FixedReplyClient(BaseLLMClient):
         self._text = text
 
     async def chat(self, messages, **kwargs) -> ChatResponse:
-        return self._resp()
+        return self._resp(kwargs)
 
     async def chat_stream(self, messages, **kwargs):
-        yield StreamEvent("message", response=self._resp())
+        yield StreamEvent("message", response=self._resp(kwargs))
 
     async def count_tokens(self, messages) -> int:
         return 16
 
-    def _resp(self) -> ChatResponse:
+    def _resp(self, kwargs) -> ChatResponse:
+        from tests.engine.workflow.test_submission_e2e import SUPERSET_INPUT
+        tools = kwargs.get("tools") or []
+        summary = any("analysis_summary" in str(t.params_schema) for t in tools)
+        text = json.dumps(SUPERSET_INPUT, ensure_ascii=False) if summary else self._text
         return ChatResponse(
-            message=Message(role=Role.ASSISTANT, content=[TextBlock(text=self._text)]),
+            message=Message(role=Role.ASSISTANT, content=[TextBlock(text=text)]),
             stop_reason=StopReason.END_TURN,
             usage=Usage(input_tokens=10, output_tokens=5),
             model="test-model",

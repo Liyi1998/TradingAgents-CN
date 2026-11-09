@@ -1,3 +1,4 @@
+# data-access-exempt: 直接实例化 Reader；待改走 DataInterface 后移除
 """
 传统筛选服务（内部实现，请勿直接调用）
 
@@ -268,6 +269,6 @@ class ScreeningService:
                 return []
 
         except Exception as e:
-            logger.error(f"❌ 从数据层获取股票列表失败: {e}")
+            logger.error(f"❌ 从数据层获取股票列表失败: {e}", exc_info=True)
             return []
 

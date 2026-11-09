@@ -31,7 +31,7 @@ def to_utc(market_dt: datetime, market: str) -> datetime:
 async def is_trading_day(market: str, target_date: Optional[date] = None) -> bool:
     """判断是否为交易日（查询 trade_calendar）。"""
     if target_date is None:
-        target_date = date.today()
+        target_date = datetime.now(get_market_timezone(market)).date()
 
     from app.data.storage.mongo.repositories.trade_calendar_repo import TradeCalendarRepo
 
@@ -52,7 +52,7 @@ async def get_latest_trade_day(
     无交易日历数据时返回 None，由调用方决定兜底策略。
     """
     if before is None:
-        before = date.today()
+        before = datetime.now(get_market_timezone(market)).date()
 
     from datetime import timedelta
 
@@ -71,7 +71,7 @@ async def get_latest_trade_day(
     )
     open_days = [
         d["cal_date"] for d in docs
-        if d.get("is_open") and d.get("cal_date")
+        if str(d.get("is_open", "")).lower() in {"true", "1"} and d.get("cal_date")
     ]
     if not open_days:
         return None

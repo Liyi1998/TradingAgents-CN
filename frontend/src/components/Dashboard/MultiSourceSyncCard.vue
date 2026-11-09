@@ -75,13 +75,13 @@
                   v-if="source.state === 'closed'"
                   class="status-success"
                 >
-                  <component :is="'SuccessFilled'" />
+                  <SuccessFilled />
                 </el-icon>
                 <el-icon
                   v-else-if="source.state === 'open'"
                   class="status-error"
                 >
-                  <component :is="'CircleCloseFilled'" />
+                  <CircleCloseFilled />
                 </el-icon>
               </div>
               <div class="source-priority">{{ source.stateLabel }}</div>
@@ -129,7 +129,9 @@ import { ElMessage } from 'element-plus'
 import {
   Connection,
   ArrowRight,
-  Refresh
+  Refresh,
+  SuccessFilled,
+  CircleCloseFilled
 } from '@element-plus/icons-vue'
 import {
   getSyncStatus as getMarketSyncStatus,
@@ -192,7 +194,7 @@ const fetchSyncStatus = async () => {
         status: latest.status === 'success' ? 'success' : latest.status === 'failed' ? 'failed' : 'idle',
         total: latest.record_count,
         finished_at: latest.last_sync_time,
-        data_sources_used: [latest.source],
+        data_sources_used: [latest.data_source],
       }
     } else {
       syncStatus.value = { job: '', status: 'never_run', total: 0, inserted: 0, updated: 0, errors: 0, data_sources_used: [] }
@@ -210,14 +212,14 @@ const fetchDataSources = async () => {
       const seen = new Set<string>()
       const sources: DataSourceStatus[] = []
       response.data
-        .sort((a, b) => a.source.localeCompare(b.source))
+        .sort((a, b) => a.data_source.localeCompare(b.data_source))
         .forEach((item: SourceHealthItem) => {
-          if (!seen.has(item.source)) {
-            seen.add(item.source)
+          if (!seen.has(item.data_source)) {
+            seen.add(item.data_source)
             // 无样本不伪造：后端已把 total_calls==0 序列化为 unknown
             const state = item.circuit_state
             sources.push({
-              name: item.source,
+              name: item.data_source,
               state,
               stateLabel: CIRCUIT_LABEL[state] || state,
             })

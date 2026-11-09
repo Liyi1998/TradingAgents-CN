@@ -206,6 +206,24 @@ class TerminalSpec(BaseModel):
     summary_node: str
 
 
+class ResearchRole(BaseModel):
+    """Workflow-owned period role; replaces, rather than appends to, a short role."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    name: str = Field(min_length=1)
+    prompt: str = Field(min_length=40)
+    data_tools: Optional[Tuple[str, ...]] = None
+    template_inputs: Tuple[InputSlot, ...] = ()
+
+
+class ResearchProfile(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    horizon: Literal["medium", "long"]
+    revision: str = Field(min_length=1)
+    required_analysts: Tuple[str, ...]
+    roles: Dict[str, ResearchRole]
+
+
 class WorkflowSpec(BaseModel):
     """工作流拓扑定义（种子 YAML 的 schema）。
 
@@ -225,6 +243,7 @@ class WorkflowSpec(BaseModel):
     terminal: TerminalSpec
     nodes: Tuple[NodeSpec, ...] = ()
     stages: Tuple[StageSpec, ...] = ()
+    research_profile: Optional[ResearchProfile] = None
 
     def node_by_slug(self, slug: str) -> Optional[NodeSpec]:
         """slug → 库内 NodeSpec（未命中 None）"""

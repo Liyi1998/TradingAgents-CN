@@ -17,7 +17,7 @@ from app.data.processor.validator import Validator
 from app.data.core.registry.capability import CapabilityRegistry
 from app.data.core.registry.priority import PriorityConfig
 from app.data.monitoring.source_health import SourceHealthMonitor
-from app.data.sources.base.exceptions import DataSourceError
+from app.data.sources.base.exceptions import DataNotFoundError, DataSourceError
 from app.data.sources.base.provider import BaseProvider
 
 logger = logging.getLogger(__name__)
@@ -31,8 +31,8 @@ _instance_lock = threading.Lock()
 def _ensure_singleton() -> "FallbackRouter":
     """获取进程级 FallbackRouter 单例。
 
-    所有调用方（refresh_service / sync_job / multi_source_basics_sync /
-    domain_sync）共享同一份 circuit_breaker + rate_limiter 状态。
+    所有调用方（refresh_service / sync_job / multi_source_basics_sync）
+    共享同一份 circuit_breaker + rate_limiter 状态。
     """
     global _instance
     if _instance is None:
@@ -57,6 +57,8 @@ class FetchResult:
 
     def __init__(self):
         self.success: bool = False
+        # success: 有有效记录；empty: 数据源正常但当前范围无记录；failed: 调用失败
+        self.status: str = "failed"
         self.records: List[Dict] = []
         self.source: Optional[str] = None
         self.fallback_from: Optional[str] = None
@@ -103,8 +105,8 @@ class FallbackRouter:
     def get_instance(cls) -> "FallbackRouter":
         """获取进程级单例（首次调用时构造，后续复用）。
 
-        保证 sync_job、refresh_service、multi_source_basics_sync、
-        domain_sync 等所有调用方共享同一份熔断器 + 限流器状态。
+        保证 sync_job、refresh_service、multi_source_basics_sync
+        等所有调用方共享同一份熔断器 + 限流器状态。
         """
         return _ensure_singleton()
 
@@ -159,13 +161,9 @@ class FallbackRouter:
 
         读取失败返回空 dict，调用方回退到构造参数的全局默认值。
         """
-        import yaml
-        from pathlib import Path
-
-        config_path = Path(__file__).parent.parent / "config" / "source_limits.yaml"
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                limits_config = yaml.safe_load(f) or {}
+            from app.data.config import load_yaml
+            limits_config = load_yaml("source_limits.yaml")
         except Exception as e:
             logger.warning(f"加载重试配置失败，使用全局默认: {e}")
             return {}
@@ -190,6 +188,9 @@ class FallbackRouter:
         start_date: str = "1970-01-01",
         end_date: str = "2099-12-31",
         preferred_sources: Optional[List[str]] = None,
+        *,
+        coverage_filters: Optional[Dict] = None,
+        timeout: Optional[float] = None,
     ) -> FetchResult:
         """从最优数据源获取并处理数据。"""
         result = FetchResult()
@@ -197,6 +198,14 @@ class FallbackRouter:
 
         priority_list = await self._priority.get_priority(market, domain)
         sources = self._registry.get_ordered_sources(market, domain, user_priority=priority_list)
+        if market == "CN" and coverage_filters:
+            # Explicit contract completion cannot acquire paid credentials or
+            # silently opt into a paid provider through a user priority setting.
+            sources = [name for name in sources if name in {"duckdb", "akshare", "baostock", "tencent", "sina"}]
+            if domain == "market_quotes" and coverage_filters.get("contract") == "verified_spot_quote":
+                # Only this adapter currently preserves an explicit source quote
+                # timestamp. Do not fan out to timestamp-less full-market APIs.
+                sources = [name for name in sources if name == "tencent"]
         if preferred_sources:
             preferred_order = {name: i for i, name in enumerate(preferred_sources)}
             original_order = {name: i for i, name in enumerate(sources)}
@@ -211,25 +220,124 @@ class FallbackRouter:
             result.error = f"无可用数据源: {market}/{domain}"
             return result
 
+        from app.data.core.identity import cn_index_identity
+        index_identity = cn_index_identity(symbol) if market == "CN" and domain in {"market_quotes", "daily_quotes"} else None
+        if index_identity:
+            index_source = "tencent" if domain == "market_quotes" else "baostock"
+            # Never let an index request fan out to stock-only full-market APIs.
+            sources = [name for name in sources if name == index_source]
         fallback_chain = []
+        empty_sources = []
+        partial_records = []
+        partial_basic_records = []
+        contract_candidates = []
         default_exchange = {"CN": "SSE", "HK": "HKEX", "US": "NYSE"}.get(market, "SSE")
 
-        for source_name in sources:
-            status, records, verrs = await self.fetch_source(
+        for source_index, source_name in enumerate(sources):
+            call = self.fetch_source(
                 market, domain, source_name,
                 lambda p: self._fetch_raw(
                     p, domain, symbol, start_date, end_date, default_exchange,
                     market=market,
+                    include_filings=(coverage_filters or {}).get("include_filings") is True,
                 ),
             )
+            if timeout is None:
+                status, records, verrs = await call
+            else:
+                remaining = timeout - (time.time() - start)
+                if remaining <= 0:
+                    call.close()
+                    fallback_chain.append(source_name + "(budget_exhausted)")
+                    break
+                # Reserve an actual chance for later providers. Cancelling a
+                # thread-backed call bounds the wait, not its synchronous I/O.
+                source_cap = (32.0 if (domain == "news" and source_name == "akshare"
+                    and (coverage_filters or {}).get("include_filings") is True) else
+                    20.0 if domain == "financial_data" and source_name == "akshare" else 12.0)
+                budget = min(source_cap, remaining / max(1, len(sources) - source_index))
+                try:
+                    status, records, verrs = await asyncio.wait_for(call, timeout=budget)
+                except asyncio.TimeoutError:
+                    self._circuit.clear_probe(source_name, domain=domain, market=market)
+                    fallback_chain.append(source_name + "(timeout)")
+                    continue
             if status == "failed":
                 fallback_chain.append(source_name)
                 continue
             if status == "skip":
                 continue
+            if status == "empty":
+                empty_sources.append(source_name)
+                continue
 
+            if market == "CN" and domain == "intraday_quotes" and symbol != "__all__":
+                target = str(symbol).split(".", 1)[0].zfill(6)
+                records = [row for row in records if row.get("symbol") == target]
+                if not records:
+                    fallback_chain.append(source_name + "(symbol_mismatch)")
+                    continue
+            if domain in {"dragon_tiger", "block_trade"} and symbol != "__all__":
+                # These public endpoints return a whole dated disclosure table.
+                # Its other securities are not a successful single-stock read,
+                # and must not be published as an accidental market backfill.
+                records = [row for row in records if row.get("symbol") == symbol
+                           and start_date <= str(row.get("trade_date") or "")[:10] <= end_date]
+                if not records:
+                    empty_sources.append(source_name)
+                    continue
+
+            if market == "CN" and domain == "basic_info" and symbol != "__all__":
+                target = str(symbol).upper().replace("SH", "").replace("SZ", "").replace("BJ", "").replace(".", "").zfill(6)
+                records = [row for row in records if row.get("symbol") == target]
+                if not records:
+                    fallback_chain.append(source_name + "(symbol_mismatch)")
+                    continue
+            if coverage_filters:
+                from app.data.core.coverage import evaluate
+                verified, coverage = evaluate(records, domain, start_date, end_date, coverage_filters)
+                if coverage["status"] != "success":
+                    contract_candidates.append((records, source_name, coverage))
+                    fallback_chain.append(source_name + "(requirements_incomplete)")
+                    continue
+                # Never merge two money-flow definitions. Indicator partials
+                # are persisted separately under the field-level merge contract.
+                if domain == "daily_indicators":
+                    records = [row for candidate, _, _ in contract_candidates for row in candidate] + records
+                else:
+                    records = verified
+
+            if index_identity:
+                from app.data.core.coverage import evaluate
+                records, identity_quality = evaluate(records, domain, start_date, end_date,
+                    {key: index_identity[key] for key in ("asset_type", "exchange")})
+                if not records:
+                    fallback_chain.append(source_name + "(identity_mismatch)")
+                    continue
+            if market == "CN" and domain == "daily_quotes" and symbol != "__all__" and not index_identity:
+                # A successful HTTP/cache response with unknown adjustment basis
+                # must not shadow the providers' explicit raw quote contract.
+                if not records or any(row.get("price_basis") != "raw" or row.get("volume_unit") != "share"
+                       or row.get("amount_unit") != "CNY" for row in records):
+                    fallback_chain.append(source_name + "(unverified_quote_contract)")
+                    continue
+            if market == "CN" and domain == "basic_info" and symbol != "__all__":
+                from app.data.processor.industry_contract import industry_verified
+                if not records or not all(industry_verified(row, min(end_date, time.strftime("%Y-%m-%d"))) for row in records):
+                    if not partial_basic_records:
+                        partial_basic_records = records
+                    fallback_chain.append(source_name + "(industry_unverified)")
+                    continue
+            if domain == "financial_data":
+                from app.data.core.coverage import evaluate
+                _, coverage = evaluate(records, domain, start_date, end_date)
+                if coverage["status"] != "success":
+                    partial_records.extend(records)
+                    fallback_chain.append(source_name + "(partial)")
+                    continue
             result.success = True
-            result.records = records
+            result.status = "success"
+            result.records = records + partial_records
             result.source = source_name
             result.latency_ms = int((time.time() - start) * 1000)
             if verrs:
@@ -238,7 +346,41 @@ class FallbackRouter:
                 result.fallback_from = " → ".join(fallback_chain)
             return result
 
-        result.error = f"所有源失败: {', '.join(fallback_chain)}"
+        if contract_candidates:
+            result.success = True
+            result.status = "partial"
+            if domain == "daily_indicators":
+                result.records = [row for candidate, _, _ in contract_candidates for row in candidate]
+                result.source = contract_candidates[-1][1]
+            else:
+                result.records, result.source, _ = min(contract_candidates, key=lambda item: (
+                    len(item[2].get("missing_dates") or []),
+                    len(item[2].get("missing_fields") or []),
+                    len(item[2].get("contract_issues") or []),
+                ))
+            result.error = "required_fields_dates_or_provenance_unavailable"
+            result.fallback_from = " → ".join(fallback_chain)
+        elif partial_basic_records:
+            result.success = True
+            result.status = "partial"
+            result.records = partial_basic_records
+            result.source = partial_basic_records[0].get("data_source")
+            result.fallback_from = " → ".join(fallback_chain)
+        elif partial_records:
+            result.success = True
+            result.status = "partial"
+            result.records = partial_records
+            result.source = partial_records[0].get("data_source")
+            result.fallback_from = " → ".join(fallback_chain)
+        elif empty_sources:
+            result.success = True
+            result.status = "empty"
+            result.source = empty_sources[-1]
+            if fallback_chain:
+                result.fallback_from = " → ".join(fallback_chain)
+        else:
+            result.status = "failed"
+            result.error = f"所有源失败: {', '.join(fallback_chain)}"
         result.latency_ms = int((time.time() - start) * 1000)
         return result
 
@@ -251,10 +393,9 @@ class FallbackRouter:
     ):
         """单数据源尝试：熔断检查 → 限流 → 重试获取 → 标准化 → 校验。
 
-        从 fetch() 的循环体抽取，供两类调用方复用同一套四件套语义：
-        1. fetch() 内部（标准 symbol 维度获取）
-        2. worker 侧 BaseMarketDomainSync（自定义 provider 方法 + kwargs 的
-           批量域同步，如 HK/US market_quotes 全市场快照）
+        从 fetch() 的循环体抽取，供 fetch() 内部（标准 symbol 维度获取）与
+        批量域同步调用方（如 HK/US market_quotes 全市场快照，现位于
+        app/data/sync）复用同一套四件套语义
 
         Args:
             raw_fetch: ``async (provider) -> raw``，返回原始数据；
@@ -310,17 +451,18 @@ class FallbackRouter:
                 return "skip", [], None
 
             if raw_data is None or (hasattr(raw_data, "empty") and raw_data.empty):
-                self._circuit.record_failure(source_name, domain=domain, market=market)
+                # 空结果是合法业务状态（例如当日无龙虎榜/大宗交易），不能触发熔断。
+                self._circuit.record_success(source_name, domain=domain, market=market)
                 self._health_monitor.record_call(
                     market,
                     source_name,
                     domain,
-                    success=False,
+                    success=True,
                     latency_ms=int((time.time() - source_start) * 1000),
                     error="empty data",
                     circuit_state=self._circuit.get_state(source_name, domain=domain, market=market).value,
                 )
-                return "failed", [], None
+                return "empty", [], None
 
             # M1 修复：区分"adapter 不支持该域"与"数据质量差"。
             # 不支持的域不应触发熔断。
@@ -333,6 +475,10 @@ class FallbackRouter:
             if not records:
                 if normalize_result.status == "error":
                     self._circuit.record_failure(source_name, domain=domain, market=market)
+                    status = "failed"
+                else:
+                    self._circuit.record_success(source_name, domain=domain, market=market)
+                    status = "empty"
                 self._health_monitor.record_call(
                     market,
                     source_name,
@@ -342,7 +488,7 @@ class FallbackRouter:
                     error=f"normalize {normalize_result.status}",
                     circuit_state=self._circuit.get_state(source_name, domain=domain, market=market).value,
                 )
-                return "failed", [], None
+                return status, [], None
 
             valid, errors = await asyncio.to_thread(
                 self._validator.validate, records, domain, market
@@ -360,6 +506,10 @@ class FallbackRouter:
                     source_name,
                     errors[:5],
                 )
+
+            if not valid:
+                self._circuit.record_failure(source_name, domain=domain, market=market)
+                return "failed", [], None
 
             self._circuit.record_success(source_name, domain=domain, market=market)
             self._health_monitor.record_call(
@@ -379,6 +529,25 @@ class FallbackRouter:
                 }
             return "success", valid, validation_errors
 
+        except asyncio.CancelledError:
+            # A bounded source timeout or cancelled analysis must not leave a
+            # half-open probe permanently occupied. It is not a provider error.
+            self._circuit.clear_probe(source_name, domain=domain, market=market)
+            raise
+        except DataNotFoundError as e:
+            # 上游明确表示“正常但无数据”。继续尝试其他免费源，但不污染健康度。
+            self._circuit.record_success(source_name, domain=domain, market=market)
+            self._health_monitor.record_call(
+                market,
+                source_name,
+                domain,
+                success=True,
+                latency_ms=int((time.time() - source_start) * 1000),
+                error="empty data",
+                circuit_state="closed",
+            )
+            logger.info(f"源 {source_name}/{domain} 正常返回空数据: {e}")
+            return "empty", [], None
         except DataSourceError as e:
             self._circuit.record_failure(source_name, domain=domain, market=market, error_code=e.code)
             self._health_monitor.record_call(
@@ -422,20 +591,23 @@ class FallbackRouter:
         end: str,
         exchange: str = "SSE",
         market: str = "",
+        include_filings: bool = False,
     ):
         method_map = {
-            "basic_info": lambda: provider.get_stock_list(market=market),
+            "basic_info": lambda: provider.get_stock_list(symbol=symbol, market=market, end_date=end),
             "trade_calendar": lambda: provider.get_trade_calendar(exchange, start, end),
             "daily_quotes": lambda: self._fetch_daily_quotes(provider, symbol, start, end),
+            "index_quotes": lambda: provider.get_index_quotes(symbol, start, end),
             "daily_indicators": lambda: self._fetch_daily_indicators(provider, symbol, start, end),
             "financial_data": lambda: self._fetch_financial_batch(provider, symbol, start, end),
-            "adj_factors": lambda: provider.get_adj_factors(symbol, start, end),
+            "adj_factors": lambda: self._fetch_adj_factors_batch(provider, symbol, start, end),
             "corporate_actions": lambda: provider.get_corporate_actions(symbol, start, end),
-            "news": lambda: provider.get_news(None if symbol == "__all__" else symbol, start, end),
-            "market_quotes": lambda: provider.get_market_quotes([symbol]),
+            "news": lambda: provider.get_news(None if symbol == "__all__" else symbol, start, end,
+                **({"include_filings": True} if include_filings and provider.name == "akshare" else {})),
+            "market_quotes": lambda: provider.get_market_quotes(None if symbol == "__all__" else [symbol]),
             "intraday_quotes": lambda: provider.get_intraday_quotes(symbol, start, end),
             "money_flow": lambda: self._fetch_money_flow_batch(provider, symbol, start, end),
-            "margin_trading": lambda: provider.get_margin_trading(symbol, start, end),
+            "margin_trading": lambda: self._fetch_margin_trading_batch(provider, symbol, start, end),
             "dragon_tiger": lambda: provider.get_dragon_tiger(symbol, start, end),
             "block_trade": lambda: provider.get_block_trade(symbol, start, end),
         }
@@ -456,7 +628,8 @@ class FallbackRouter:
         （非交易日/未发布）跳过不阻塞其他日。
         """
         if symbol != "__all__":
-            return await provider.get_daily_quotes(symbol, start, end)
+            kwargs = {"adjust": ""} if provider.market == "CN" and provider.name in {"akshare", "baostock"} else {}
+            return await provider.get_daily_quotes(symbol, start, end, **kwargs)
         base_method = BaseProvider.get_daily_quotes_batch
         if type(provider).get_daily_quotes_batch is base_method:
             return self._BATCH_NOT_SUPPORTED
@@ -489,22 +662,17 @@ class FallbackRouter:
         重启，库内 distinct 只有旧日期，靠日历才能发现要补的新交易日）；
         日历缺失时退回库内 distinct（原语义）。
         """
-        dates: set = set(await self._recent_quote_trade_dates(market, n))
-        try:
-            from app.data.core.market import get_latest_trade_day
-            from datetime import timedelta
-
-            latest = await get_latest_trade_day(market)
-            if latest is not None:
-                cursor = latest
-                # 向前收集 n 个日历开市日（与 distinct 并集后截取前 n）
-                while len([d for d in dates if d <= latest.isoformat()]) < n:
-                    dates.add(cursor.isoformat())
-                    cursor = cursor - timedelta(days=1)
-                    if cursor < latest - timedelta(days=30):
-                        break  # 防御：日历异常时最多回看 30 天
-        except Exception as e:
-            logger.debug(f"交易日历不可用，仅用库内日期: {e}")
+        from datetime import datetime, timedelta
+        from app.data.core.market import get_market_timezone
+        from app.data.storage.mongo.repositories.trade_calendar_repo import TradeCalendarRepo
+        end = datetime.now(get_market_timezone(market)).date()
+        exchange = {"CN": "SSE", "HK": "HKEX", "US": "NYSE"}.get(market)
+        rows = await TradeCalendarRepo().get_range(exchange, market, (end - timedelta(days=60)).isoformat(), end.isoformat())
+        known = {str(row.get("cal_date")): str(row.get("is_open")).lower() in {"true", "1"} for row in rows}
+        dates = {day for day, opened in known.items() if opened and day <= end.isoformat()}
+        # Observed quote dates are a fallback, never fabricated calendar days.
+        observed = await self._recent_quote_trade_dates(market, n)
+        dates.update(day for day in observed if day <= end.isoformat() and known.get(day, True))
         return sorted(dates, reverse=True)[:n]
 
     async def _fetch_daily_indicators(self, provider, symbol: str, start: str, end: str):
@@ -538,6 +706,76 @@ class FallbackRouter:
             return self._BATCH_NOT_SUPPORTED
         return await provider.get_financial_data_batch()
 
+    async def _fetch_adj_factors_batch(self, provider, symbol: str, start: str, end: str):
+        """获取复权因子：per-symbol 模式或按交易日批量模式。
+
+        批量拉最近 6 个交易日（与 daily_quotes 同窗口）：复权因子随行情
+        每日发布，窗口式重拉可自愈单日缺失；单日无数据（停市/未发布）
+        跳过不阻塞其他日。BaseProvider 未定义批量基方法（改动范围受限），
+        能力探测用 getattr——仅覆写了该方法的源（CN tushare）进入批量分支，
+        其余源返回 _BATCH_NOT_SUPPORTED 静默跳过，不误记熔断。
+        """
+        if symbol != "__all__":
+            return await provider.get_adj_factors(symbol, start, end)
+        batch_method = getattr(provider, "get_adj_factors_batch", None)
+        if not callable(batch_method):
+            return self._BATCH_NOT_SUPPORTED
+
+        from app.data.sources.base.exceptions import DataNotFoundError
+
+        dates = await self._recent_sync_trade_dates(provider.market, 6)
+        if not dates:
+            return self._BATCH_NOT_SUPPORTED  # 无可用交易日，skip 不误记熔断
+
+        import pandas as pd
+
+        frames = []
+        for d in dates:
+            try:
+                df = await batch_method(d)
+            except DataNotFoundError:
+                logger.debug(f"{provider.name} adj_factors {d} 无数据，跳过")
+                continue
+            if df is not None and not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
+    async def _fetch_margin_trading_batch(self, provider, symbol: str, start: str, end: str):
+        """获取融资融券明细：per-symbol 模式或按交易日批量模式。
+
+        批量拉最近 6 个交易日（两融明细每日盘后更新上一交易日数据，
+        窗口式重拉可自愈延迟发布）；单日无数据跳过不阻塞其他日。
+        能力探测同 _fetch_adj_factors_batch（getattr，见其注释）。
+        """
+        if symbol != "__all__":
+            return await provider.get_margin_trading(symbol, start, end)
+        batch_method = getattr(provider, "get_margin_trading_batch", None)
+        if not callable(batch_method):
+            return self._BATCH_NOT_SUPPORTED
+
+        from app.data.sources.base.exceptions import DataNotFoundError
+
+        dates = await self._recent_sync_trade_dates(provider.market, 6)
+        if not dates:
+            return self._BATCH_NOT_SUPPORTED  # 无可用交易日，skip 不误记熔断
+
+        import pandas as pd
+
+        frames = []
+        for d in dates:
+            try:
+                df = await batch_method(d)
+            except DataNotFoundError:
+                logger.debug(f"{provider.name} margin_trading {d} 无数据，跳过")
+                continue
+            if df is not None and not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
+
     async def _fetch_money_flow_batch(self, provider, symbol: str, start: str, end: str):
         """获取资金流向：per-symbol 模式或按交易日批量模式。
 
@@ -553,7 +791,7 @@ class FallbackRouter:
 
         from app.data.sources.base.exceptions import DataNotFoundError
 
-        dates = await self._recent_quote_trade_dates(provider.market, 6)
+        dates = await self._recent_sync_trade_dates(provider.market, 6)
         if not dates:
             return self._BATCH_NOT_SUPPORTED  # 本地无行情日期，skip 不误记熔断
 

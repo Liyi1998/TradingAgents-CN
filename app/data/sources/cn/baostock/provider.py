@@ -50,7 +50,7 @@ class BaoStockCNProvider(BaseProvider):
             self.connected = True
             return True
         except Exception as e:
-            logger.error(f"BaoStock 连接失败: {e}")
+            logger.error(f"BaoStock 连接失败: {e}", exc_info=True)
             return False
 
     def is_available(self) -> bool:
@@ -63,13 +63,13 @@ class BaoStockCNProvider(BaseProvider):
 
     async def get_stock_list(self, **kwargs) -> pd.DataFrame:
         from .api.stock_basic import fetch_stock_list
-        return await fetch_stock_list()
+        return await fetch_stock_list(symbol=kwargs.get("symbol"), end_date=kwargs.get("end_date"))
 
     async def get_daily_quotes(
         self, symbol: str, start_date: str, end_date: str, **kwargs
     ) -> pd.DataFrame:
         from .api.daily_quotes import fetch_daily_quotes
-        return await fetch_daily_quotes(symbol, start_date, end_date)
+        return await fetch_daily_quotes(symbol, start_date, end_date, adjust=kwargs.get("adjust", ""))
 
     async def get_financial_data(
         self, symbol: str, start_date: str, end_date: str,
@@ -81,6 +81,15 @@ class BaoStockCNProvider(BaseProvider):
         # 若未提供日期则拉取最新一期（year/quarter 为 None 时 BaoStock 返回最新）。
         year, quarter = _derive_year_quarter(start_date, end_date)
         return await fetch_financial_data(symbol, year=year, quarter=quarter)
+
+    async def get_index_quotes(self, symbol: str, start_date: str, end_date: str, **kwargs) -> pd.DataFrame:
+        from app.data.core.identity import cn_index_identity
+        from app.data.sources.base.exceptions import DataNotFoundError
+        from .api.daily_quotes import fetch_daily_quotes
+        identity = cn_index_identity(symbol)
+        if not identity:
+            raise DataNotFoundError("baostock", "index_quotes", "该指数未接入 BaoStock 免费通道")
+        return await fetch_daily_quotes(identity["symbol"], start_date, end_date, adjust="raw")
 
     async def get_adj_factors(
         self, symbol: str, start_date: str, end_date: str, **kwargs

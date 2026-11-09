@@ -31,6 +31,22 @@ def _stage_reports(state) -> dict:
     return resolved.get("analyst_reports") or {}
 
 
+
+def _compact_context_report(content: object, limit: int = 4000) -> str:
+    """保留报告结论首尾，限制每份上游报告反复进入辩论上下文的体积。"""
+    text = str(content or "")
+    if len(text) <= limit:
+        return text
+    head = int(limit * 0.75)
+    tail = limit - head
+    omitted = len(text) - limit
+    return (
+        text[:head]
+        + f"\n\n……中间 {omitted} 个字符已压缩；保留末尾结论……\n\n"
+        + text[-tail:]
+    )
+
+
 # ── 辩手配置表 ──────────────────────────────────────────────────────────────
 
 _SIDE_CONFIG = {
@@ -92,7 +108,7 @@ _SIDE_CONFIG = {
 _BUILTIN_SIDE_TAGS = {"bull": "看涨分析师", "bear": "看跌分析师"}
 
 
-def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, group=None):
+def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, group=None, horizon=None):
     """
     创建 Stage 2 研究员节点（看涨/看跌辩手）。
 
@@ -104,6 +120,7 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
             缺省 None = 内置双方行为（per_turn=2 / investment_debate_state / investment 视图）；
             传入时 per_turn = len(sides)、state_key / 报告视图 / 对手集合按组拓扑驱动，
             内置对手的文案仍查本表（与缺省路径逐字一致）
+        horizon: 投资期限档位（short/mid/long；None/short 不注入期限锚点）
 
     Returns:
         节点执行函数
@@ -184,7 +201,7 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
             base_prompt = load_agent_config(cfg["slug"])
             if not base_prompt:
                 error_msg = f"❌ 未找到 {cfg['slug']} 智能体配置，请检查 agent_specs 智能体库（DB）。"
-                logger.error(error_msg)
+                logger.warning(error_msg)
                 raise ValueError(error_msg)
 
             from app.engine.prompts.builder import (
@@ -194,7 +211,15 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
                 inject_report_messages,
             )
 
-            system = build_context_prefix(ticker, company_name, currency, currency_symbol) + "\n\n" + base_prompt
+            # 期限锚点（mid/long）：尾置最高显著位，重解读「未来 7 天协同性」等周期表述
+            from app.engine.prompts.horizon import build_horizon_anchor
+
+            system = (
+                build_context_prefix(ticker, company_name, currency, currency_symbol)
+                + "\n\n"
+                + base_prompt
+                + build_horizon_anchor(horizon, role="debater")
+            )
             messages = []
 
             # ── 4. 注入 Stage 1 报告（<report> 边界符包裹，防止 prompt 注入）──
@@ -209,7 +234,7 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
             # ── 4.5 历史记忆注入（写读对称：反思写入的相似情景经验） ──
             from app.engine.agents.utils.memory import fetch_memory_brief
 
-            memory_brief = await fetch_memory_brief(memory, "\n\n".join(r for r in all_reports.values() if r))
+            memory_brief = await fetch_memory_brief(memory, "\n\n".join(r for r in all_reports.values() if r), as_of=state.get("trade_date"))
             if memory_brief and not memory_brief.startswith("暂无"):
                 messages.append(Message(role=Role.USER, content=f"=== 历史交易反思（类似情景） ===\n{memory_brief}"))
 
@@ -238,6 +263,16 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
                 max_rounds,
                 counter_latest=has_counter_latest,
             )
+            if current_round_index == 0:
+                trigger_msg += (
+                    "\n篇幅要求：正文控制在2500个中文字符以内，优先保留可验证数据、"
+                    "核心逻辑、目标/止损和关键风险，避免重复转述基础报告。"
+                )
+            else:
+                trigger_msg += (
+                    "\n篇幅要求：本轮反驳控制在1200个中文字符以内，只回应对手最关键的"
+                    "3至5点，不重复既有论述。"
+                )
 
             # ── 7. 执行推理（统一会话循环 + submit_report 提交协议）──
             #    debater 工具白名单 = 仅 submit_report（纯提交、无信息获取，
@@ -295,7 +330,7 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
                 os.replace(tmp_filename, filename)
                 logger.info(f"{emoji} [{label}研究员] 已更新报告文件: {filename}")
             except Exception as e:
-                logger.error(f"{emoji} [ERROR] 保存报告文件失败: {e}")
+                logger.error(f"{emoji} [ERROR] 保存报告文件失败: {e}", exc_info=True)
 
             # ── 10. 状态返回（history/current_response 等由 export_legacy_state 派生）──
 
@@ -305,15 +340,16 @@ def create_researcher(llm, memory, side: Literal["bull", "bear"] = "bull", *, gr
             }
 
         except Exception as e:
-            logger.error(f"{emoji} ❌ [{label}研究员] 节点执行异常: {e}", exc_info=True)
-            error_content = f"❌ {label}研究员节点执行失败：{e}"
-            new_investment_debate_state = dict(investment_debate_state)
-            new_investment_debate_state.update(
-                {
-                    "current_response": error_content,
-                    "latest_speaker": cfg["speaker"],
-                }
+            from app.engine.orchestrator.state import append_round
+            from app.llm.failures import describe_failure
+
+            logger.error(
+                f"{emoji} ❌ [{label}研究员] 节点执行异常: {e}", exc_info=True
             )
+            error_content = f"❌ {label}研究员节点执行失败：{describe_failure(e)['message']}"
+            new_investment_debate_state = dict(investment_debate_state)
+            # Keep failures in the canonical round so the barrier can report the cause.
+            append_round(new_investment_debate_state, cfg["round_key"], error_content, per_turn)
             return {
                 state_key: new_investment_debate_state,
                 "reports": {cfg["report_key"]: error_content},

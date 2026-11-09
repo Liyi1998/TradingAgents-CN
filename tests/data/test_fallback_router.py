@@ -5,6 +5,7 @@ Provider/Adapter 层使用最小化内联实现替代 MagicMock。
 """
 
 import pytest
+import pandas as pd
 
 from app.data.processor.fallback_router import FallbackRouter, FetchResult
 from app.data.core.registry.capability import CapabilityRegistry
@@ -64,3 +65,33 @@ class TestFallbackRouterBasic:
         assert hasattr(result, "records")
         assert hasattr(result, "source")
         assert hasattr(result, "error")
+
+    @pytest.mark.asyncio
+    async def test_empty_result_is_not_reported_as_source_failure(self):
+        from app.data.sources.base.adapter import BaseAdapter
+        from app.data.sources.base.provider import BaseProvider
+
+        class EmptyProvider(BaseProvider):
+            def __init__(self):
+                super().__init__("empty", "CN")
+            async def connect(self): return True
+            def is_available(self): return True
+            async def get_money_flow(self, symbol, start_date, end_date, **kwargs):
+                return pd.DataFrame()
+
+        class EmptyAdapter(BaseAdapter):
+            def __init__(self): super().__init__(EmptyProvider(), "CN", "empty")
+
+        class EmptyRouter(FallbackRouter):
+            async def _get_provider_adapter(self, market, source_name):
+                return EmptyProvider(), EmptyAdapter()
+
+        registry = CapabilityRegistry()
+        registry.register("CN", "money_flow", "empty", SupportLevel.FULL)
+        result = await EmptyRouter(registry, PriorityConfig(), retry_max_retries=0).fetch(
+            "CN", "money_flow", "600875"
+        )
+        assert result.success is True
+        assert result.status == "empty"
+        assert result.records == []
+        assert result.error is None

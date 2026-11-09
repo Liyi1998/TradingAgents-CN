@@ -19,6 +19,7 @@ _MARKET = "CN"
 _VALID_SYNC_DOMAINS = [
     "trade_calendar", "basic_info", "daily_quotes",
     "daily_indicators", "adj_factors", "financial_data", "news",
+    "market_quotes", "dragon_tiger", "block_trade",
 ]
 
 
@@ -53,7 +54,7 @@ async def refresh_cn_stock(
         for d, dr in result.domains.items():
             domain_dict[d] = {
                 "status": dr.status,
-                "source": dr.source,
+                "data_source": dr.source,
                 "fallback_from": dr.fallback_from,
                 "records": dr.record_count,
                 "error": dr.error,
@@ -64,7 +65,7 @@ async def refresh_cn_stock(
             "status": result.status,
             "domains": domain_dict,
             "duration_ms": result.total_latency_ms,
-            "source": result.source_used,
+            "data_source": result.source_used,
             "fallback_from": result.fallback_from,
             "error": result.error,
         })
@@ -102,7 +103,7 @@ async def trigger_sync_by_domain(
     """手动触发指定域的同步（需管理员权限，后台执行立即返回）"""
     if domain not in _VALID_SYNC_DOMAINS:
         return fail(message=f"不支持的域: {domain}", code=400)
-    if request.mode not in ("incremental", "full"):
+    if request.mode not in {"incremental", "full"}:
         return fail(message=f"不支持的同步模式: {request.mode}", code=400)
 
     try:
@@ -119,6 +120,7 @@ async def trigger_sync_by_domain(
                 "task_id": result["task_id"],
                 "job_id": result["job_id"],
                 "mode": request.mode,
+                "source": request.source,
                 "status": result["status"],
                 "triggered": result["status"] != "failed",
             })

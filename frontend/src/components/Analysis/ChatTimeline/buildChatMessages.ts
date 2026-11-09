@@ -199,6 +199,14 @@ export function buildChatMessages(evs: AgentEvent[]): ChatMessage[] {
   for (const ev of evs) {
     const p = payload(ev)
     switch (ev.event_type) {
+      case 'report_reused':
+      case 'llm_retry': {
+        const text = ev.event_type === 'report_reused'
+          ? String(p.text || '复用同日完整报告，数据时点沿用原报告')
+          : `${String(p.message || '模型暂时不可用')}；重试 ${Number(p.attempt || 1)}`
+        messages.push({ kind: 'boundary', id: `e${ev.seq}`, subtype: 'info', text })
+        break
+      }
       case 'llm_request': {
         const rawMsgs = Array.isArray(p.messages) ? p.messages : null
         const full = p.messages_full === true

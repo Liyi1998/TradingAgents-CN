@@ -17,14 +17,56 @@ export enum BatchStatus {
   CANCELLED = 'cancelled'
 }
 
+export type AccountPosition = 'UNKNOWN' | 'NONE' | 'HELD'
+export type AnalysisHorizon = 'short' | 'medium' | 'long'
+export type ResearchView = 'BULLISH' | 'NEUTRAL' | 'BEARISH' | 'UNCERTAIN'
+export type DecisionAction = 'BUY' | 'WATCH' | 'HOLD' | 'REDUCE' | 'SELL'
+
+// Final reports have both legacy condition and structured conditions/price fields.
+export interface ConditionalStrategy {
+  condition?: string | string[]
+  conditions?: string | string[]
+  limit_pct?: number | null
+  [key: string]: unknown
+}
+
+export interface AnalysisDecision {
+  schema_version?: number
+  account_position?: AccountPosition
+  research_view?: ResearchView
+  unheld_action?: 'BUY' | 'WATCH'
+  held_action?: 'HOLD' | 'REDUCE' | 'SELL'
+  position_limit_pct?: number | null
+  total_position_limit_pct?: number | null
+  current_entry_limit_pct?: number | null
+  conditional_strategy?: ConditionalStrategy[]
+  exit_conditions?: string[]
+  primary_action?: DecisionAction
+  primary_action_basis?: 'ACCOUNT_POSITION' | 'UNHELD_DEFAULT'
+  action?: string
+  legacy_action?: string
+  derived_from_legacy?: boolean
+  semantics_source?: 'STRUCTURED' | 'LEGACY_DETERMINISTIC' | string
+  confidence?: number | null
+  target_price?: string | number | null
+  risk_score?: number | null
+  reasoning?: string
+  reason?: string
+  [key: string]: unknown
+}
+
 // 分析参数
 export interface AnalysisParameters {
   market_type: 'A股' | '美股' | '港股'
+  analysis_horizon?: AnalysisHorizon
   analysis_date?: string
   selected_analysts: string[]
   custom_prompt?: string
   include_charts: boolean
   language: 'zh-CN' | 'en-US'
+  account_position?: AccountPosition
+  // 投资期限（short/mid/long 为兼容别名；研究周期以 analysis_horizon 为准）
+  horizon?: 'short' | 'mid' | 'long'
   // MCP 工具配置
   mcp_enabled?: boolean
   mcp_tool_ids?: string[]
@@ -35,9 +77,10 @@ export interface AnalysisParameters {
 // 分析结果
 export interface AnalysisResult {
   analysis_id: string
+  analysis_horizon?: AnalysisHorizon
   summary?: string
   recommendation?: string
-  confidence_score?: number
+  confidence_score?: number | null
   risk_level?: string
   key_points: string[]
   detailed_analysis?: Record<string, any>
@@ -45,12 +88,15 @@ export interface AnalysisResult {
   tokens_used: number
   execution_time: number
   error_message?: string
+  decision?: AnalysisDecision
+  structured_summary?: Record<string, any>
 }
 
 // 分析任务
 export interface AnalysisTask {
   id: string
   task_id: string
+  analysis_horizon?: AnalysisHorizon
   batch_id?: string
   user_id: string
   symbol?: string  // 主字段：6位股票代码
@@ -165,6 +211,7 @@ export interface BatchAnalysisRequest {
 // 分析任务响应
 export interface AnalysisTaskResponse {
   task_id: string
+  analysis_horizon?: AnalysisHorizon
   batch_id?: string
   symbol?: string  // 主字段：6位股票代码
   stock_code?: string  // 兼容字段（已废弃）
@@ -267,6 +314,7 @@ export interface UserQueueStatus {
 // 分析报告
 export interface AnalysisReport {
   id: string
+  analysis_horizon?: AnalysisHorizon
   task_id: string
   batch_id?: string
   title: string

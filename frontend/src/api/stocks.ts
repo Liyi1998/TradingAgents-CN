@@ -58,7 +58,8 @@ export interface KlineResponse {
   period: 'day'|'week'|'month'|'5m'|'15m'|'30m'|'60m'
   limit: number
   adj: 'none'|'qfq'|'hfq'
-  source?: string
+  freshness?: string  // 数据新鲜度（历史版本被错标为 source）
+  source?: string     // 兼容字段（已废弃，含义实为 freshness）
   items: KlineBar[]
 }
 
@@ -104,8 +105,8 @@ export const stocksApi = {
    * 获取股票行情
    * @param symbol 6位股票代码
    */
-  async getQuote(symbol: string) {
-    return ApiClient.get<QuoteResponse>(`/api/stocks/${symbol}/quote`)
+  async getQuote(symbol: string, forceRefresh = false) {
+    return ApiClient.get<QuoteResponse>(`/api/stocks/${symbol}/quote`, { force_refresh: forceRefresh })
   },
 
   /**

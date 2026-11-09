@@ -156,7 +156,7 @@ class TestSummaryAgentBehavior:
         result = await node(state)
         assert "structured_summary" in result
         assert result["structured_summary"]["model_confidence"] == 75
-        assert result["structured_summary"]["final_signal"] == "Buy"
+        assert result["structured_summary"]["final_signal"] == "BUY"
 
     @pytest.mark.asyncio
     async def test_handles_json_decode_error(self):
@@ -164,8 +164,10 @@ class TestSummaryAgentBehavior:
         node = create_summary_agent(llm)
         result = await node(_summary_state())
         assert "structured_summary" in result
-        assert result["structured_summary"]["model_confidence"] == 50
-        assert result["structured_summary"]["final_signal"] == "Hold"
+        # 失败置信度未知；WATCH 是未授权观察，不能伪造持仓 HOLD。
+        assert result["structured_summary"]["model_confidence"] is None
+        assert result["structured_summary"]["final_signal"] == "WATCH"
+        assert result["structured_summary"]["degraded"] is True
 
     @pytest.mark.asyncio
     async def test_handles_llm_exception(self):
@@ -176,7 +178,7 @@ class TestSummaryAgentBehavior:
         node = create_summary_agent(FailingLLM())
         result = await node(_summary_state())
         assert "structured_summary" in result
-        assert result["structured_summary"]["model_confidence"] == 0
+        assert result["structured_summary"]["model_confidence"] is None
 
     @pytest.mark.asyncio
     async def test_cleans_markdown_json(self):

@@ -9,9 +9,8 @@
 5. get_latest_trade_day 交易日回退
 6. DataRefreshService._get_incremental_date_range 三元组 + end_date 回退
 7. DataRefreshService._refresh_domain 空结果区分 fresh/failed
-8. CN worker BaseDomainSync._write_checkpoint 带 market 字段
-9. BaseMarketDomainSync._write_checkpoint 成功/失败写入
-10. refresh 成功后写 manual checkpoint
+8. refresh 成功后写 manual checkpoint
+（历史第 8/9 节 worker 域同步 checkpoint 测试随遗留同步层删除，2026-11-02）
 
 测试原则：无 mock，通过 inject_sim_db 使用 SimulatedMongoDB 做真实 I/O。
 """
@@ -55,7 +54,7 @@ class TestSyncCheckpointSchema:
     """验证 SyncCheckpointSchema 新增字段正确。"""
 
     def test_new_fields_all_optional_with_defaults(self):
-        s = SyncCheckpointSchema(market="CN", domain="daily_quotes", source="tushare")
+        s = SyncCheckpointSchema(market="CN", domain="daily_quotes", data_source="tushare")
         doc = s.to_db_doc()
         assert doc["market"] == "CN"
         assert "scope" not in doc
@@ -65,7 +64,7 @@ class TestSyncCheckpointSchema:
 
     def test_new_fields_when_set(self):
         s = SyncCheckpointSchema(
-            market="CN", domain="daily_quotes", source="tushare",
+            market="CN", domain="daily_quotes", data_source="tushare",
             scope="single", trigger="manual", symbol="000001", duration_ms=200,
             last_sync_date="2026-06-19", status="success", record_count=5,
         )
@@ -291,14 +290,17 @@ class TestRefreshServiceDateRange:
         from app.data.core.registry.capability import CapabilityRegistry
         from app.data.core.registry.priority import PriorityConfig
 
-        _patch_today(monkeypatch, date(2026, 6, 21))
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        days = [(today - timedelta(days=i)).isoformat() for i in range(4)]
 
         coll = inject_sim_db["trade_calendar"]
         await coll.insert_many([
-            {"exchange": "SSE", "cal_date": "2026-06-18", "is_open": True},
-            {"exchange": "SSE", "cal_date": "2026-06-19", "is_open": True},
-            {"exchange": "SSE", "cal_date": "2026-06-20", "is_open": False},
-            {"exchange": "SSE", "cal_date": "2026-06-21", "is_open": False},
+            {"exchange": "SSE", "cal_date": days[3], "is_open": True},
+            {"exchange": "SSE", "cal_date": days[2], "is_open": True},
+            {"exchange": "SSE", "cal_date": days[1], "is_open": False},
+            {"exchange": "SSE", "cal_date": days[0], "is_open": False},
         ])
 
         svc = DataRefreshService(CapabilityRegistry(), PriorityConfig())
@@ -306,7 +308,7 @@ class TestRefreshServiceDateRange:
             "CN", "TESTSYMBOL", "daily_quotes"
         )
         assert latest_db is None
-        assert end == "2026-06-19", f"end_date 应回退到最近交易日 06-19，实际: {end}"
+        assert end == days[2], f"end_date 应回退到最近交易日 06-19，实际: {end}"
 
     @pytest.mark.asyncio
     async def test_latest_db_date_extracted_from_existing_data(self, inject_sim_db):
@@ -344,23 +346,26 @@ class TestRefreshServiceFreshVsFailed:
     """fresh/failed 分支在 _write_to_mongo 之前 return，不触发 bulk_write。"""
 
     @pytest.mark.asyncio
-    async def test_up_to_date_returns_fresh_not_failed(self, inject_sim_db, monkeypatch):
-        """库已最新（latest_db_date >= end_date）+ 源失败 → fresh。"""
+    async def test_existing_cache_does_not_hide_source_failure(self, inject_sim_db, monkeypatch):
+        """已有缓存也不能把上游失败标成刷新成功；缓存本身保留。"""
         from app.data.core.refresh_service import DataRefreshService
         from app.data.core.registry.capability import CapabilityRegistry
         from app.data.core.registry.priority import PriorityConfig
         from app.data.processor.fallback_router import FetchResult
         from app.data.storage.mongo.collections import get_collection_name
 
-        _patch_today(monkeypatch, date(2026, 6, 21))
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        days = [(today - timedelta(days=i)).isoformat() for i in range(4)]
 
         coll = inject_sim_db[get_collection_name("daily_quotes", "CN")]
         await coll.insert_many([
-            {"symbol": "TESTFRESH", "trade_date": "2026-06-19", "close": 10.0},
+            {"symbol": "TESTFRESH", "trade_date": days[2], "close": 10.0},
         ])
         cal_coll = inject_sim_db["trade_calendar"]
         await cal_coll.insert_many([
-            {"exchange": "SSE", "cal_date": "2026-06-19", "is_open": True},
+            {"exchange": "SSE", "cal_date": days[2], "is_open": True},
         ])
 
         svc = DataRefreshService(CapabilityRegistry(), PriorityConfig())
@@ -373,7 +378,9 @@ class TestRefreshServiceFreshVsFailed:
 
         monkeypatch.setattr(svc, "_get_router", lambda: _FakeRouter(make_failure))
         dr = await svc._refresh_domain("CN", "TESTFRESH", "daily_quotes", force=True, timeout=30)
-        assert dr.status == "fresh", f"数据已最新时应标 fresh，实际: {dr.status}"
+        assert dr.status == "failed"
+        assert dr.error == "所有源失败"
+        assert await coll.count_documents({"symbol": "TESTFRESH"}) == 1
 
     @pytest.mark.asyncio
     async def test_real_source_failure_returns_failed(self, inject_sim_db, monkeypatch):
@@ -409,87 +416,6 @@ class TestRefreshServiceFreshVsFailed:
 
 
 # ============================================================
-# 测试 8: CN worker checkpoint
-# ============================================================
-
-class TestCNWorkerCheckpointFix:
-
-    @pytest.mark.asyncio
-    async def test_cn_worker_writes_market_field(self, inject_sim_db):
-        from app.worker.cn.domain_sync.base_domain_sync import BaseDomainSync
-
-        class TestSync(BaseDomainSync):
-            domain = "daily_quotes"
-            description = "test"
-            async def sync(self):
-                pass
-
-        sync = TestSync()
-        await sync._write_checkpoint(
-            source="tushare", status="success",
-            record_count=50, duration_ms=300,
-        )
-
-        coll = inject_sim_db["sync_checkpoints"]
-        doc = await coll.find_one({"market": "CN", "domain": "daily_quotes"})
-        assert doc is not None, "CN worker 写入的 checkpoint 必须能被 {market: CN} 查到"
-        assert doc["market"] == "CN"
-        assert doc["scope"] == "market"
-        assert doc["trigger"] == "scheduled"
-        assert doc["duration_ms"] == 300
-
-
-# ============================================================
-# 测试 9: BaseMarketDomainSync checkpoint
-# ============================================================
-
-class TestBaseMarketSyncCheckpoint:
-
-    @pytest.mark.asyncio
-    async def test_writes_success_checkpoint(self, inject_sim_db):
-        from app.worker.base_market_sync import BaseMarketDomainSync
-
-        class TestHkSync(BaseMarketDomainSync):
-            market = "HK"
-            domain = "daily_quotes"
-            def get_provider(self, source_name): return None
-            def get_adapter(self, source_name): return None
-
-        sync = TestHkSync()
-        await sync._write_checkpoint(
-            success=True, source="tushare_hk",
-            record_count=30, duration_ms=200,
-        )
-
-        coll = inject_sim_db["sync_checkpoints"]
-        doc = await coll.find_one({"market": "HK", "domain": "daily_quotes"})
-        assert doc is not None
-        assert doc["status"] == "success"
-        assert doc["scope"] == "market"
-        assert doc["trigger"] == "scheduled"
-
-    @pytest.mark.asyncio
-    async def test_writes_failed_checkpoint(self, inject_sim_db):
-        from app.worker.base_market_sync import BaseMarketDomainSync
-
-        class TestUsSync(BaseMarketDomainSync):
-            market = "US"
-            domain = "daily_quotes"
-            def get_provider(self, source_name): return None
-            def get_adapter(self, source_name): return None
-
-        sync = TestUsSync()
-        await sync._write_checkpoint(
-            success=False, source="", record_count=0, duration_ms=100,
-        )
-
-        coll = inject_sim_db["sync_checkpoints"]
-        doc = await coll.find_one({"market": "US"})
-        assert doc is not None
-        assert doc["status"] == "failed"
-
-
-# ============================================================
 # 测试 10: refresh 成功后写 manual checkpoint
 # ============================================================
 
@@ -501,7 +427,7 @@ class TestRefreshWritesCheckpoint:
 
         _write_to_mongo 是纯 I/O（repo.upsert_many → bulk_write，sim_db 不支持），
         隔离它以聚焦验证"成功后是否写 manual checkpoint"这一调用路径。
-        repo.upsert_many 的写入正确性由 worker 测试覆盖。
+        repo.upsert_many 的写入正确性由 test_index_definitions 覆盖。
         """
         from app.data.core.refresh_service import DataRefreshService
         from app.data.core.registry.capability import CapabilityRegistry

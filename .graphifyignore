@@ -1,0 +1,7 @@
+# Runtime results and release backups are not source-code evidence.
+runtime/
+# Preserve the existing approved source-index exclusions.
+config/agents/phase1_agents_config.yaml
+config/agents/phase2_agents_config.yaml
+config/agents/phase3_agents_config.yaml
+frontend/components.d.ts

@@ -1,0 +1,6 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:jev-decision-ae059437
+  frontend:
+    image: tradingagents-cn-hub-frontend:jev-decision-ae059437
+

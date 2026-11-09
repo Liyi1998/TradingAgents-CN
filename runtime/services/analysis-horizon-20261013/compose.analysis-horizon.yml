@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:analysis-horizon-4d1326b5
+  frontend:
+    image: tradingagents-cn-hub-frontend:analysis-horizon-4d1326b5

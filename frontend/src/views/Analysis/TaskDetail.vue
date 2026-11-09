@@ -10,11 +10,21 @@
         <!-- 状态未加载完成时显示占位，避免闪现"未知" -->
         <el-skeleton-item v-if="!taskStatus" variant="text" class="status-skeleton" />
         <el-tag v-else :type="statusTagType" size="small">{{ statusLabel }}</el-tag>
+        <el-tag v-if="overview" type="info" size="small" effect="plain">{{ analysisHorizonLabel(overview.task) }}</el-tag>
+        <SettlementBadge :task-id="taskId" style="margin-left: 8px;" />
       </div>
 
       <span class="elapsed" :title="'起算时间：' + startedAtText">已耗时 {{ elapsedText }}</span>
 
       <div class="actions">
+        <el-button
+          v-if="taskStatus === 'failed'"
+          type="primary"
+          :loading="retrying"
+          @click="handleRetry"
+        >
+          重试并复用报告
+        </el-button>
         <el-button
           v-if="isActive"
           type="danger"
@@ -154,7 +164,9 @@ import TaskDetailSidebar from '@/components/Analysis/TaskDetailSidebar.vue'
 import ProcessPanel from '@/components/Analysis/ProcessPanel.vue'
 import LiveReportPanel from '@/components/Analysis/LiveReportPanel.vue'
 import TaskReportPanel from '@/components/Analysis/TaskReportPanel.vue'
+import SettlementBadge from '@/components/Settlement/SettlementBadge.vue'
 import { useAnalysisProcessStore } from '@/stores/analysisProcess'
+import { analysisHorizonLabel, resolveAnalysisHorizon } from '@/utils/analysisHorizon'
 
 const processStore = useAnalysisProcessStore()
 
@@ -180,6 +192,7 @@ let tickTimer: ReturnType<typeof setInterval> | null = null
 let pollSeq = 0
 
 const cancelling = ref(false)
+const retrying = ref(false)
 const nowMs = ref(Date.now())
 
 const ACTIVE_STATUSES = ['pending', 'processing', 'running']
@@ -297,6 +310,9 @@ async function loadOverview() {
       taskStatus.value = res.data.task.status
       // 直接打开已完成任务（不经轮询分支）时补齐进度，避免完成态显示 0%
       if (res.data.task.status === 'completed') progressPercentage.value = 100
+      if (res.data.task.status === 'failed') {
+        errorMessage.value = res.data.task.error_message || ''
+      }
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -394,7 +410,42 @@ async function handleCancel() {
 }
 
 function restartAnalysis() {
-  router.push('/analysis/single')
+  router.push({
+    path: '/analysis/single',
+    query: {
+      stock: overview.value?.task.symbol,
+      market: overview.value?.task.market_type,
+      analysis_horizon: resolveAnalysisHorizon(overview.value?.task),
+    },
+  })
+}
+
+async function handleRetry() {
+  try {
+    await ElMessageBox.confirm(
+      '仅复用同一分析日期内已完成的分析师报告，补跑缺失部分，并重新生成后续判断。复用内容保留原数据时点，不等于全量实时重分析；跨天请发起新的完整分析。',
+      '恢复失败分析',
+      { type: 'info', confirmButtonText: '继续重试', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  retrying.value = true
+  try {
+    const res = await analysisApi.retryTask(taskId)
+    if (!res.success || !res.data?.task_id) {
+      ElMessage.error(res.message || '重试未成功，请刷新后查看')
+      return
+    }
+    ElMessage.success(res.data.existing
+      ? '已打开此前创建的重试任务，未重复提交'
+      : `已保留 ${res.data.reused_report_keys.length} 份报告，开始补跑`)
+    await router.push({ name: 'AnalysisTaskDetail', params: { taskId: res.data.task_id } })
+  } catch (e: unknown) {
+    ElMessage.error(e instanceof Error ? e.message : '重试失败，请重新发起完整分析')
+  } finally {
+    retrying.value = false
+  }
 }
 
 // 报告下载：委托报告面板（失败提示含后端 message，如 pandoc 缺失）
@@ -445,6 +496,7 @@ onBeforeUnmount(() => {
 .task-title {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   min-width: 0;
 }

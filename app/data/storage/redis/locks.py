@@ -190,3 +190,26 @@ class DistributedLock:
             elapsed += delay
             delay = min(delay * 1.5, 2.0)
         return False
+
+    async def wait_until_released(self, max_wait: float = 5) -> bool:
+        """Observe a peer refresh without taking, deleting or extending its lock."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0, max_wait)
+        while True:
+            try:
+                from app.data.storage.redis.client import get_redis
+                redis = get_redis()
+                if redis is not None:
+                    busy = bool(await redis.exists(self.lock_key))
+                else:
+                    lock = _async_memory_locks.get(self.lock_key)
+                    busy = bool(lock and lock.locked())
+            except Exception:
+                # A failed observation is not evidence that the owner released.
+                return False
+            if not busy:
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(.1, remaining))

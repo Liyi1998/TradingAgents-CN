@@ -15,16 +15,14 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Any, Dict, List
 
+from app.data.config import load_yaml
 from app.data.storage.mongo.collections import get_all_collections
 from app.data.storage.mongo.index_definitions import INDEX_DEFINITIONS, get_unique_key
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-
-# 源优先级（与 config/data 优先级默认一致）：数值越小越优先保留
-_SOURCE_PRIORITY = {"tushare": 1, "akshare": 2, "baostock": 3}
-_DEFAULT_PRIORITY = 9
 
 # 排序键兜底：非时序域按 updated_at 取最新
 _FALLBACK_SORT_FIELD = "updated_at"
@@ -37,6 +35,47 @@ def _sort_field(domain: str) -> str:
         if candidate in key_fields:
             return candidate
     return _FALLBACK_SORT_FIELD
+
+
+def _source_priority(market: str, domain: str, source: str) -> int:
+    """从唯一的默认优先级配置中读取域级源顺序。"""
+    configured = (
+        load_yaml("default_priorities.yaml")
+        .get(market.upper(), {})
+        .get(domain, [])
+    )
+    normalized = [str(item).strip().lower() for item in configured]
+    try:
+        return normalized.index(str(source or "").strip().lower())
+    except ValueError:
+        return len(normalized)
+
+
+def _select_keep_id(
+    docs: List[Dict[str, Any]], market: str, domain: str
+) -> Any:
+    """优先保留配置排名最高的源，同级再保留最新文档。"""
+    if not docs:
+        return None
+    best_priority = min(
+        _source_priority(market, domain, doc.get("data_source") or "")
+        for doc in docs
+    )
+    candidates = [
+        doc
+        for doc in docs
+        if _source_priority(market, domain, doc.get("data_source") or "")
+        == best_priority
+    ]
+    winner = max(
+        candidates,
+        key=lambda doc: (
+            str(doc.get("updated_at") or ""),
+            str(doc.get("created_at") or ""),
+            str(doc.get("_id") or ""),
+        ),
+    )
+    return winner["_id"]
 
 
 async def dedupe_market(db, market: str, apply: bool) -> int:
@@ -55,12 +94,20 @@ async def dedupe_market(db, market: str, apply: bool) -> int:
         collection = db[collection_name]
         group_id = {f: f"${f}" for f in key_fields}
 
+        sort_field = _sort_field(domain)
+        grouped_doc = {
+            "_id": "$_id",
+            "data_source": "$data_source",
+            "updated_at": "$updated_at",
+            "created_at": "$created_at",
+        }
+        if sort_field not in grouped_doc:
+            grouped_doc[sort_field] = f"${sort_field}"
+
         pipeline = [
             {"$group": {
                 "_id": group_id,
-                "docs": {"$push": {"_id": "$_id",
-                                   "data_source": "$data_source",
-                                   _sort_field(domain): f"${_sort_field(domain)}"}},
+                "docs": {"$push": grouped_doc},
                 "count": {"$sum": 1},
             }},
             {"$match": {"count": {"$gt": 1}}},
@@ -77,15 +124,9 @@ async def dedupe_market(db, market: str, apply: bool) -> int:
 
         deleted_for_collection = 0
         for group in groups:
-            docs = sorted(
-                group["docs"],
-                key=lambda d: (
-                    _SOURCE_PRIORITY.get(d.get("data_source") or "", _DEFAULT_PRIORITY),
-                    str(d.get(_sort_field(domain)) or ""),
-                ),
-            )
-            # 保留优先级最高的一条（排序后第一个），删除其余
-            to_delete = [d["_id"] for d in docs[1:]]
+            docs = group["docs"]
+            keep_id = _select_keep_id(docs, market, domain)
+            to_delete = [d["_id"] for d in docs if d["_id"] != keep_id]
             if not apply:
                 logger.info(
                     f"  [干跑] {collection_name} 组 {group['_id']}: "
@@ -127,22 +168,35 @@ async def record_event(db, market: str, deleted: int, apply: bool):
 
 
 async def main(apply: bool = False):
-    from app.core.database import get_mongo_db
+    from app.core.database import (
+        create_database_indexes,
+        db_manager,
+    )
 
-    db = get_mongo_db()
-    mode = "实际删除" if apply else "干跑（仅统计）"
-    logger.info(f"=== 单版本覆盖去重迁移（{mode}） ===")
+    # 迁移脚本只需要 MongoDB；干跑模式不初始化 Redis、视图或索引，确保零写入。
+    await db_manager.init_mongodb()
+    try:
+        db = db_manager.mongo_db
+        if db is None:
+            raise RuntimeError("MongoDB数据库未初始化")
+        mode = "实际删除" if apply else "干跑（仅统计）"
+        logger.info(f"=== 单版本覆盖去重迁移（{mode}） ===")
 
-    grand_total = 0
-    for market in ("CN", "HK", "US"):
-        logger.info(f"--- {market} 市场 ---")
-        deleted = await dedupe_market(db, market, apply)
-        await record_event(db, market, deleted, apply)
-        grand_total += deleted
+        grand_total = 0
+        for market in ("CN", "HK", "US"):
+            logger.info(f"--- {market} 市场 ---")
+            deleted = await dedupe_market(db, market, apply)
+            if apply:
+                await record_event(db, market, deleted, apply)
+            grand_total += deleted
 
-    logger.info(f"=== 完成（{mode}）: 共处理重复文档 {grand_total} 条 ===")
-    if not apply:
-        logger.info("确认无误后执行: python -m app.data.scripts.dedupe_for_single_version --apply")
+        if apply:
+            await create_database_indexes(db)
+        logger.info(f"=== 完成（{mode}）: 共处理重复文档 {grand_total} 条 ===")
+        if not apply:
+            logger.info("确认无误后执行: python -m app.data.scripts.dedupe_for_single_version --apply")
+    finally:
+        await db_manager.close_connections()
 
 
 if __name__ == "__main__":

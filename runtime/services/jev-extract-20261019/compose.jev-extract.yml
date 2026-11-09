@@ -1,0 +1,4 @@
+services:
+  frontend:
+    image: tradingagents-cn-hub-frontend:jev-extract-6e85f7e8
+

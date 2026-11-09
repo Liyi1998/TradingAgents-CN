@@ -61,4 +61,11 @@ async def build_report_titles(task_id: str, report_keys: List[str]) -> Dict[str,
         if name:
             titles[key] = name
 
+    # Fixed document section, not a generative analyst or a selectable chat model.
+    from app.llm.jev_review import REPORT_KEY, REPORT_TITLE
+
+    if REPORT_KEY in report_keys:
+        titles[REPORT_KEY] = REPORT_TITLE
+    if "analysis_recovery_report" in report_keys:
+        titles["analysis_recovery_report"] = "分析恢复记录"
     return {k: v for k, v in titles.items()}

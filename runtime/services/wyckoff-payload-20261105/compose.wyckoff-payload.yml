@@ -1,0 +1,5 @@
+services:
+  backend:
+    image: tradingagents-cn-hub-backend:wyckoff-payload-ce349de1
+  frontend:
+    image: tradingagents-cn-hub-frontend:wyckoff-timeline-5544a684

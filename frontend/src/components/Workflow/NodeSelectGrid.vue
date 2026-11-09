@@ -40,6 +40,7 @@
           </div>
           <div class="node-content">
             <div class="node-name">{{ node.name }}</div>
+            <el-tag v-if="spec.research_profile?.required_analysts.includes(node.slug)" size="small">本周期必选</el-tag>
             <div class="node-desc">{{ node.description }}</div>
           </div>
           <div class="node-check">
@@ -135,7 +136,11 @@ const MODE_LABEL: Record<string, string> = {
 
 /** 批阶段成员：pool 模式取智能体库 phase1 全集；显式枚举按 NodeRef 顺序取元数据 */
 const batchMembers = (stage: StageSpecDto): BatchNode[] => {
-  if (stage.pool) return props.agents
+  if (stage.pool) return props.agents.filter((a) => !props.spec.research_profile ||
+    a.slug in props.spec.research_profile.roles).map((a) => {
+      const role = props.spec.research_profile?.roles[a.slug]
+      return role ? { ...a, name: role.name, description: role.prompt.split('\n')[0] } : a
+    })
   return (stage.nodes || []).map((ref) => {
     const meta = props.agents.find((a) => a.slug === ref.ref)
     const nodeDef = props.spec.nodes.find((n) => n.slug === ref.ref)
@@ -155,6 +160,7 @@ const isStageSkipped = (stage: StageSpecDto): boolean => (props.disabledStageIds
 const toggleNode = (slug: string, stage: StageSpecDto) => {
   // 组被阶段开关跳过时本次不执行，勾选无意义但保留原值（切回开启即恢复）
   if (isStageSkipped(stage)) return
+  if (props.spec.research_profile?.required_analysts.includes(slug)) return
   const next = props.selected.includes(slug)
     ? props.selected.filter((s) => s !== slug)
     : [...props.selected, slug]
@@ -183,7 +189,9 @@ const resolveIcon = (name: string) => {
   return icons[name] || icons[getAnalystIcon(name)] || InfoFilled
 }
 
-const displayNames = computed(() => props.displayNames || {})
+const displayNames = computed(() => ({ ...props.displayNames,
+  ...Object.fromEntries(Object.entries(props.spec.research_profile?.roles || {}).map(([slug, role]) => [slug, role.name])),
+}))
 </script>
 
 <style lang="scss" scoped>

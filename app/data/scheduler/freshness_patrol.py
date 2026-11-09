@@ -61,19 +61,10 @@ _PATROL_MARKET_DOMAINS: Dict[str, list] = {
     ],
 }
 
-# 各域收盘后数据可用的等待窗（市场本地时间）：
-# 收盘后源端整理需要时间，巡检判定「应有数据」的时点 = 收盘 + 该窗口。
-# 缺省 90 分钟，行情类源通常 30~60 分钟内可用，留裕量避免巡检与 cron 抢跑。
-_DOMAIN_READY_AFTER_CLOSE: Dict[str, int] = {
-    "CN": {"default": 90, "daily_indicators": 120, "adj_factors": 150,
-           "money_flow": 90, "financial_data": 360},
-    "HK": {"default": 90},
-    "US": {"default": 90, "daily_indicators": 120, "adj_factors": 120},
-}
-
-# 市场收盘时间（本地）与自然日容忍度：
-# daily 类域按交易日判定；basic_info/calendar/财务等自然日域按天判定。
-_MARKET_CLOSE_LOCAL = {"CN": 15, "HK": 16, "US": 16}
+from app.data.core.freshness import (
+    get_expected_trading_date as _expected_trading_date,
+    get_ready_after_close as _ready_after_close,
+)
 # 自然日域的容忍天数：落后超过该天数才补（每天全量同步一次足矣）
 _CALENDAR_DAY_TOLERANCE = {"default": 1, "trade_calendar": 7, "financial_data": 2}
 
@@ -81,9 +72,6 @@ _patrol_lock = asyncio.Lock()
 _last_patrol_result: Dict = {}
 
 
-def _ready_after_close(market: str, domain: str) -> int:
-    cfg = _DOMAIN_READY_AFTER_CLOSE.get(market, {})
-    return cfg.get(domain, cfg.get("default", 90))
 
 
 def _calendar_tolerance(domain: str) -> int:
@@ -96,48 +84,6 @@ def _is_calendar_domain(domain: str) -> bool:
                       "corporate_actions", "connect_status")
 
 
-async def _expected_trading_date(market: str, domain: str) -> Optional[date]:
-    """计算「此刻源端应已具备数据」的最新交易日。
-
-    从今天往回找第一个满足「交易日且已过收盘+就绪窗」的日期。
-    今天是交易日但还没到就绪时点 → 昨个交易日；否则 → 今天。
-    找不到日历（None）时返回 None，调用方按自然日逻辑兜底。
-    """
-    from app.data.core.market import get_market_timezone
-    from app.data.core.domain import DataDomain
-
-    if domain not in {d.value for d in DataDomain}:
-        return None
-
-    tz = get_market_timezone(market)
-    now_local = datetime.now(tz)
-    ready_minutes = _ready_after_close(market, domain)
-    close_hour = _MARKET_CLOSE_LOCAL.get(market, 16)
-
-    # 就绪时点（本地）：收盘 + 就绪窗；超过它当日数据才「应有」
-    ready_dt = now_local.replace(
-        hour=close_hour, minute=0, second=0, microsecond=0
-    ) + timedelta(minutes=ready_minutes)
-
-    from app.data.storage.mongo.repositories.trade_calendar_repo import TradeCalendarRepo
-    from app.data.schema.base.markets import MARKET_META, MarketType
-
-    meta = MARKET_META.get(MarketType(market))
-    exchange = meta.exchanges[0] if meta and meta.exchanges else ""
-    repo = TradeCalendarRepo()
-
-    candidate = now_local.date()
-    # 最多回看 40 天，覆盖最长节假日连休 + 巡检长期停摆
-    for _ in range(40):
-        is_open = await repo.is_trading_day(candidate.isoformat(), exchange, market)
-        if is_open:
-            if candidate == now_local.date() and now_local < ready_dt:
-                # 今日数据尚未就绪，继续回看上一交易日
-                candidate = candidate - timedelta(days=1)
-                continue
-            return candidate
-        candidate = candidate - timedelta(days=1)
-    return None
 
 
 async def _checkpoint_date(market: str, domain: str) -> Optional[date]:
@@ -165,7 +111,9 @@ async def evaluate_domain(market: str, domain: str) -> Dict:
     checkpoint = await _checkpoint_date(market, domain)
 
     if _is_calendar_domain(domain):
-        tz_days = (date.today() - checkpoint).days if checkpoint else None
+        from datetime import datetime
+        from app.data.core.market import get_market_timezone
+        tz_days = (datetime.now(get_market_timezone(market)).date() - checkpoint).days if checkpoint else None
         tolerance = _calendar_tolerance(domain)
         behind = tz_days is None or tz_days > tolerance
         return {
@@ -212,9 +160,10 @@ async def run_patrol(trigger: str = "interval") -> Dict:
                         "compensated": [], "results": {}}
         engine = None
         try:
-            from app.worker.scheduler_setup import get_scheduler_engine
+            # SchedulerEngine 是数据模块自有组件，直接取单例（不经 app.worker 转发）
+            from app.data.scheduler.engine import SchedulerEngine
 
-            engine = get_scheduler_engine()
+            engine = SchedulerEngine.get_instance()
         except Exception as e:
             logger.warning("巡检无法获取调度引擎: %s", e)
 
@@ -223,8 +172,14 @@ async def run_patrol(trigger: str = "interval") -> Dict:
         # 500 次/分钟），打爆限流反而拖慢整体回补（对齐 Airflow
         # catchup 逐 run 串行回放的通行做法）
         pending: list = []
+        from app.core.config import settings
+        enabled_markets = {value.strip().upper() for value in settings.DATA_FRESHNESS_PATROL_MARKETS.split(",")}
         for market, domains in _PATROL_MARKET_DOMAINS.items():
+            if market not in enabled_markets:
+                continue
             for domain in domains:
+                if engine is not None and not engine.is_scheduled_domain(market, domain):
+                    continue
                 try:
                     verdict = await evaluate_domain(market, domain)
                 except Exception as e:
@@ -244,14 +199,14 @@ async def run_patrol(trigger: str = "interval") -> Dict:
                 if engine is not None:
                     pending.append((market, domain))
 
-        for market, domain in pending:
+        for market, domain in pending[:settings.DATA_FRESHNESS_PATROL_MAX_JOBS]:
             try:
                 # trigger_job 阻塞等待该域补完（增量幂等，可与 cron 共存：
                 # engine 侧 already_running 幂等防止同域并发）
-                await engine.trigger_job(market, domain)
+                result = await engine.trigger_job(market, domain)
                 report["compensated"].append(
                     {"task_id": f"{market}:{domain}", "domain": f"{market}:{domain}",
-                     "status": "triggered"}
+                     "status": (result or {}).get("status", "unknown")}
                 )
             except Exception as e:
                 logger.warning("巡检补数触发失败 %s/%s: %s", market, domain, e)

@@ -84,12 +84,14 @@ def check_required_inputs(spec: WorkflowSpec, plan) -> List[str]:
     try:
         contracts = {entry["slug"]: entry.get("template_inputs", []) for entry in workflow_store.list_agent_specs()}
     except Exception as e:  # noqa: BLE001 - 库不可读不阻断任务，required 检查降级
+        if spec.research_profile is not None:
+            raise WorkflowLoadError("研究工作流的智能体库不可读，无法核验必需研究角色") from e
         logger.warning(f"⚠️ [orchestrator] required 输入检查跳过（agent_specs 不可读）: {e}")
         return []
     # 键形态与 DynamicAnalystFactory.get_agent_config 的三种解析方式对齐
     # （slug / internal_key / 中文名），前端任一形态的选择都能命中报告键映射
     analyst_keys: Dict[str, Tuple[str, ...]] = {}
-    for identity in registry._load_identities():
+    for identity in registry.load_identities():
         if not identity.is_analyst:
             continue
         internal_key = identity.slug.replace("-analyst", "").replace("-", "_")
@@ -97,6 +99,9 @@ def check_required_inputs(spec: WorkflowSpec, plan) -> List[str]:
         for lookup in (identity.slug, internal_key, identity.name):
             if lookup:
                 analyst_keys[lookup] = report_keys
+    if spec.research_profile is not None:
+        for slug, role in spec.research_profile.roles.items():
+            contracts[slug] = [slot.model_dump() for slot in role.template_inputs]
     return inputs_mod.check_required_sources(plan, spec, contracts, analyst_keys)
 
 

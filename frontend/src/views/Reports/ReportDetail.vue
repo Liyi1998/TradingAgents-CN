@@ -17,8 +17,10 @@
             </h1>
             <div class="report-meta">
               <el-tag type="primary">{{ report.stock_symbol }}</el-tag>
+              <el-tag type="info" effect="plain">{{ analysisHorizonLabel(report) }}</el-tag>
               <el-tag v-if="report.stock_name && report.stock_name !== report.stock_symbol" type="info">{{ report.stock_name }}</el-tag>
               <el-tag type="success">{{ getStatusText(report.status) }}</el-tag>
+              <SettlementBadge :task-id="String(route.params.id)" style="margin-left: 8px;" />
               <span class="meta-item">
                 <el-icon><Calendar /></el-icon>
                 {{ formatTime(report.created_at) }}
@@ -99,7 +101,21 @@
         </el-alert>
       </div>
 
+      <DecisionSemanticsCard
+        v-if="report.decision && (report.decision.schema_version ?? 0) >= 2"
+        :decision="report.decision"
+      />
+
       <!-- 关键指标 -->
+      <ExperienceUsage :task-id="String(report.analysis_id || route.params.id || '')" />
+      <JevFinalActionCard :analysis-id="String(report.analysis_id || route.params.id || '')" />
+      <details><summary>旧条件核验记录（仅历史对照）</summary>
+        <JevConditionCard :analysis-id="String(report.analysis_id || route.params.id || '')" />
+      </details>
+      <details><summary>高级调试：手动日线动作试验（非日常入口）</summary>
+        <JevDecisionExperiment :analysis-id="String(report.analysis_id || route.params.id || '')" :source-text="String(report.reports?.final_trade_decision || report.reports?.trader_investment_plan || '')" :source-label="report.reports?.final_trade_decision ? '最终裁决' : '专业交易员计划'" />
+      </details>
+
       <el-card class="metrics-card" shadow="never">
         <template #header>
           <div class="card-header">
@@ -110,7 +126,7 @@
         <div class="metrics-content">
           <el-row :gutter="24">
             <!-- 分析参考 -->
-            <el-col :span="8">
+            <el-col :xs="24" :sm="12" :md="8">
               <div class="metric-item">
                 <div class="metric-label">
                   <el-icon><TrendCharts /></el-icon>
@@ -120,12 +136,22 @@
                   </el-tooltip>
                 </div>
                 <div class="metric-value recommendation-value markdown-content" v-html="renderSafeMarkdown(report.recommendation || '暂无')"></div>
-                <el-tag type="info" size="small" style="margin-top: 8px;">仅供参考</el-tag>
+                <div style="margin-top: 8px;">
+                  <el-tag type="info" size="small">仅供参考</el-tag>
+                  <el-tag
+                    v-if="report.structured_summary?.degraded"
+                    type="warning"
+                    size="small"
+                    effect="dark"
+                    style="margin-left: 8px;"
+                    title="总结生成失败后的降级占位结果，信号与置信度不可信"
+                  >降级结果</el-tag>
+                </div>
               </div>
             </el-col>
 
             <!-- 风险评估 -->
-            <el-col :span="8">
+            <el-col :xs="24" :sm="12" :md="8">
               <div class="metric-item risk-item">
                 <div class="metric-label">
                   <el-icon><Warning /></el-icon>
@@ -140,13 +166,13 @@
                       v-for="star in 5"
                       :key="star"
                       class="star-icon"
-                      :class="{ active: star <= getRiskStars(report.risk_level || '中等') }"
+                      :class="{ active: star <= getRiskStars(report.risk_level || '未知') }"
                     >
                       <StarFilled />
                     </el-icon>
                   </div>
-                  <div class="risk-label" :style="{ color: getRiskColor(report.risk_level || '中等') }">
-                    {{ report.risk_level || '中等' }}风险
+                  <div class="risk-label" :style="{ color: getRiskColor(report.risk_level || '未知') }">
+                    {{ report.risk_level || '未知' }}风险
                   </div>
                   <!-- 风险评估详情（原独立区块合并入卡片） -->
                   <div v-if="report.structured_summary?.risk_assessment" class="risk-detail">
@@ -168,17 +194,18 @@
             </el-col>
 
             <!-- 模型置信度 -->
-            <el-col :span="8">
+            <el-col :xs="24" :sm="12" :md="8">
               <div class="metric-item confidence-item">
                 <div class="metric-label">
                   <el-icon><DataAnalysis /></el-icon>
-                  模型置信度
-                  <el-tooltip content="基于AI模型计算的置信度，不代表实际投资成功率" placement="top">
+                  模型研究置信度
+                  <el-tooltip content="模型主观自评，非校准概率，也不代表投资胜率；未量化时保留文字判断" placement="top">
                     <el-icon style="margin-left: 4px; cursor: help; font-size: 14px;"><QuestionFilled /></el-icon>
                   </el-tooltip>
                 </div>
                 <div class="confidence-display">
                   <el-progress
+                    v-if="report.confidence_score != null"
                     type="circle"
                     :percentage="normalizeConfidenceScore(report.confidence_score || 0)"
                     :width="120"
@@ -192,7 +219,8 @@
                       </span>
                     </template>
                   </el-progress>
-                  <div class="confidence-label">{{ getConfidenceLabel(normalizeConfidenceScore(report.confidence_score || 0)) }}</div>
+                  <div v-if="report.confidence_score == null" class="confidence-label">{{ report.structured_summary?.confidence_label || '未量化，暂无评分' }}</div>
+                  <div v-else class="confidence-label">{{ getConfidenceLabel(normalizeConfidenceScore(report.confidence_score || 0)) }}</div>
                 </div>
               </div>
             </el-col>
@@ -212,26 +240,31 @@
             </ul>
           </div>
 
+          <PriceReferences
+            :reference="report.structured_summary?.price_reference"
+            :strategies="report.decision?.conditional_strategy || report.structured_summary?.decision_semantics?.conditional_strategy"
+          />
+
           <!-- 🔥 关键点位参考（来自结构化总结） -->
           <div v-if="report.structured_summary && report.structured_summary.key_indicators" class="key-indicators-section">
             <h4>
               <el-icon><TrendCharts /></el-icon>
-              关键点位参考
-              <el-tooltip content="基于AI模型分析的参考点位，仅供参考，不构成投资建议" placement="top">
+              条件研究点位原始说明
+              <el-tooltip content="研究参考，须结合报告中的触发与失效条件；不代表当前获准买卖或委托价格" placement="top">
                 <el-icon style="margin-left: 4px; cursor: help; font-size: 14px;"><QuestionFilled /></el-icon>
               </el-tooltip>
             </h4>
             <div class="key-indicators-grid">
               <div class="indicator-item">
-                <span class="indicator-label">入场价格:</span>
+                <span class="indicator-label">条件入场参考:</span>
                 <span class="indicator-value">{{ report.structured_summary.key_indicators.entry_price || 'N/A' }}</span>
               </div>
               <div class="indicator-item">
-                <span class="indicator-label">目标价格:</span>
+                <span class="indicator-label">条件目标参考:</span>
                 <span class="indicator-value">{{ report.structured_summary.key_indicators.target_price || 'N/A' }}</span>
               </div>
               <div class="indicator-item">
-                <span class="indicator-label">止损价格:</span>
+                <span class="indicator-label">保护/失效参考:</span>
                 <span class="indicator-value">{{ report.structured_summary.key_indicators.stop_loss || 'N/A' }}</span>
               </div>
               <div class="indicator-item">
@@ -332,7 +365,16 @@ import {
   ArrowDown
 } from '@element-plus/icons-vue'
 import { reportsApi } from '@/api/reports'
+import SettlementBadge from '@/components/Settlement/SettlementBadge.vue'
+import ExperienceUsage from '@/components/Settlement/ExperienceUsage.vue'
 import { renderMarkdown } from '@/utils/markdown'
+import DecisionSemanticsCard from '@/components/Analysis/DecisionSemanticsCard.vue'
+import PriceReferences from '@/components/Report/PriceReferences.vue'
+import JevConditionCard from '@/components/Report/JevConditionCard.vue'
+import JevFinalActionCard from '@/components/Report/JevFinalActionCard.vue'
+import JevDecisionExperiment from '@/components/Report/JevDecisionExperiment.vue'
+import type { AnalysisDecision } from '@/types/analysis'
+import { analysisHorizonLabel } from '@/utils/analysisHorizon'
 
 
 // 路由
@@ -350,11 +392,12 @@ interface ReportData {
   analysts?: string | string[]
   model_info?: string
   recommendation?: string
+  decision?: AnalysisDecision
   summary?: string
   structured_summary?: any
   reports?: Record<string, any>
   risk_level?: string
-  confidence_score?: number | string
+  confidence_score?: number | string | null
   key_points?: string[]
   key_indicators?: any
   risk_assessment?: any
@@ -385,6 +428,9 @@ const MODULE_ORDER: Record<string, number> = {
   trader_investment_plan: 400,
   investment_plan: 400,
   final_trade_decision: 401,
+  data_quality_report: 490,
+  jev_review_report: 500,
+  analysis_recovery_report: 501,
 }
 
 const getModuleWeight = (key: string): number => {
@@ -470,7 +516,7 @@ const downloadReport = async (format: string = 'markdown') => {
 
     // 根据格式设置文件扩展名
     const ext = getFileExtension(format)
-    a.download = `${report.value.stock_symbol || 'report'}_分析报告_${report.value.analysis_date || new Date().toISOString().slice(0,10)}.${ext}`
+    a.download = `${report.value.stock_symbol || 'report'}_${analysisHorizonLabel(report.value, true)}分析报告_${report.value.analysis_date || new Date().toISOString().slice(0,10)}.${ext}`
 
     document.body.appendChild(a)
     a.click()
@@ -616,6 +662,9 @@ const getModuleDisplayName = (moduleName: string) => {
 
   // 非智能体产出的固定文档段落标题（决策汇总类，不属于任何智能体名称）
   const fixedNameMap: Record<string, string> = {
+    data_quality_report: '数据质量与取数覆盖',
+    jev_review_report: 'Jev 报告复核（试用）',
+    analysis_recovery_report: '分析恢复记录',
     final_trade_decision: '最终交易决策',
     investment_plan: '投资建议',
     investment_debate_state: '研究团队决策（旧）',
@@ -686,7 +735,7 @@ const getRiskStars = (riskLevel: string) => {
     '中高': 4,
     '高': 5
   }
-  return riskMap[riskLevel] || 3
+  return riskMap[riskLevel] ?? 0
 }
 
 const getRiskColor = (riskLevel: string) => {
@@ -697,7 +746,7 @@ const getRiskColor = (riskLevel: string) => {
     '中高': '#E57373',    // 红色
     '高': '#E57373'       // 深红色
   }
-  return colorMap[riskLevel] || '#D4AF37'
+  return colorMap[riskLevel] || 'var(--el-text-color-secondary)'
 }
 
 // 🔥 风险评分进度条颜色
@@ -1256,6 +1305,27 @@ onMounted(() => {
 
   .error-container {
     padding: 48px 24px;
+  }
+
+  @media (max-width: 767px) {
+    .report-content .report-header .header-content {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 16px;
+
+      .title-section {
+        min-width: 0;
+
+        .report-meta .meta-item {
+          min-width: 0;
+          overflow-wrap: anywhere;
+        }
+      }
+
+      .action-section {
+        flex-wrap: wrap;
+      }
+    }
   }
 }
 </style>

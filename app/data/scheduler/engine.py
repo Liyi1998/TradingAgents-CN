@@ -95,6 +95,9 @@ class SchedulerEngine:
         for domain, job_conf in config.items():
             if not isinstance(job_conf, dict):
                 continue
+            if job_conf.get("enabled", True) is False:
+                logger.info("跳过未启用的定时同步: %s/%s", market, domain)
+                continue
 
             cron_expr = job_conf.get("cron")
             if not cron_expr:
@@ -134,7 +137,7 @@ class SchedulerEngine:
                 )
                 logger.info("注册调度: %s (%s %s)", job_id, cron_expr, timezone)
             except Exception as e:
-                logger.error("注册调度失败 %s: %s", job_id, e)
+                logger.error("注册调度失败 %s: %s", job_id, e, exc_info=True)
 
     def _make_job_func(self, market: str, domain: str):
         """创建任务函数 — 从 JobRegistry 查找并执行对应 Job。"""
@@ -186,6 +189,9 @@ class SchedulerEngine:
         if monitor:
             monitor.on_task_start(market, domain)
         start_ts = time.time()
+        timeout_seconds = max(
+            0.1, float(job_conf.get("timeout_seconds", 3600) or 3600)
+        )
 
         try:
             job_instance = job_entry["class"]()
@@ -197,10 +203,40 @@ class SchedulerEngine:
             )
             job_instance.dependencies = list(job_conf.get("depends_on", []) or [])
             job_instance.force_sync = force
-            result = await job_instance.execute()
-            logger.debug("调度完成 %s/%s: %s", market, domain, result)
+            result = await asyncio.wait_for(
+                job_instance.execute(), timeout=timeout_seconds
+            )
+            logger.info("调度完成 %s/%s: %s", market, domain, result)
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.time() - start_ts) * 1000)
+            logger.error(
+                "调度执行超时 %s/%s: 超过 %s 秒，任务已取消",
+                market,
+                domain,
+                timeout_seconds,
+            )
+            if monitor:
+                try:
+                    monitor.on_task_complete(
+                        market, domain, success=False, latency_ms=elapsed_ms
+                    )
+                except Exception as monitor_err:
+                    logger.warning("监控回调 on_task_complete(False) 异常: %s", monitor_err)
+            return
+        except asyncio.CancelledError:
+            if monitor:
+                try:
+                    monitor.on_task_complete(
+                        market,
+                        domain,
+                        success=False,
+                        latency_ms=int((time.time() - start_ts) * 1000),
+                    )
+                except Exception as monitor_err:
+                    logger.warning("取消任务的监控清理异常: %s", monitor_err)
+            raise
         except Exception as e:
-            logger.error("调度执行失败 %s/%s: %s", market, domain, e)
+            logger.error("调度执行失败 %s/%s: %s", market, domain, e, exc_info=True)
             # M14 修复：监控回调用独立 try-except 包裹，避免回调异常
             # 掩盖任务的真实执行结果或导致成功任务被误标为失败。
             if monitor:
@@ -223,7 +259,7 @@ class SchedulerEngine:
                 monitor.on_task_complete(
                     market,
                     domain,
-                    success=True,
+                    success=(result or {}).get("status") != "failed",
                     latency_ms=int((time.time() - start_ts) * 1000),
                 )
             except Exception as monitor_err:
@@ -260,8 +296,11 @@ class SchedulerEngine:
                 )
                 return job_id
             except Exception as e:
-                logger.error("手动触发失败 %s: %s", job_id, e)
+                logger.error("手动触发失败 %s: %s", job_id, e, exc_info=True)
         return ""
+
+    def is_scheduled_domain(self, market: str, domain: str) -> bool:
+        return (market.upper(), domain) in self._job_configs
 
     def run_job_now(
         self,

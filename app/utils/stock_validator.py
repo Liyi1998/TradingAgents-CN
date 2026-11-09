@@ -334,7 +334,7 @@ class StockDataPreparer:
                     suggestion="请选择支持的市场类型：A股、港股、美股"
                 )
         except Exception as e:
-            logger.error(f"❌ [数据准备] 数据准备异常: {e}")
+            logger.error(f"❌ [数据准备] 数据准备异常: {e}", exc_info=True)
             return StockDataPreparationResult(
                 is_valid=False,
                 stock_code=stock_code,
@@ -364,7 +364,7 @@ class StockDataPreparer:
                     suggestion="请选择支持的市场类型：A股、港股、美股"
                 )
         except Exception as e:
-            logger.error(f"❌ [数据准备-异步] 数据准备异常: {e}")
+            logger.error(f"❌ [数据准备-异步] 数据准备异常: {e}", exc_info=True)
             return StockDataPreparationResult(
                 is_valid=False,
                 stock_code=stock_code,
@@ -515,7 +515,7 @@ class StockDataPreparer:
             )
 
         except Exception as e:
-            logger.error(f"❌ [A股数据] 数据准备失败: {e}")
+            logger.error(f"❌ [A股数据] 数据准备失败: {e}", exc_info=True)
             import traceback
             logger.debug(f"详细错误: {traceback.format_exc()}")
             return StockDataPreparationResult(
@@ -620,7 +620,7 @@ class StockDataPreparer:
             )
 
         except Exception as e:
-            logger.error(f"❌ [A股数据-异步] 数据准备失败: {e}")
+            logger.error(f"❌ [A股数据-异步] 数据准备失败: {e}", exc_info=True)
             import traceback
             logger.debug(f"详细错误: {traceback.format_exc()}")
             return StockDataPreparationResult(
@@ -694,7 +694,7 @@ class StockDataPreparer:
             }
 
         except Exception as e:
-            logger.error(f"❌ [数据检查] 检查数据库数据失败: {e}")
+            logger.error(f"❌ [数据检查] 检查数据库数据失败: {e}", exc_info=True)
             return {
                 "has_data": False,
                 "is_latest": False,
@@ -798,7 +798,7 @@ class StockDataPreparer:
 
             # 同步失败
             message = f"数据同步失败: {last_error}"
-            logger.error(f"❌ [数据同步] {message}")
+            logger.warning(f"❌ [数据同步] {message}")
             return {
                 "success": False,
                 "message": message,
@@ -810,7 +810,7 @@ class StockDataPreparer:
             }
 
         except Exception as e:
-            logger.error(f"❌ [数据同步] 同步数据失败: {e}")
+            logger.error(f"❌ [数据同步] 同步数据失败: {e}", exc_info=True)
             import traceback
             logger.debug(f"详细错误: {traceback.format_exc()}")
             return {
@@ -835,8 +835,8 @@ class StockDataPreparer:
             else:
                 logger.warning("⚠️ [数据源优先级] 未找到配置，使用默认顺序")
         except Exception as e:
-            logger.error(f"❌ [数据源优先级] 获取失败: {e}")
-        return ['tushare', 'akshare', 'baostock']
+            logger.error(f"❌ [数据源优先级] 获取失败: {e}", exc_info=True)
+        return ['duckdb', 'akshare', 'baostock']
 
     def _get_data_source_priority_for_sync(self, stock_code: str) -> list:
         """同步版本：通过 run_async 桥接到异步版本"""
@@ -965,7 +965,7 @@ class StockDataPreparer:
             )
 
         except Exception as e:
-            logger.error(f"❌ [港股数据] 数据准备失败: {e}")
+            logger.error(f"❌ [港股数据] 数据准备失败: {e}", exc_info=True)
             return StockDataPreparationResult(
                 is_valid=False,
                 stock_code=formatted_code,
@@ -1062,7 +1062,7 @@ class StockDataPreparer:
                 )
 
         except Exception as e:
-            logger.error(f"❌ [美股数据] 数据准备失败: {e}")
+            logger.error(f"❌ [美股数据] 数据准备失败: {e}", exc_info=True)
             return StockDataPreparationResult(
                 is_valid=False,
                 stock_code=formatted_code,

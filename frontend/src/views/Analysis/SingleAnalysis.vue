@@ -99,6 +99,10 @@
                   </el-col>
                 </el-row>
 
+                <el-form-item label="分析周期">
+                  <AnalysisHorizonSelector v-model="analysisForm.analysisHorizon" />
+                </el-form-item>
+
                 <el-form-item label="分析日期">
                   <el-date-picker
                     v-model="analysisForm.analysisDate"
@@ -109,8 +113,21 @@
                     :disabled-date="disabledDate"
                   />
                 </el-form-item>
+
+                <el-form-item label="账户持仓">
+                  <div class="account-position-control">
+                    <el-radio-group v-model="analysisForm.accountPosition" size="large">
+                      <el-radio-button value="UNKNOWN">未提供</el-radio-button>
+                      <el-radio-button value="NONE">未持仓</el-radio-button>
+                      <el-radio-button value="HELD">已持仓</el-radio-button>
+                    </el-radio-group>
+                    <div class="help-message">
+                      仅用于区分“空仓是否买入”和“已有仓位如何处理”，不会连接账户或执行交易。
+                    </div>
+                  </div>
+                </el-form-item>
                 <el-form-item label="工作流">
-                  <WorkflowSelector v-model="workflowSlug" />
+                  <WorkflowSelector v-model="workflowSlug" :analysis-horizon="analysisForm.analysisHorizon" />
                 </el-form-item>
               </div>
 
@@ -319,6 +336,10 @@ import { loadStageToggles, saveStageToggles } from '@/utils/stageToggleMemory'
 import { normalizeAnalystIds } from '@/constants/analysts'
 import { validateStockCode, getStockCodeFormatHelp } from '@/utils/stockValidator'
 import { normalizeMarketForAnalysis, getMarketByStockCode } from '@/utils/market'
+import AnalysisHorizonSelector from '@/components/Analysis/AnalysisHorizonSelector.vue'
+import type { AnalysisHorizon } from '@/types/analysis'
+import { isAnalysisHorizon } from '@/utils/analysisHorizon'
+import { periodAnalystSelection } from '@/utils/researchWorkflow'
 
 // 市场类型定义
 type MarketType = 'A股' | '美股' | '港股'
@@ -338,6 +359,8 @@ interface AnalysisForm {
   symbol: string
   market: MarketType
   analysisDate: Date
+  analysisHorizon: AnalysisHorizon
+  accountPosition: 'UNKNOWN' | 'NONE' | 'HELD'
   selectedAnalysts: string[]
   mcpTools: string[]
   language: 'zh-CN' | 'en-US'
@@ -428,7 +451,7 @@ const fetchAnalysts = async () => {
     // 竞态兜底：工作流 spec 先于分析师列表到达时，pool 裁剪在此补跑
     if (workflowSpec.value && analysisForm.selectedAnalysts.length) {
       const prunable = prunableSlugs(workflowSpec.value)
-      analysisForm.selectedAnalysts = analysisForm.selectedAnalysts.filter((s) => prunable.has(s))
+      analysisForm.selectedAnalysts = periodAnalystSelection(workflowSpec.value, analysisForm.selectedAnalysts, prunable)
     }
   }
 }
@@ -452,6 +475,8 @@ const analysisForm = reactive<AnalysisForm>({
   symbol: '',     // 标准化后的代码
   market: 'A股',
   analysisDate: new Date(),
+  analysisHorizon: isAnalysisHorizon(route.query.analysis_horizon) ? route.query.analysis_horizon : 'short',
+  accountPosition: 'UNKNOWN',
   selectedAnalysts: [], // 将在 onMounted 中加载默认值
   mcpTools: [],
   language: 'zh-CN',
@@ -465,6 +490,10 @@ const workflowSpec = ref<WorkflowSpecDto | null>(null)
 const stageStates = ref<Record<string, StageState>>({})
 const runErrors = ref<string[]>([])
 const runPlan = ref<ValidateRunResult['plan'] | undefined>(undefined)
+const horizonSelections = new Map<string, string[]>()
+watch(() => analysisForm.analysisHorizon, (_next, previous) => {
+  horizonSelections.set(previous, [...analysisForm.selectedAnalysts])
+})
 
 /** 被跳过的组（optional 且未启用）：NodeSelectGrid 灰显其成员选择 */
 const skippedStageIds = computed(() =>
@@ -510,7 +539,8 @@ const applyWorkflowSpec = (spec: WorkflowSpecDto) => {
   )
 
   const prunable = prunableSlugs(spec)
-  analysisForm.selectedAnalysts = analysisForm.selectedAnalysts.filter((s) => prunable.has(s))
+  analysisForm.selectedAnalysts = periodAnalystSelection(spec,
+    horizonSelections.get(spec.research_profile?.horizon || 'short') || analysisForm.selectedAnalysts, prunable)
   scheduleValidateRun()
 }
 
@@ -518,35 +548,44 @@ const fetchWorkflowSpec = async (slug: string) => {
   if (!slug) return
   try {
     const res = await workflowApi.get(slug)
+    if (slug !== workflowSlug.value) return
     applyWorkflowSpec(res.data.workflow)
   } catch (error) {
     console.error('获取工作流详情失败', error)
+    if (slug !== workflowSlug.value) return
     workflowSpec.value = null
     runErrors.value = ['工作流加载失败，请刷新重试']
   }
 }
 
 watch(workflowSlug, (slug) => {
+  validateRunVersion++
   runErrors.value = []
   runPlan.value = undefined
+  workflowSpec.value = null
   fetchWorkflowSpec(slug)
 })
 
 // 裁剪可行性校验（轻量编译 validate-run）：勾选变化后防抖触发
 let validateRunTimer: ReturnType<typeof setTimeout> | null = null
+let validateRunVersion = 0
 const scheduleValidateRun = () => {
+  validateRunVersion++
   if (validateRunTimer) clearTimeout(validateRunTimer)
   validateRunTimer = setTimeout(validateRun, 400)
 }
 
 const validateRun = async () => {
   if (!workflowSlug.value || !workflowSpec.value) return
+  const version = validateRunVersion
   try {
     const res = await workflowApi.validateRun({
       workflow_slug: workflowSlug.value,
+      analysis_horizon: analysisForm.analysisHorizon,
       selected_nodes: analysisForm.selectedAnalysts,
       stage_overrides: buildStageOverrides(),
     })
+    if (version !== validateRunVersion) return
     runErrors.value = res.data?.valid ? [] : res.data?.errors || []
     runPlan.value = res.data?.plan
   } catch (error) {
@@ -692,35 +731,46 @@ const validateStockCodeInput = () => {
   fetchStockInfo()
 }
 
+/** 应用路由 query（筛选页/仪表盘跳转入口）；路由参数优先级最高。
+ * 返回是否携带了新的股票代码（true 时调用方跳过进行中任务的缓存检查） */
+const applyRouteQuery = () => {
+  const q = route.query as any
+  const hasNewStock = !!q?.stock
+  if (hasNewStock) {
+    analysisForm.stockCode = String(q.stock)
+    // 🔥 关键修复：如果有新的股票代码，清除旧任务缓存
+    clearTaskCache()
+    console.log('🔄 检测到新股票代码，已清除旧任务缓存:', q.stock)
+
+    // 🆕 自动识别市场类型（如果URL中没有明确指定market参数）
+    if (!q?.market) {
+      const detectedMarket = getMarketByStockCode(analysisForm.stockCode)
+      analysisForm.market = detectedMarket as MarketType
+    }
+  }
+  if (q?.market) analysisForm.market = normalizeMarketForAnalysis(q.market) as MarketType
+  return hasNewStock
+}
+
 // 页面初始化
 onMounted(async () => {
-  await fetchAnalysts()
-  initializeModelSettings()
-
-  // 加载模型配置
-  try {
-    const defaultModels = await configApi.getDefaultModels()
-    modelSettings.value.analystModel = defaultModels.analyst_model
-    modelSettings.value.debateModel = defaultModels.debate_model
-
-    const llmConfigs = await configApi.getLLMConfigs()
-    availableModels.value = (llmConfigs as any).filter((config: any) => config.enabled)
-  } catch (error) {
-    console.error('加载模型配置失败:', error)
-  }
-
-  // 加载MCP工具
-  loadingMcpTools.value = true
-  try {
-    const res = await mcpApi.listTools()
-    if (res.success && res.data) {
-      mcpTools.value = res.data
+  // 挂载请求治理：分析师列表 / 模型配置（默认模型+可用列表）/ MCP 工具三个独立请求
+  // 并行发起（此前 getDefaultModels+getLLMConfigs 被 onMounted 内联块与
+  // initializeModelSettings 重复请求两次），错误处理在各函数内部
+  const loadMcpTools = async () => {
+    loadingMcpTools.value = true
+    try {
+      const res = await mcpApi.listTools()
+      if (res.success && res.data) {
+        mcpTools.value = res.data
+      }
+    } catch (error) {
+      console.error('加载MCP工具失败:', error)
+    } finally {
+      loadingMcpTools.value = false
     }
-  } catch (error) {
-    console.error('加载MCP工具失败:', error)
-  } finally {
-    loadingMcpTools.value = false
   }
+  await Promise.all([fetchAnalysts(), initializeModelSettings(), loadMcpTools()])
 
   // 🆕 从用户偏好加载默认设置
   const authStore = useAuthStore()
@@ -752,26 +802,17 @@ onMounted(async () => {
   }
 
   // 接收一次路由参数（从筛选页带入）- 路由参数优先级最高
-  const q = route.query as any
-  const hasNewStock = !!q?.stock
-  if (hasNewStock) {
-    analysisForm.stockCode = String(q.stock)
-    // 🔥 关键修复：如果有新的股票代码，清除旧任务缓存
-    clearTaskCache()
-    console.log('🔄 检测到新股票代码，已清除旧任务缓存:', q.stock)
-
-    // 🆕 自动识别市场类型（如果URL中没有明确指定market参数）
-    if (!q?.market) {
-      const detectedMarket = getMarketByStockCode(analysisForm.stockCode)
-      analysisForm.market = detectedMarket as MarketType
-    }
-  }
-  if (q?.market) analysisForm.market = normalizeMarketForAnalysis(q.market) as MarketType
+  const hasNewStock = applyRouteQuery()
 
   // 轻量检查：缓存中有进行中任务时仅显示提示条（不再原地恢复）
   if (!hasNewStock) {
     await checkRunningTaskFromCache()
   }
+})
+
+// 同路由 query 变化（App.vue 按 route.name 复用组件实例）时重新应用股票/市场
+watch(() => route.query, () => {
+  applyRouteQuery()
 })
 
 // 提交分析
@@ -798,6 +839,11 @@ const submitAnalysis = async () => {
     return
   }
 
+  if (analysisForm.analysisHorizon !== 'short' &&
+      (!workflowSpec.value || workflowSpec.value.research_profile?.horizon !== analysisForm.analysisHorizon)) {
+    ElMessage.error('请等待对应周期研究工作流加载完成')
+    return
+  }
   if (runErrors.value.length) {
     ElMessage.error(`当前选择不满足工作流依赖：${runErrors.value[0]}`)
     return
@@ -818,11 +864,14 @@ const submitAnalysis = async () => {
       parameters: {
         market_type: analysisForm.market,
         analysis_date: analysisDate.toISOString().split('T')[0],
+        analysis_horizon: analysisForm.analysisHorizon,
+        account_position: analysisForm.accountPosition,
         selected_analysts: normalizeAnalystIds(analysisForm.selectedAnalysts), // 旧字段兼容
         // 工作流通用化新参数：selected_nodes 优先于 selected_analysts
         selected_nodes: normalizeAnalystIds(analysisForm.selectedAnalysts),
         // optional 阶段开关/轮次（优先于下方 phaseN_* 旧映射）
         stage_overrides: buildStageOverrides(),
+        // 投资期限（short/mid/long；后端 None/short=旧行为零漂移）
         language: analysisForm.language,
         analyst_model: modelSettings.value.analystModel,
         debate_model: modelSettings.value.debateModel,
@@ -877,7 +926,7 @@ const initializeModelSettings = async () => {
 
     // 获取所有可用的模型列表
     const llmConfigs = await configApi.getLLMConfigs()
-    availableModels.value = (llmConfigs as any).filter((config: any) => config.enabled)
+    availableModels.value = (llmConfigs as any).filter((config: any) => config.enabled && config.model_type !== 'embedding')
 
     // 未设置默认模型时，回退到第一个启用的模型（不写死具体模型 ID）
     const firstModel = availableModels.value[0]?.model_name || ''

@@ -1,0 +1,9 @@
+{
+  "enabled": false,
+  "external_calls_enabled": false,
+  "mode": "shadow",
+  "model": "jev-1.13.0",
+  "api_key": "",
+  "timeout_seconds": 8,
+  "max_calls_per_day": 20
+}

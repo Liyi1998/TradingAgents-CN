@@ -11,6 +11,7 @@ from typing import Any, Dict
 from app.engine.agents.utils.agent_utils import Toolkit
 from app.engine.agents.utils.memory import FinancialSituationMemory
 from app.engine.default_config import DEFAULT_CONFIG
+from app.engine.decision_semantics import normalize_decision
 from app.engine.orchestrator.pipeline import PipelineDeps, run_pipeline
 from app.engine.orchestrator.state import side_history_labeled
 from app.engine.orchestrator.workflow.inputs import resolve_field
@@ -71,7 +72,9 @@ class AnalysisRuntime:
         config: Dict[str, Any] = None,
     ):
         self.debug = debug
-        self.config = config or DEFAULT_CONFIG
+        from app.core.horizons import resolve_research_horizon
+        self.config = dict(config or DEFAULT_CONFIG)
+        self.config["analysis_horizon"] = resolve_research_horizon(self.config.get("analysis_horizon"), self.config.get("horizon"))
         if not selected_analysts:
             raise ValueError("selected_analysts 不能为空，请先配置阶段1分析师。")
 
@@ -91,11 +94,13 @@ class AnalysisRuntime:
         # Initialize memories（如果启用）
         memory_enabled = self.config.get("memory_enabled", True)
         if memory_enabled:
-            self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
-            self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
-            self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
-            self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
-            self.risk_manager_memory = FinancialSituationMemory("risk_manager_memory", self.config)
+            from app.engine.analysis_horizon import horizon_memory_name
+            horizon = self.config["analysis_horizon"]
+            self.bull_memory = FinancialSituationMemory(horizon_memory_name("bull_memory", horizon), self.config)
+            self.bear_memory = FinancialSituationMemory(horizon_memory_name("bear_memory", horizon), self.config)
+            self.trader_memory = FinancialSituationMemory(horizon_memory_name("trader_memory", horizon), self.config)
+            self.invest_judge_memory = FinancialSituationMemory(horizon_memory_name("invest_judge_memory", horizon), self.config)
+            self.risk_manager_memory = FinancialSituationMemory(horizon_memory_name("risk_manager_memory", horizon), self.config)
         else:
             self.bull_memory = None
             self.bear_memory = None
@@ -138,6 +143,72 @@ class AnalysisRuntime:
         await _override("debate")
         return clients
 
+    async def _preflight_clients(self, clients: Dict[str, Any]) -> None:
+        """在启动数十个节点前，对本次实际使用的模型做最小真实调用。
+
+        过去网关离线时，各节点会把连接异常降级成占位文本，任务最终仍可能被
+        标记为完成。预检失败必须在流水线开始前终止，并把可读原因交给任务状态。
+        """
+        if not self.config.get("llm_preflight_enabled", True):
+            return
+
+        from app.llm.core.types import Message, Role
+        from app.llm.connection_check import (
+            CHECK_MAX_TOKENS, check_failure, check_identity, client_check_timeout,
+            require_check_text,
+        )
+
+        checked = set()
+        checks = []
+        # Validate both roles before scheduling any billable request.
+        for role in ("analyst", "debate"):
+            if clients.get(role) is None:
+                raise RuntimeError(f"模型网关连接检查失败：未配置 {role} 模型客户端。")
+        for role in ("analyst", "debate"):
+            client = clients.get(role)
+
+            primary = getattr(client, "primary", client)
+            # 同端点、模型、凭据及请求参数只探测一次；不切换备用模型。
+            identity = check_identity(client)
+            if identity in checked:
+                continue
+            checked.add(identity)
+
+            model = getattr(client, "model", None) or getattr(primary, "model", "未知模型")
+            timeout = client_check_timeout(client, self.config.get("llm_preflight_timeout"))
+
+            async def _check(check_role=role, check_client=client, check_model=model, check_budget=timeout):
+                try:
+                    response = await asyncio.wait_for(
+                        check_client.chat(
+                            [Message(role=Role.USER, content="只回复 OK")],
+                            system="模型连通性检查",
+                            tools=[],
+                            max_tokens=CHECK_MAX_TOKENS,
+                        ),
+                        timeout=check_budget,
+                    )
+                    require_check_text(response.text())
+                except Exception as exc:
+                    failure = check_failure(exc, check_budget)
+                    raise RuntimeError(
+                        f"模型连接检查未通过（{check_role}: {check_model}）：{failure['message']}。"
+                        "本次未进入分析流程，请处理后再重试。"
+                    ) from exc
+
+            checks.append(asyncio.create_task(_check()))
+
+        # 两个角色通常使用不同模型；并行预检将额外等待时间限制为较慢的一次调用。
+        if checks:
+            try:
+                await asyncio.gather(*checks)
+            except Exception:
+                for task in checks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*checks, return_exceptions=True)
+                raise
+
     # ── 主入口 ────────────────────────────────────────────────────────
 
     async def propagate(
@@ -161,11 +232,15 @@ class AnalysisRuntime:
             f"🔍 [RUNTIME DEBUG] propagate: company='{company_name}', trade_date='{trade_date}', task_id='{task_id}'"
         )
         self.ticker = company_name
+        self.config["user_id"] = str(user_id or "")
 
         total_start_time = time.time()
         self._current_task_id = task_id
 
         clients = await self._resolve_clients()
+        if event_sink is not None:
+            await event_sink.emit("status", text="正在检查模型网关连接...")
+        await self._preflight_clients(clients)
         self._last_debate_client = clients["debate"]
 
         def _limit_fields(prefix: str, bundle) -> Dict[str, Any]:
@@ -202,7 +277,7 @@ class AnalysisRuntime:
         )
 
         if final_state is None:
-            logger.error("final_state 为 None，分析流程未产生任何输出")
+            logger.error("final_state 为 None，分析流程未产生任何输出", exc_info=False)
             final_state = {}
 
         total_elapsed = time.time() - total_start_time
@@ -213,7 +288,6 @@ class AnalysisRuntime:
         final_state["performance_metrics"] = performance_data
 
         self.curr_state = final_state
-        self._log_state(trade_date, final_state)
 
         model_info = ""
         try:
@@ -232,14 +306,17 @@ class AnalysisRuntime:
         # 来源（终端 > trader），文本关键词/LLM 解析仅在 fallback_text 提交时启用
         signal_fields = final_state.get("final_decision_signal") or final_state.get("trader_decision_signal")
         if signal_fields and signal_fields.get("action"):
-            decision = {
+            decision = normalize_decision({
                 "action": signal_fields["action"],
                 "target_price": signal_fields.get("target_price"),
-                "confidence": signal_fields.get("confidence", 0.7),
-                "risk_score": signal_fields.get("risk_score", 0.5),
+                "confidence": signal_fields.get("confidence"),
+                "risk_score": signal_fields.get("risk_score"),
+                "risk_level": signal_fields.get("risk_level"),
+                "confidence_label": signal_fields.get("confidence_label"),
                 "reasoning": signal_fields.get("reasoning") or "基于结构化提交的投资决策",
                 "submission_source": "structured",
-            }
+                **(signal_fields.get("decision_semantics") or {}),
+            }, final_signal, account_position=self.config.get("account_position", "UNKNOWN"))
             if event_sink is not None:
                 await event_sink.emit("status", text="最终决策生成完毕")
         elif final_signal:
@@ -247,20 +324,57 @@ class AnalysisRuntime:
             # 提前下发状态提示消除尾部静默空窗）
             if event_sink is not None:
                 await event_sink.emit("status", text="正在生成最终交易信号...")
-            decision = await self.process_signal(final_signal, company_name)
+            decision = await self.process_signal(
+                final_signal,
+                company_name,
+                account_position=self.config.get("account_position", "UNKNOWN"),
+            )
             if event_sink is not None:
                 await event_sink.emit("status", text="最终决策生成完毕")
         else:
-            decision = {
+            decision = normalize_decision({
                 "action": "观望",
+                "account_position": self.config.get("account_position", "UNKNOWN"),
+                "research_view": "UNCERTAIN",
+                "unheld_action": "WATCH",
+                "held_action": "HOLD",
                 "target_price": None,
-                "confidence": 0,
-                "risk_score": 0,
+                "confidence": None,
+                "risk_score": None,
                 "risk_level": "未知",
                 "reasoning": "未开启深度决策阶段，未生成最终决策",
                 "reason": "未开启深度决策阶段，未生成最终决策",
-            }
+            }, account_position=self.config.get("account_position", "UNKNOWN"))
         decision["model_info"] = model_info
+        decision["analysis_horizon"] = self.config["analysis_horizon"]
+
+        # All presentation paths consume the terminal verdict, not a second
+        # numeric interpretation by the summary model.
+        from app.engine.decision_semantics import synchronize_summary
+        if final_state.get("structured_summary"):
+            final_state["structured_summary"] = synchronize_summary(
+                final_state["structured_summary"], decision
+            )
+        final_state["authoritative_decision"] = decision
+
+        # Jev is an optional text reviewer, never a replacement for the trading model.
+        from app.llm.jev_review import attach_review
+
+        context = final_state.get("analysis_context") or {}
+        coverage = list(context.pop("coverage_snapshots", {}).values())
+        context.pop("news_snapshots", None)
+        fallback_cache = context.pop("mcp_fallback_snapshots", {})
+        context["builtin_fallback_statuses"] = [{"tool_id": item.get("tool_id"), "status": item.get("status")}
+                                               for item in fallback_cache.values()]
+        final_state["data_coverage"] = coverage
+        if isinstance(final_state.get("structured_summary"), dict):
+            final_state["structured_summary"]["data_coverage"] = coverage
+            if context.get("price_reference") is not None:
+                final_state["structured_summary"]["price_reference"] = context["price_reference"]
+        from app.engine.data_quality_report import render_data_quality
+        final_state.setdefault("reports", {})["data_quality_report"] = render_data_quality(context, coverage)
+        await attach_review(final_state, company_name, trade_date)
+        self._log_state(trade_date, final_state)
 
         return final_state, decision
 
@@ -339,6 +453,7 @@ class AnalysisRuntime:
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state.get("company_of_interest", ""),
             "trade_date": final_state.get("trade_date", ""),
+            "analysis_horizon": final_state.get("analysis_horizon", "short"),
             **all_reports,
             "investment_debate_state": {
                 "bull_history": _safe(inv_state, "bull_history"),
@@ -441,7 +556,12 @@ class AnalysisRuntime:
 
         run_async(self.reflect_and_remember(returns_losses))
 
-    async def process_signal(self, full_signal, stock_symbol=None):
+    async def process_signal(
+        self,
+        full_signal,
+        stock_symbol=None,
+        account_position="UNKNOWN",
+    ):
         """Process a signal to extract the core decision."""
         from app.engine.agents.postprocess.signal_processor import SignalProcessor
 
@@ -454,20 +574,40 @@ class AnalysisRuntime:
                     user_id=(self.curr_state or {}).get("user_id") or "",
                 )
             except Exception as e:  # noqa: BLE001
-                logger.error(f"❌ 信号处理客户端初始化失败: {e}")
-                return {
-                    "action": "持有",
+                logger.error(f"❌ 信号处理客户端初始化失败: {e}", exc_info=True)
+                return normalize_decision({
+                    "action": "观望",
+                    "account_position": account_position,
+                    "research_view": "UNCERTAIN",
+                    "unheld_action": "WATCH",
+                    "held_action": "HOLD",
                     "target_price": None,
-                    "confidence": 0.5,
-                    "risk_score": 0.5,
+                    "confidence": None,
+                    "risk_score": None,
                     "reasoning": "信号处理初始化失败",
-                }
-        return await self._signal_processor.process_signal(full_signal, stock_symbol)
+                }, account_position=account_position)
+        return await self._signal_processor.process_signal(
+            full_signal,
+            stock_symbol,
+            account_position=account_position,
+            analysis_horizon=self.config.get("analysis_horizon", "short"),
+        )
 
-    def process_signal_sync(self, full_signal, stock_symbol=None):
+    def process_signal_sync(
+        self,
+        full_signal,
+        stock_symbol=None,
+        account_position="UNKNOWN",
+    ):
         from app.core.async_utils import run_async
 
-        return run_async(self.process_signal(full_signal, stock_symbol))
+        return run_async(
+            self.process_signal(
+                full_signal,
+                stock_symbol,
+                account_position=account_position,
+            )
+        )
 
 
 # 旧名兼容：外部历史引用平滑迁移
